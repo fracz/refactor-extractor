@@ -1,0 +1,53 @@
+<?php
+require 'vendor/autoload.php';
+
+const REPO_DIR = 'C:/Users/Wojciech/Desktop/spring-framework';
+const REFACTOR_KEYWORDS = ['refactor', 'improve', 'reorganize', 'readability'];
+const EXTENSION_FILTER = ['java', 'js', 'ts', 'php', 'cs'];
+
+chdir(REPO_DIR);
+
+echo 'Looking for commits with refactorings...' . PHP_EOL;
+$searchCommand = 'git log --pretty=format:%H ' . implode(' ', array_map(function ($keyword) {
+        return '--grep=' . $keyword;
+    }, REFACTOR_KEYWORDS));
+//echo $searchCommand . PHP_EOL;
+$commits = executeInRepo($searchCommand);
+
+echo 'Getting refactor changes from found commits...' . PHP_EOL;
+
+$progress = new \ProgressBar\Manager(0, count($commits));
+
+@mkdir(__DIR__ . '/output');
+
+$files = 0;
+
+foreach ($commits as $hash) {
+    $progress->advance();
+    $output = __DIR__ . '/output/' . $hash;
+    @mkdir($output);
+    $fullCommitMessage = implode(PHP_EOL, executeInRepo('git show -q ' . $hash));
+    file_put_contents($output . '/COMMIT_MESSAGE.txt', $fullCommitMessage);
+    $changedFiles = executeInRepo('git diff-tree --no-commit-id --name-only -r ' . $hash);
+    foreach ($changedFiles as $changedFile) {
+        $filename = basename($changedFile);
+        $extension = strtolower(@end(explode('.', $filename)));
+        if (in_array($extension, EXTENSION_FILTER)) {
+            $cmd = "git show {$hash}^:$changedFile";
+            $beforeRefactoring = implode(PHP_EOL, executeInRepo("git show {$hash}~1:$changedFile"));
+            $afterRefactoring = implode(PHP_EOL, executeInRepo("git show $hash:$changedFile"));
+            $filename = substr($filename, 0, -strlen($extension) - 1);
+            file_put_contents($output . "/$filename.before.$extension", $beforeRefactoring);
+            file_put_contents($output . "/$filename.after.$extension", $afterRefactoring);
+            ++$files;
+        }
+    }
+}
+
+echo "Found $files files with refactor changes";
+
+function executeInRepo($cmd)
+{
+    exec($cmd . ' 2>NUL', $output);
+    return $output;
+}
