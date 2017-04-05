@@ -1,7 +1,7 @@
 <?php
 require 'vendor/autoload.php';
 
-const REPO_DIR = 'C:/Users/Wojciech/Desktop/spring-framework';
+const REPO_DIR = 'C:/Users/Wojciech/Desktop/spring-data-jpa';
 const REFACTOR_KEYWORDS = ['refactor', 'improve', 'reorganize', 'readability'];
 const EXTENSION_FILTER = ['java', 'js', 'ts', 'php', 'cs'];
 
@@ -44,6 +44,8 @@ foreach ($commits as $hash) {
         }
     }
 }
+
+file_put_contents($outputDir . '/README.txt', 'Commits: ' . count($commits) . PHP_EOL . 'Files: ' . $files);
 
 echo "Found $files files with refactor changes";
 
