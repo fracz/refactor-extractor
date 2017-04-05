@@ -18,13 +18,14 @@ echo 'Getting refactor changes from found commits...' . PHP_EOL;
 
 $progress = new \ProgressBar\Manager(0, count($commits));
 
-@mkdir(__DIR__ . '/output');
+$outputDir = __DIR__ . '/results/' . basename(REPO_DIR);
+@mkdir($outputDir);
 
 $files = 0;
 
 foreach ($commits as $hash) {
     $progress->advance();
-    $output = __DIR__ . '/output/' . $hash;
+    $output = $outputDir . '/' . $hash;
     @mkdir($output);
     $fullCommitMessage = implode(PHP_EOL, executeInRepo('git show -q ' . $hash));
     file_put_contents($output . '/COMMIT_MESSAGE.txt', $fullCommitMessage);
