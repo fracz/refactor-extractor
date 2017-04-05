@@ -1,0 +1,219 @@
+<?php namespace Laravel\Routing;
+
+use Closure;
+use Laravel\Response;
+use Laravel\Container;
+
+class Caller {
+
+	/**
+	 * The IoC container instance.
+	 *
+	 * @var Container
+	 */
+	protected $container;
+
+	/**
+	 * The route filters defined for the application.
+	 *
+	 * @var array
+	 */
+	protected $filters;
+
+	/**
+	 * The path to the application's controllers.
+	 *
+	 * @var string
+	 */
+	protected $path;
+
+	/**
+	 * Create a new route caller instance.
+	 *
+	 * @param  Container  $container
+	 * @param  Delegator  $delegator
+	 * @param  array      $filters
+	 * @return void
+	 */
+	public function __construct(Container $container, $filters, $path)
+	{
+		$this->path = $path;
+		$this->filters = $filters;
+		$this->container = $container;
+	}
+
+	/**
+	 * Call a given route and return the route's response.
+	 *
+	 * @param  Route        $route
+	 * @return Response
+	 */
+	public function call(Route $route)
+	{
+		if ( ! $route->callback instanceof \Closure and ! is_array($route->callback))
+		{
+			throw new \Exception('Invalid route defined for URI ['.$route->key.']');
+		}
+
+		// Since "before" filters can halt the request cycle, we will return any response
+		// from the before filters. Allowing the filters to halt the request cycle makes
+		// common tasks like authorization convenient to implement.
+		if ( ! is_null($response = $this->before($route)))
+		{
+			return $this->finish($route, $response);
+		}
+
+		if ( ! is_null($response = $route->call()))
+		{
+			// If a route returns an array, it means that the route is delegating the
+			// handling of the request to a controller method. So, we will pass the
+			// array to the route delegator and let it resolve the controller.
+			if (is_array($response)) $response = $this->delegate($route, $response);
+
+			return $this->finish($route, $response);
+		}
+
+		// If we get to this point, no response was returned from the filters or the route.
+		// The 404 response will be returned to the browser instead of a blank screen.
+		return $this->finish($route, $this->container->resolve('laravel.response')->error('404'));
+	}
+
+	/**
+	 * Run the "before" filters for the route.
+	 *
+	 * If a before filter returns a value, that value will be considered the response to the
+	 * request and the route function / controller will not be used to handle the request.
+	 *
+	 * @param  Route  $route
+	 * @return mixed
+	 */
+	protected function before(Route $route)
+	{
+		$before = array_merge(array('before'), $route->filters('before'));
+
+		return $this->filter($before, array(), true);
+	}
+
+	/**
+	 * Handle the delegation of a route to a controller method.
+	 *
+	 * @param  Route  $route
+	 * @param  array  $delegate
+	 * @return mixed
+	 */
+	public function delegate(Route $route, $delegate)
+	{
+		list($controller, $method) = array($delegate[0], $delegate[1]);
+
+		// A route delegate may contain an array of parameters that should be passed to
+		// the controller method. If it does, we will merge those parameters in with
+		// the other route parameters that were detected by the router.
+		$parameters = (isset($delegate[2])) ? array_merge((array) $delegate[2], $route->parameters) : $route->parameters;
+
+		$controller = $this->resolve($controller);
+
+		// If the controller doesn't exist or the request is to an invalid method, we will
+		// return the 404 error response. The "before" method and any method beginning with
+		// an underscore are not publicly available.
+		if (is_null($controller) or ($method == 'before' or strncmp($method, '_', 1) === 0))
+		{
+			return $this->container->resolve('laravel.response')->error('404');
+		}
+
+		$controller->container = $this->container;
+
+		// Again, as was the case with route closures, if the controller "before" method returns
+		// a response, it will be considered the response to the request and the controller method
+		// will not be used to handle the request to the application.
+		$response = $controller->before();
+
+		return (is_null($response)) ? call_user_func_array(array($controller, $method), $parameters) : $response;
+	}
+
+	/**
+	 * Resolve a controller name to a controller instance.
+	 *
+	 * @param  string      $controller
+	 * @return Controller
+	 */
+	protected function resolve($controller)
+	{
+		if ( ! $this->load($controller)) return;
+
+		// If the controller is registered in the IoC container, we will resolve it out
+		// of the container. Using constructor injection on controllers via the container
+		// allows more flexible and testable development of applications.
+		if ($this->container->registered('controllers.'.$controller))
+		{
+			return $this->container->resolve('controllers.'.$controller);
+		}
+
+		// If the controller was not registered in the container, we will instantiate
+		// an instance of the controller manually. All controllers are suffixed with
+		// "_Controller" to avoid namespacing. Allowing controllers to exist in the
+		// global namespace gives the developer a convenient API for using the framework.
+		$controller = str_replace(' ', '_', ucwords(str_replace('.', ' ', $controller))).'_Controller';
+
+		return new $controller;
+	}
+
+	/**
+	 * Load the file for a given controller.
+	 *
+	 * @param  string  $controller
+	 * @return bool
+	 */
+	protected function load($controller)
+	{
+		if (file_exists($path = $this->path.strtolower(str_replace('.', '/', $controller)).EXT))
+		{
+			require $path;
+
+			return true;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Finish the route handling for the request.
+	 *
+	 * The route response will be converted to a Response instance and the "after" filters will be run.
+	 *
+	 * @param  Route        $route
+	 * @param  mixed        $response
+	 * @return Response
+	 */
+	protected function finish(Route $route, $response)
+	{
+		if ( ! $response instanceof Response) $response = new Response($response);
+
+		$this->filter(array_merge($route->filters('after'), array('after')), array($response));
+
+		return $response;
+	}
+
+	/**
+	 * Call a filter or set of filters.
+	 *
+	 * @param  array  $filters
+	 * @param  array  $parameters
+	 * @param  bool   $override
+	 * @return mixed
+	 */
+	protected function filter($filters, $parameters = array(), $override = false)
+	{
+		foreach ((array) $filters as $filter)
+		{
+			if ( ! isset($this->filters[$filter])) continue;
+
+			$response = call_user_func_array($this->filters[$filter], $parameters);
+
+			// "Before" filters may override the request cycle. For example, an authentication
+			// filter may redirect a user to a login view if they are not logged in. Because of
+			// this, we will return the first filter response if overriding is enabled.
+			if ( ! is_null($response) and $override) return $response;
+		}
+	}
+
+}
