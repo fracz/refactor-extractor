@@ -1,7 +1,7 @@
 <?php
 require 'vendor/autoload.php';
 
-const REPO_DIR = 'C:/Users/Wojciech/Desktop/spring-data-jpa';
+const REPO_DIR = 'C:/Users/Wojciech/Desktop/hibernate-orm';
 const REFACTOR_KEYWORDS = ['refactor', 'improve', 'reorganize', 'readability'];
 const EXTENSION_FILTER = ['java', 'js', 'ts', 'php', 'cs'];
 
