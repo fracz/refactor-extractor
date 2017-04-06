@@ -28,7 +28,7 @@ foreach ($commits as $hash) {
     $output = $outputDir . '/' . $hash;
     @mkdir($output);
     $fullCommitMessage = implode(PHP_EOL, executeInRepo('git show -q ' . $hash));
-    file_put_contents($output . '/COMMIT_MESSAGE.txt', $fullCommitMessage);
+    file_put_contents($output . '/README.txt', $fullCommitMessage);
     $changedFiles = executeInRepo('git diff-tree --no-commit-id --name-only -r ' . $hash);
     foreach ($changedFiles as $changedFile) {
         $filename = basename($changedFile);
