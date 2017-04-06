@@ -1,0 +1,1 @@
+NG_PAGES={{{JSON}}};
