@@ -1,10 +1,11 @@
 <?php
-$project = 'symfony';
-$command = 'sh -c "./vendor/bin/phpmetrics --report-json=REPORT.json PATH"';
+$project = 'angular.js';
+//$command = 'sh -c "./vendor/bin/phpmetrics --report-json=../metrics.REPORT.json ."';
+$command = 'jsmeter -o ../metrics-REPORT .'; // npm install node-jsmeter -g
 
 require 'vendor/autoload.php';
 
-$path = './results/' . $project;
+$path = __DIR__ . '/results/' . $project;
 
 $commits = $files = array_diff(scandir($path), ['.', '..', 'README.txt']);
 
@@ -12,8 +13,10 @@ $progress = new \ProgressBar\Manager(0, count($commits));
 
 foreach ($commits as $commit) {
     $progress->advance();
-    $commandForCommit = str_replace(['REPORT', 'PATH'], [$path . "/$commit/metrics.after", $path . "/$commit/after"], $command);
+    chdir($path . "/$commit/after");
+    $commandForCommit = str_replace('REPORT', 'after', $command);
     exec($commandForCommit);
-    $commandForCommit = str_replace(['REPORT', 'PATH'], [$path . "/$commit/metrics.before", $path . "/$commit/before"], $command);
+    chdir($path . "/$commit/before");
+    $commandForCommit = str_replace('REPORT', "before", $command);
     exec($commandForCommit);
 }
