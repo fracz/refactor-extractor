@@ -1,7 +1,7 @@
 <?php
-$project = 'vue.git';
-//$command = 'sh -c "../../../../vendor/bin/phpmetrics --report-json=../metrics.REPORT.json ."';
-$command = 'jsmeter -o ../metrics-REPORT .'; // npm install node-jsmeter -g
+$project = 'zendframework.git';
+$command = 'sh -c "../../../../vendor/bin/phpmetrics --report-json=../metrics.REPORT.json ."';
+//$command = 'jsmeter -o ../metrics-REPORT .'; // npm install node-jsmeter -g
 
 require 'vendor/autoload.php';
 
