@@ -1,6 +1,0 @@
-commit 110b032ad9dddcb643a36b28dba94e4ed548b556
-Author: Chris Beams <cbeams@vmware.com>
-Date:   Fri Jan 29 20:55:03 2010 +0000
-
-    IN PROGRESS - issue SPR-6779: imported @Configuration classes do not get enhanced and fail to satisfy scoping requirements
-    All tests in ImportedConfigurationClassEnhancementTests now pass.  The fix was simple - imported @Configuration class bean definitions were not getting marked with the attribute that indicates that they are indeed @Configuration class bean definitions.  To make this happen, ConfigurationClassPostProcessor's protected checkConfigurationClassCandidate(beanDef) method is being called from within ConfigurationClassBeanDefinitionReader when imported @Configuration classes are being processed.  This is quick and dirty, and the subsequent check-in will refactor the solution appropriately.
