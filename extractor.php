@@ -1,7 +1,7 @@
 <?php
 require 'vendor/autoload.php';
 
-const REPO_DIR = __DIR__ . '/repos/react.git';
+const REPO_DIR = __DIR__ . '/repos/vue.git';
 const REFACTOR_KEYWORDS = ['refactor', 'improve', 'reorganize', 'readability'];
 const EXTENSION_FILTER = ['java', 'js', 'ts', 'php', 'cs'];
 

@@ -1,5 +1,5 @@
 <?php
-$project = 'react.git';
+$project = 'vue.git';
 //$command = 'sh -c "../../../../vendor/bin/phpmetrics --report-json=../metrics.REPORT.json ."';
 $command = 'jsmeter -o ../metrics-REPORT .'; // npm install node-jsmeter -g
 
