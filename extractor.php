@@ -1,7 +1,7 @@
 <?php
 require 'vendor/autoload.php';
 
-const REPO_DIR = 'C:/Users/Wojciech/Desktop/symfony';
+const REPO_DIR = 'C:/Users/Wojciech/Desktop/angular.js';
 const REFACTOR_KEYWORDS = ['refactor', 'improve', 'reorganize', 'readability'];
 const EXTENSION_FILTER = ['java', 'js', 'ts', 'php', 'cs'];
 
@@ -23,6 +23,7 @@ $outputDir = __DIR__ . '/results/' . basename(REPO_DIR);
 
 $files = 0;
 $commitsWithFiles = 0;
+$filesStats = [];
 
 foreach ($commits as $hash) {
     $progress->advance();
@@ -49,14 +50,26 @@ foreach ($commits as $hash) {
     }
     if ($filesInThisCommit > 0) {
         ++$commitsWithFiles;
+        if (!isset($filesStats[$filesInThisCommit])) {
+            $filesStats[$filesInThisCommit] = 0;
+        }
+        ++$filesStats[$filesInThisCommit];
         $fullCommitMessage = implode(PHP_EOL, executeInRepo('git show -q ' . $hash));
         file_put_contents($output . '/README.txt', $fullCommitMessage);
     }
 }
 
-file_put_contents($outputDir . '/README.txt', 'Commits: ' . $commitsWithFiles . PHP_EOL . 'Files: ' . $files);
+$fileStatsReadme = PHP_EOL . PHP_EOL . 'Commit stats:' . PHP_EOL;
+ksort($filesStats);
+foreach ($filesStats as $fileCount => $commitCount) {
+    $fileStatsReadme .= $commitCount . ' commits with ' . $fileCount . ' files' . PHP_EOL;
+}
 
-echo "Found $files files with refactor changes in $commitsWithFiles commits.";
+$resultText = 'Commits: ' . $commitsWithFiles . PHP_EOL . 'Files: ' . $files . $fileStatsReadme;
+
+file_put_contents($outputDir . '/README.txt', $resultText);
+
+echo $resultText;
 
 function executeInRepo($cmd)
 {
