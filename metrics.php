@@ -1,7 +1,7 @@
 <?php
-$project = 'angular.js';
-//$command = 'sh -c "./vendor/bin/phpmetrics --report-json=../metrics.REPORT.json ."';
-$command = 'jsmeter -o ../metrics-REPORT .'; // npm install node-jsmeter -g
+$project = 'laravel.git';
+$command = 'sh -c "../../../../vendor/bin/phpmetrics --report-json=../metrics.REPORT.json ."';
+//$command = 'jsmeter -o ../metrics-REPORT .'; // npm install node-jsmeter -g
 
 require 'vendor/autoload.php';
 
