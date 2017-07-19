@@ -1,11 +1,13 @@
 <?php
 require 'vendor/autoload.php';
 
-const REPO_DIR = __DIR__ . '/repos/zendframework.git';
-const REFACTOR_KEYWORDS = ['refactor', 'improve', 'reorganize', 'readability'];
-const EXTENSION_FILTER = ['java', 'js', 'ts', 'php', 'cs'];
+$project = $argv[1];
 
-chdir(REPO_DIR);
+$REPO_DIR = __DIR__ . '/repos/' . $project;
+const REFACTOR_KEYWORDS = ['refactor', 'improve', 'reorganize', 'readability'];
+const EXTENSION_FILTER = ['js']; //['java', 'js', 'ts', 'php', 'cs'];
+
+chdir($REPO_DIR);
 
 echo 'Looking for commits with refactorings...' . PHP_EOL;
 $searchCommand = 'git log --pretty=format:%H ' . implode(' ', array_map(function ($keyword) {
@@ -18,7 +20,7 @@ echo 'Getting refactor changes from found commits...' . PHP_EOL;
 
 $progress = new \ProgressBar\Manager(0, count($commits));
 
-$outputDir = __DIR__ . '/results/' . basename(REPO_DIR);
+$outputDir = __DIR__ . '/results/' . basename($REPO_DIR);
 @mkdir($outputDir);
 
 $files = 0;
@@ -31,11 +33,15 @@ foreach ($commits as $hash) {
     $outputBefore = $output . '/before';
     $outputAfter = $output . '/after';
     $changedFiles = executeInRepo('git diff-tree --no-commit-id --name-only -r ' . $hash);
-    $filesInThisCommit = 0;
-    foreach ($changedFiles as $changedFile) {
-        $filename = basename($changedFile);
-        $extension = strtolower(@end(explode('.', $filename)));
-        if (in_array($extension, EXTENSION_FILTER)) {
+    $processableFiles = array_filter($changedFiles, function ($changedFile) {
+        $extension = strtolower(@end(explode('.', $changedFile)));
+        return in_array($extension, EXTENSION_FILTER);
+    });
+    $filesInThisCommit = count($processableFiles);
+    $files += $filesInThisCommit;
+    if ($filesInThisCommit == 1) {
+        foreach ($processableFiles as $changedFile) {
+            $filename = basename($changedFile);
             @mkdir($output);
             @mkdir($outputBefore);
             @mkdir($outputAfter);
@@ -44,8 +50,6 @@ foreach ($commits as $hash) {
             $afterRefactoring = implode(PHP_EOL, executeInRepo("git show $hash:$changedFile"));
             file_put_contents($outputBefore . "/$filename", $beforeRefactoring);
             file_put_contents($outputAfter . "/$filename", $afterRefactoring);
-            ++$files;
-            ++$filesInThisCommit;
         }
     }
     if ($filesInThisCommit > 0) {
@@ -54,8 +58,10 @@ foreach ($commits as $hash) {
             $filesStats[$filesInThisCommit] = 0;
         }
         ++$filesStats[$filesInThisCommit];
-        $fullCommitMessage = implode(PHP_EOL, executeInRepo('git show -q ' . $hash));
-        file_put_contents($output . '/README.txt', $fullCommitMessage);
+        if ($filesInThisCommit == 1) {
+            $fullCommitMessage = implode(PHP_EOL, executeInRepo('git show -q ' . $hash));
+            file_put_contents($output . '/README.txt', $fullCommitMessage);
+        }
     }
 }
 

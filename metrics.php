@@ -1,11 +1,11 @@
 <?php
-$project = 'zendframework.git';
-$command = 'sh -c "../../../../vendor/bin/phpmetrics --report-json=../metrics.REPORT.json ."';
-//$command = 'jsmeter -o ../metrics-REPORT .'; // npm install node-jsmeter -g
+$project = $argc == 2 ? $argv[1] : 'freeCodeCamp';
+//$command = 'sh -c "../../../../vendor/bin/phpmetrics --report-json=../metrics.REPORT.json ."';
+$command = 'jsmeter -o ../metrics-REPORT .'; // npm install node-jsmeter -g
 
 require 'vendor/autoload.php';
 
-$path = __DIR__ . '/results/' . $project;
+$path = __DIR__ . '/results/' . basename($project);
 
 $commits = $files = array_diff(scandir($path), ['.', '..', 'README.txt']);
 
