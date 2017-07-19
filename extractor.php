@@ -1,11 +1,11 @@
 <?php
 require 'vendor/autoload.php';
 
-$project = $argv[1];
+$project = $argc == 2 ? $argv[1] : 'domnikl/DesignPatternsPHP';
 
 $REPO_DIR = __DIR__ . '/repos/' . $project;
 const REFACTOR_KEYWORDS = ['refactor', 'improve', 'reorganize', 'readability'];
-const EXTENSION_FILTER = ['js']; //['java', 'js', 'ts', 'php', 'cs'];
+const EXTENSION_FILTER = ['php']; //['java', 'js', 'ts', 'php', 'cs'];
 
 chdir($REPO_DIR);
 
@@ -39,7 +39,7 @@ foreach ($commits as $hash) {
     });
     $filesInThisCommit = count($processableFiles);
     $files += $filesInThisCommit;
-    if ($filesInThisCommit == 1) {
+    if ($filesInThisCommit > 0) {
         foreach ($processableFiles as $changedFile) {
             $filename = basename($changedFile);
             @mkdir($output);
@@ -58,10 +58,8 @@ foreach ($commits as $hash) {
             $filesStats[$filesInThisCommit] = 0;
         }
         ++$filesStats[$filesInThisCommit];
-        if ($filesInThisCommit == 1) {
-            $fullCommitMessage = implode(PHP_EOL, executeInRepo('git show -q ' . $hash));
-            file_put_contents($output . '/README.txt', $fullCommitMessage);
-        }
+        $fullCommitMessage = implode(PHP_EOL, executeInRepo('git show -q ' . $hash));
+        file_put_contents($output . '/README.txt', $fullCommitMessage);
     }
 }
 
