@@ -14,6 +14,8 @@ $projects = array_diff(scandir($projectsDir), ['.', '..', 'README.txt']);
 
 $progress = new \ProgressBar\Manager(0, count($projects));
 
+$changesCount = 0;
+
 foreach ($projects as $project) {
     $projectDir = $projectsDir . $project;
     $changes = array_diff(scandir($projectDir), ['.', '..', 'README.txt']);
@@ -22,6 +24,7 @@ foreach ($projects as $project) {
         $metricsBeforePath = $changeDir . '/metrics.before.json';
         $metricsAfterPath = $changeDir . '/metrics.after.json';
         if (file_exists($metricsBeforePath) && file_exists($metricsAfterPath)) {
+            ++$changesCount;
             $metricsAfter = createAssocArrayFromMetrics(json_decode(file_get_contents($metricsAfterPath), true));
             $metricsBefore = createAssocArrayFromMetrics(json_decode(file_get_contents($metricsBeforePath), true));
             foreach ($metricsBefore as $filename => $fileMetricsBefore) {
@@ -47,6 +50,8 @@ foreach ($projects as $project) {
     }
     $progress->advance();
 }
+
+echo "Refactoring commits: " . $changesCount;
 
 function createAssocArrayFromMetrics(array $metrics) {
     $assocMetrics = [];
