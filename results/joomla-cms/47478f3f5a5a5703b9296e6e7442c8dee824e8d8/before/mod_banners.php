@@ -1,0 +1,110 @@
+<?php
+/**
+* @version $Id$
+* @package Joomla
+* @copyright Copyright (C) 2005 Open Source Matters. All rights reserved.
+* @license http://www.gnu.org/copyleft/gpl.html GNU/GPL, see LICENSE.php
+* Joomla! is free software. This version may have been modified pursuant
+* to the GNU General Public License, and as distributed it includes or
+* is derivative of works licensed under the GNU General Public License or
+* other free or open source software licenses.
+* See COPYRIGHT.php for copyright notices and details.
+*/
+
+// no direct access
+defined('_JEXEC') or die('Restricted access');
+
+$clientids	= intval($params->get('banner_cids', 0));
+$limit		= (int) $params->get( 'count', 1 );
+$randomise	= (int) $params->get( 'randomise' );
+$cssSuffix	= $params->get( 'moduleclass_sfx' );
+
+$where	= '';
+
+if ($clientids)
+{
+	$ids = explode( ',', $clientids );
+	mosArrayToInts( $ids, array() );
+	if (count( $ids ))
+	{
+		$where = " AND (cid=";
+		$where .= implode( ' OR cid=', $ids );
+		$where .= ')';
+	}
+}
+
+$query = "SELECT *"
+	. ($randomise ? ', RAND() AS ordering' : ', 1 AS ordering')
+	. "\n FROM #__banner"
+	. "\n WHERE showBanner = 1 "
+	. $where
+	. "\nORDER BY ordering"
+	. "\nLIMIT " . $limit;
+	;
+$database->setQuery( $query );
+$banners = $database->loadObjectList();
+$numrows = count( $banners );
+
+echo '<div class="bannergroup' . $cssSuffix . '">';
+
+for ($i = 0; $i < $numrows; $i++)
+{
+	$item = &$banners[$i];
+
+	$query = "UPDATE #__banner"
+	. "\n SET impmade = impmade + 1"
+	. "\n WHERE bid = $item->bid"
+	;
+	$database->setQuery( $query );
+
+	if (!$database->query())
+	{
+		echo $database->stderr( true );
+		return;
+	}
+	$item->impmade++;
+
+	// expire the banner
+	if ($item->imptotal == $item->impmade)
+	{
+
+		$query = "INSERT INTO #__bannerfinish ( cid, type, name, impressions, clicks, imageurl, datestart, dateend )"
+		. "\n VALUES ( $item->cid, '$item->type', '$item->name', $item->impmade, $item->clicks, '$item->imageurl', '$item->date', 'now()' )"
+		;
+		$database->setQuery($query);
+		if(!$database->query()) {
+			die($database->stderr(true));
+		}
+
+		$query = "DELETE FROM #__banner"
+		. "\n WHERE bid = $item->bid"
+		;
+		$database->setQuery($query);
+		if(!$database->query()) {
+			die($database->stderr(true));
+		}
+	}
+
+	echo '<div class="banneritem' . $cssSuffix . '">';
+	if (trim( $item->custombannercode ))
+	{
+		echo $item->custombannercode;
+	}
+	else if (eregi( "(\.bmp|\.gif|\.jpg|\.jpeg|\.png)$", $item->imageurl ))
+	{
+		$imageurl = 'images/banners/'.$item->imageurl;
+		$link		= sefRelToAbs( 'index.php?option=com_banners&amp;task=click&amp;bid='. $item->bid );
+		echo '<a href="'.$link.'" target="_blank"><img src="'.$imageurl.'" border="0" alt="'.JText::_('Banner').'" /></a>';
+	}
+	else if (eregi("\.swf$", $item->imageurl))
+	{
+					$imageurl = "images/banners/".$item->imageurl;
+					echo "<object classid=\"clsid:D27CDB6E-AE6D-11cf-96B8-444553540000\" codebase=\"http://fpdownload.macromedia.com/pub/shockwave/cabs/flash/swflash.cab#version=6,0,0,0\" border=\"5\">
+										<param name=\"movie\" value=\"$imageurl\"><embed src=\"$imageurl\" loop=\"false\" pluginspage=\"http://www.macromedia.com/go/get/flashplayer\" type=\"application/x-shockwave-flash\"></embed></object>";
+	}
+
+	echo '	<div class="clr"></div>';
+	echo '</div>';
+}
+echo '</div>';
+?>

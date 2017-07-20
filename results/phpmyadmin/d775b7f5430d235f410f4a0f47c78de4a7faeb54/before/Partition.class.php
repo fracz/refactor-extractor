@@ -1,0 +1,76 @@
+<?php
+/* vim: set expandtab sw=4 ts=4 sts=4: */
+/**
+ * Library for extracting information about the partitions
+ *
+ * @package PhpMyAdmin
+ */
+if (! defined('PHPMYADMIN')) {
+    exit;
+}
+
+/**
+ * base Partition Class
+ *
+ * @package PhpMyAdmin
+ */
+class PMA_Partition
+{
+    /**
+     * returns array of partition names for a specific db/table
+     *
+     * @access  public
+     * @return array   of partition names
+     */
+    static public function getPartitionNames($db, $table)
+    {
+        if (PMA_Partition::havePartitioning()) {
+            return PMA_DBI_fetch_result(
+                "select `PARTITION_NAME` from `information_schema`.`PARTITIONS`"
+                . " where `TABLE_SCHEMA` = '" . $db
+                . "' and `TABLE_NAME` = '" . $table . "'"
+            );
+        } else {
+            return array();
+        }
+    }
+
+    /**
+     * checks if MySQL server supports partitioning
+     *
+     * @static
+     * @staticvar boolean $have_partitioning
+     * @staticvar boolean $already_checked
+     * @access  public
+     * @return boolean
+     */
+    static public function havePartitioning()
+    {
+        static $have_partitioning = false;
+        static $already_checked = false;
+
+        if (! $already_checked) {
+            if (PMA_MYSQL_INT_VERSION >= 50100) {
+                if (PMA_MYSQL_INT_VERSION < 50600) {
+                    if (PMA_DBI_fetch_value(
+                        "SHOW VARIABLES LIKE 'have_partitioning';"
+                    )) {
+                        $have_partitioning = true;
+                    }
+                } else {
+                    // see http://dev.mysql.com/doc/refman/5.6/en/partitioning.html
+                    $plugins = PMA_DBI_fetch_result("SHOW PLUGINS");
+                    foreach ($plugins as $key => $value) {
+                        if ($value['Name'] == 'partition') {
+                            $have_partitioning = true;
+                            break;
+                        }
+                    }
+                }
+                $already_checked = true;
+            }
+        }
+        return $have_partitioning;
+    }
+}
+?>

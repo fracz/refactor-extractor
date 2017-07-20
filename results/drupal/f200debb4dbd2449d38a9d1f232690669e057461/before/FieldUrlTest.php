@@ -1,0 +1,63 @@
+<?php
+
+/**
+ * @file
+ * Definition of Drupal\views\Tests\Handler\FieldUrlTest.
+ */
+
+namespace Drupal\views\Tests\Handler;
+
+use Drupal\views\Tests\ViewsSchemaTestBase;
+/**
+ * Tests the core Drupal\views\Plugin\views\field\Url handler.
+ */
+class FieldUrlTest extends ViewsSchemaTestBase {
+  public static function getInfo() {
+    return array(
+      'name' => 'Field: Url',
+      'description' => 'Test the core Drupal\views\Plugin\views\field\Url handler.',
+      'group' => 'Views Handlers',
+    );
+  }
+
+  function viewsData() {
+    $data = parent::viewsData();
+    $data['views_test']['name']['field']['id'] = 'url';
+    return $data;
+  }
+
+  public function testFieldUrl() {
+    $view = $this->getBasicView();
+
+    $view->display['default']->handler->override_option('fields', array(
+      'name' => array(
+        'id' => 'name',
+        'table' => 'views_test',
+        'field' => 'name',
+        'relationship' => 'none',
+        'display_as_link' => FALSE,
+      ),
+    ));
+
+    $this->executeView($view);
+
+    $this->assertEqual('John', $view->field['name']->advanced_render($view->result[0]));
+
+    // Make the url a link.
+    $view->delete();
+    $view = $this->getBasicView();
+
+    $view->display['default']->handler->override_option('fields', array(
+      'name' => array(
+        'id' => 'name',
+        'table' => 'views_test',
+        'field' => 'name',
+        'relationship' => 'none',
+      ),
+    ));
+
+    $this->executeView($view);
+
+    $this->assertEqual(l('John', 'John'), $view->field['name']->advanced_render($view->result[0]));
+  }
+}

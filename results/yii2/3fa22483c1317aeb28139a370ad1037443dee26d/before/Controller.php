@@ -1,0 +1,300 @@
+<?php
+/**
+ * Controller class file.
+ *
+ * @link http://www.yiiframework.com/
+ * @copyright Copyright &copy; 2008 Yii Software LLC
+ * @license http://www.yiiframework.com/license/
+ */
+
+namespace yii\base;
+
+/**
+ * Controller is the base class for classes containing controller logic.
+ *
+ * Controller implements the action life cycles, which consist of the following steps:
+ *
+ * 1. [[authorize]]
+ * 2. [[beforeAction]]
+ * 3. [[afterAction]]
+ *
+ * @property array $actionParams the request parameters (name-value pairs) to be used for action parameter binding
+ * @property string $route the route (module ID, controller ID and action ID) of the current request.
+ * @property string $uniqueId the controller ID that is prefixed with the module ID (if any).
+ *
+ * @author Qiang Xue <qiang.xue@gmail.com>
+ * @since 2.0
+ */
+class Controller extends Component
+{
+	/**
+	 * @var string the ID of this controller
+	 */
+	public $id;
+	/**
+	 * @var Module $module the module that this controller belongs to.
+	 */
+	public $module;
+	/**
+	 * @var string the ID of the action that is used when the action ID is not specified
+	 * in the request. Defaults to 'index'.
+	 */
+	public $defaultAction = 'index';
+	/**
+	 * @var string|boolean the name of the layout to be applied to this controller's views.
+	 * This property mainly affects the behavior of [[render()]].
+	 * Defaults to null, meaning the actual layout value should inherit that from [[module]]'s layout value.
+	 * If false, no layout will be applied.
+	 */
+	public $layout;
+	/**
+	 * @var Action the action that is currently being executed. This property will be set
+	 * by [[run()]] when it is called by [[Application]] to run an action.
+	 */
+	public $action;
+
+	/**
+	 * @param string $id the ID of this controller
+	 * @param Module $module the module that this controller belongs to.
+	 * @param array $config name-value pairs that will be used to initialize the object properties
+	 */
+	public function __construct($id, $module, $config = array())
+	{
+		$this->id = $id;
+		$this->module = $module;
+		parent::__construct($config);
+	}
+
+	/**
+	 * Declares external actions for the controller.
+	 * This method is meant to be overwritten to declare external actions for the controller.
+	 * It should return an array, with array keys being action IDs, and array values the corresponding
+	 * action class names or action configuration arrays. For example,
+	 *
+	 * ~~~
+	 * return array(
+	 *     'action1' => '@application/components/Action1',
+	 *     'action2' => array(
+	 *         'class' => '@application/components/Action2',
+	 *         'property1' => 'value1',
+	 *         'property2' => 'value2',
+	 *     ),
+	 * );
+	 * ~~~
+	 *
+	 * [[\Yii::createObject()]] will be used later to create the requested action
+	 * using the configuration provided here.
+	 */
+	public function actions()
+	{
+		return array();
+	}
+
+	/**
+	 * Runs the controller with the specified action and parameters.
+	 * @param Action|string $action the action to be executed. This can be either an action object
+	 * or the ID of the action.
+	 * @param array $params the parameters (name-value pairs) to be passed to the action.
+	 * If null, the result of [[getActionParams()]] will be used as action parameters.
+	 * @return integer the exit status of the action. 0 means normal, other values mean abnormal.
+	 * @see missingAction
+	 * @see createAction
+	 */
+	public function run($action, $params = null)
+	{
+		if (is_string($action)) {
+			if (($a = $this->createAction($action)) !== null) {
+				$action = $a;
+			} else {
+				$this->missingAction($action);
+				return 1;
+			}
+		}
+
+		$priorAction = $this->action;
+		$this->action = $action;
+
+		if ($this->authorize($action) && $this->beforeAction($action)) {
+			if ($params === null) {
+				$params = $this->getActionParams();
+			}
+			$status = $action->runWithParams($params);
+			$this->afterAction($action);
+		} else {
+			$status = 1;
+		}
+
+		$this->action = $priorAction;
+
+		return $status;
+	}
+
+	/**
+	 * Creates the action instance based on the action ID.
+	 * The action can be either an inline action or an object.
+	 * The latter is created by looking up the action map specified in [[actions]].
+	 * @param string $actionID ID of the action. If empty, it will take the value of [[defaultAction]].
+	 * @return Action the action instance, null if the action does not exist.
+	 * @see actions
+	 */
+	public function createAction($actionID)
+	{
+		if ($actionID === '') {
+			$actionID = $this->defaultAction;
+		}
+		$actions = $this->actions();
+		if (isset($actions[$actionID])) {
+			return \Yii::createObject($actions[$actionID], $actionID, $this);
+		} elseif (method_exists($this, 'action' . $actionID)) {
+			return new InlineAction($actionID, $this);
+		} else {
+			return null;
+		}
+	}
+
+	/**
+	 * Returns the request parameters that will be used for action parameter binding.
+	 * Default implementation simply returns an empty array.
+	 * Child classes may override this method to customize the parameters to be provided
+	 * for action parameter binding (e.g. `$_GET`).
+	 * @return array the request parameters (name-value pairs) to be used for action parameter binding
+	 */
+	public function getActionParams()
+	{
+		return array();
+	}
+
+	/**
+	 * This method is invoked when the request parameters do not satisfy the requirement of the specified action.
+	 * The default implementation will throw an exception.
+	 * @param Action $action the action being executed
+	 * @param Exception $exception the exception about the invalid parameters
+	 * @throws Exception whenever this method is invoked
+	 */
+	public function invalidActionParams($action, $exception)
+	{
+		throw $exception;
+	}
+
+	/**
+	 * This method is invoked when extra parameters are provided to an action when it is executed.
+	 * The default implementation does nothing.
+	 * @param Action $action the action being executed
+	 * @param array $expected the expected action parameters (name => value)
+	 * @param array $actual the actual action parameters (name => value)
+	 */
+	public function extraActionParams($action, $expected, $actual)
+	{
+	}
+
+	/**
+	 * Handles the request whose action is not recognized.
+	 * This method is invoked when the controller cannot find the requested action.
+	 * The default implementation simply throws an exception.
+	 * @param string $actionID the missing action name
+	 * @throws InvalidRequestException whenever this method is invoked
+	 */
+	public function missingAction($actionID)
+	{
+		throw new InvalidRequestException(\Yii::t('yii', 'The system is unable to find the requested action "{action}".',
+			array('{action}' => $actionID == '' ? $this->defaultAction : $actionID)));
+	}
+
+	/**
+	 * @return string the controller ID that is prefixed with the module ID (if any).
+	 */
+	public function getUniqueId()
+	{
+		return $this->module instanceof Application ? $this->id : $this->module->getUniqueId() . '/' . $this->id;
+	}
+
+	/**
+	 * Returns the route of the current request.
+	 * @return string the route (module ID, controller ID and action ID) of the current request.
+	 */
+	public function getRoute()
+	{
+		return $this->action !== null ? $this->getUniqueId() . '/' . $this->action->id : $this->getUniqueId();
+	}
+
+	/**
+	 * Processes the request using another controller action.
+	 * @param string $route the route of the new controller action. This can be an action ID, or a complete route
+	 * with module ID (optional in the current module), controller ID and action ID. If the former,
+	 * the action is assumed to be located within the current controller.
+	 * @param array $params the parameters to be passed to the action.
+	 * If null, the result of [[getActionParams()]] will be used as action parameters.
+	 * Note that the parameters must be name-value pairs with the names corresponding to
+	 * the parameter names as declared by the action.
+	 * @param boolean $exit whether to end the application after this call. Defaults to true.
+	 */
+	public function forward($route, $params = array(), $exit = true)
+	{
+		if (strpos($route, '/') === false) {
+			$status = $this->run($route, $params);
+		} else {
+			if ($route[0] !== '/' && !$this->module instanceof Application) {
+				$route = '/' . $this->module->getUniqueId() . '/' . $route;
+			}
+			$status = \Yii::$application->runController($route, $params);
+		}
+		if ($exit) {
+			\Yii::$application->end($status);
+		}
+	}
+
+	/**
+	 * This method is invoked when checking the access for the action to be executed.
+	 * @param Action $action the action to be executed.
+	 * @return boolean whether the action is allowed to be executed.
+	 */
+	public function authorize($action)
+	{
+		$event = new ActionEvent($action);
+		$this->trigger(__METHOD__, $event);
+		return $event->isValid;
+	}
+
+	/**
+	 * This method is invoked right before an action is to be executed (after all possible filters.)
+	 * You may override this method to do last-minute preparation for the action.
+	 * @param Action $action the action to be executed.
+	 * @return boolean whether the action should continue to be executed.
+	 */
+	public function beforeAction($action)
+	{
+		$event = new ActionEvent($action);
+		$this->trigger(__METHOD__, $event);
+		return $event->isValid;
+	}
+
+	/**
+	 * This method is invoked right after an action is executed.
+	 * You may override this method to do some postprocessing for the action.
+	 * @param Action $action the action just executed.
+	 */
+	public function afterAction($action)
+	{
+		$this->trigger(__METHOD__, new ActionEvent($action));
+	}
+
+	public function render($view, $params = array())
+	{
+		return $this->createView()->render($view, $params);
+	}
+
+	public function renderText($text)
+	{
+		return $this->createView()->renderText($text);
+	}
+
+	public function renderPartial($view, $params = array())
+	{
+		return $this->createView()->renderPartial($view, $params);
+	}
+
+	public function createView()
+	{
+		return new View($this);
+	}
+}

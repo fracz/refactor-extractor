@@ -1,0 +1,69 @@
+<?php
+/**
+ * @package     Joomla.Platform
+ * @subpackage  Form
+ *
+ * @copyright   Copyright (C) 2005 - 2015 Open Source Matters, Inc. All rights reserved.
+ * @license     GNU General Public License version 2 or later; see LICENSE
+ */
+
+defined('JPATH_PLATFORM') or die;
+
+JFormHelper::loadFieldClass('list');
+
+/**
+ * Form Field class for the Joomla Platform.
+ * Provides radio button inputs
+ *
+ * @link   http://www.w3.org/TR/html-markup/command.radio.html#command.radio
+ * @since  11.1
+ */
+class JFormFieldRadio extends JFormFieldList
+{
+	/**
+	 * The form field type.
+	 *
+	 * @var    string
+	 * @since  11.1
+	 */
+	protected $type = 'Radio';
+
+	/**
+	 * Name of the layout being used to render the field
+	 *
+	 * @var    string
+	 * @since  3.5
+	 */
+	protected $layout = 'joomla.fields.radio';
+
+	/**
+	 * Method to get the radio button field input markup.
+	 *
+	 * @return  string  The field input markup.
+	 *
+	 * @since   11.1
+	 */
+	protected function getInput()
+	{
+		$layout = $this->getAttribute('layout', $this->layout);
+
+		return $this->getRenderer($layout)->render($this->getLayoutData());
+	}
+
+	/**
+	 * Method to get the data to be passed to the layout for rendering.
+	 *
+	 * @return  array
+	 *
+	 * @since   3.5
+	 */
+	protected function getLayoutData()
+	{
+		$data = parent::getLayoutData();
+
+		$data['value'] = (string) $this->value;
+		$data['options'] = $this->getOptions();
+
+		return $data;
+	}
+}

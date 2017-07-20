@@ -1,0 +1,1206 @@
+<?php
+/**
+ * @link http://www.yiiframework.com/
+ * @copyright Copyright (c) 2008 Yii Software LLC
+ * @license http://www.yiiframework.com/license/
+ */
+
+namespace yii\base;
+
+use Yii;
+use DateTime;
+use IntlDateFormatter;
+use NumberFormatter;
+use yii\helpers\HtmlPurifier;
+use yii\helpers\Html;
+
+/**
+ * Formatter provides a set of commonly used data formatting methods.
+ *
+ * The formatting methods provided by Formatter are all named in the form of `asXyz()`.
+ * The behavior of some of them may be configured via the properties of Formatter. For example,
+ * by configuring [[dateFormat]], one may control how [[asDate()]] formats the value into a date string.
+ *
+ * Formatter is configured as an application component in [[\yii\base\Application]] by default.
+ * You can access that instance via `Yii::$app->formatter`.
+ *
+ * The Formatter class is designed to format values according to a [[locale]]. For this feature to work
+ * the [PHP intl extension](http://php.net/manual/en/book.intl.php) has to be installed.
+ * Most of the methods however work also if the PHP intl extension is not installed by providing
+ * a fallback implementation. Without intl month and day names are in english only.
+ *
+ * @author Qiang Xue <qiang.xue@gmail.com>
+ * @author Enrica Ruedin <e.ruedin@guggach.com>
+ * @author Carsten Brandt <mail@cebe.cc>
+ * @since 2.0
+ */
+class Formatter extends Component
+{
+    /**
+     * @var string the text to be displayed when formatting a `null` value.
+     * Defaults to `'<span class="not-set">(not set)</span>'`, where `(not set)`
+     * will be translated according to [[locale]].
+     */
+    public $nullDisplay;
+    /**
+     * @var array the text to be displayed when formatting a boolean value. The first element corresponds
+     * to the text displayed for `false`, the second element for `true`.
+     * Defaults to `['No', 'Yes']`, where `Yes` and `No`
+     * will be translated according to [[locale]].
+     */
+    public $booleanFormat;
+    /**
+     * @var string the locale ID that is used to localize the date and number formatting.
+     * For number and date formatting this is only effective when the
+     * [PHP intl extension](http://php.net/manual/en/book.intl.php) is installed.
+     * If not set, [[\yii\base\Application::language]] will be used.
+     */
+    public $locale;
+    /**
+     * @var string the timezone to use for formatting time and date values.
+     * This can be any value that may be passed to [date_default_timezone_set()](http://www.php.net/manual/en/function.date-default-timezone-set.php)
+     * e.g. `UTC`, `Europe/Berlin` or `America/Chicago`.
+     * Refer to the [php manual](http://www.php.net/manual/en/timezones.php) for available timezones.
+     * If this property is not set, [[\yii\base\Application::timeZone]] will be used.
+     */
+    public $timeZone;
+    /**
+     * @var string the default format string to be used to format a [[asDate()|date]].
+     * This can be "short", "medium", "long", or "full", which represents a preset format of different lengths.
+     *
+     * It can also be a custom format as specified in the [ICU manual](http://userguide.icu-project.org/formatparse/datetime).
+     * Alternatively this can be a string prefixed with `php:` representing a format that can be recognized by the
+     * PHP [date()](http://php.net/manual/de/function.date.php)-function.
+     */
+    public $dateFormat = 'medium';
+    /**
+     * @var string the default format string to be used to format a [[asTime()|time]].
+     * This can be "short", "medium", "long", or "full", which represents a preset format of different lengths.
+     *
+     * It can also be a custom format as specified in the [ICU manual](http://userguide.icu-project.org/formatparse/datetime).
+     * Alternatively this can be a string prefixed with `php:` representing a format that can be recognized by the
+     * PHP [date()](http://php.net/manual/de/function.date.php)-function.
+     */
+    public $timeFormat = 'medium';
+    /**
+     * @var string the default format string to be used to format a [[asDateTime()|date and time]].
+     * This can be "short", "medium", "long", or "full", which represents a preset format of different lengths.
+     *
+     * It can also be a custom format as specified in the [ICU manual](http://userguide.icu-project.org/formatparse/datetime).
+     *
+     * Alternatively this can be a string prefixed with `php:` representing a format that can be recognized by the
+     * PHP [date()](http://php.net/manual/de/function.date.php)-function.
+     */
+    public $datetimeFormat = 'medium';
+    /**
+     * @var string the character displayed as the decimal point when formatting a number.
+     * If not set, the decimal separator corresponding to [[locale]] will be used.
+     * If [PHP intl extension](http://php.net/manual/en/book.intl.php) is not available, the default value is '.'.
+     */
+    public $decimalSeparator;
+    /**
+     * @var string the character displayed as the thousands separator (also called grouping separator) character when formatting a number.
+     * If not set, the thousand separator corresponding to [[locale]] will be used.
+     * If [PHP intl extension](http://php.net/manual/en/book.intl.php) is not available, the default value is ','.
+     */
+    public $thousandSeparator;
+
+    // TODO refactor number formatters
+//    /**
+//     * @var array the options to be set for the NumberFormatter objects (eg. grouping used). Please refer to
+//     * [PHP manual](http://php.net/manual/en/class.numberformatter.php#intl.numberformatter-constants.unumberformatattribute)
+//     * for the possible options. This property is used by [[createNumberFormatter]] when
+//     * creating a new number formatter to format decimals, currencies, etc.
+//     */
+//    public $numberFormatOptions = [];
+//    /**
+//     * @var array the text options to be set for the NumberFormatter objects (eg. Negative sign). Please refer to
+//     * [PHP manual](http://php.net/manual/en/class.numberformatter.php#intl.numberformatter-constants.unumberformatattribute)
+//     * for the possible options. This property is used by [[createNumberFormatter]] when
+//     * creating a new number formatter to format decimals, currencies, etc.
+//     *
+//     * Default value: GOUPING_USED = 1 / MAX_FRACTION_DIGITS = 3 / GROUPING_SIZE = 3 / ROUNDING_MODE = 4
+//     */
+//    public $numberTextFormartOptions = [];
+    /**
+     * @var string the international currency code displayed when formatting a number.
+     * If not set, the currency code corresponding to [[locale]] will be used. TODO default value?
+     */
+    public $currencyCode;
+//    /**
+//     * @var float "intl" numberformat library knows a rounding increment
+//     * This means that any value is rounded to this increment.
+//     * Example: increment of 0.05 rounds values <= 2.024 to 2.00 / values >= 2.025 to 2.05
+//     */
+//    public $roundingIncrement;
+//    public $roundingIncrCurrency;
+    /**
+     * @var array the format used to format size (bytes). Three elements may be specified: "base", "decimals" and "decimalSeparator".
+     * They correspond to the base at which a kilobyte is calculated (1000 or 1024 bytes per kilobyte, defaults to 1024),
+     * the number of digits after the decimal point (defaults to 2) and the character displayed as the decimal point.
+     */
+    public $sizeFormat = [
+        'base' => 1024,
+        'decimals' => 2,
+        'decimalSeparator' => null,
+    ];
+
+    /**
+     * @var boolean whether the [PHP intl extension](http://php.net/manual/en/book.intl.php) is loaded.
+     */
+    private $_intlLoaded = false;
+
+
+    /**
+     * @inheritdoc
+     */
+    public function init()
+    {
+        if ($this->timeZone === null) {
+            $this->timeZone = Yii::$app->timeZone;
+        }
+        if ($this->locale === null) {
+            $this->locale = Yii::$app->language;
+        }
+        if ($this->booleanFormat === null) {
+            $this->booleanFormat = [Yii::t('yii', 'No'), Yii::t('yii', 'Yes')];
+        }
+        if ($this->nullDisplay === null) {
+            $this->nullDisplay = '<span class="not-set">' . Yii::t('yii', '(not set)') . '</span>';
+        }
+        $this->_intlLoaded = extension_loaded('intl');
+        if (!$this->_intlLoaded) {
+            $this->decimalSeparator = '.';
+            $this->thousandSeparator = ',';
+        }
+
+//        if (extension_loaded('intl')) {
+//            $this->_intlLoaded = true;
+//            $this->numberFormatOptions = [NumberFormatter::ROUNDING_MODE => NumberFormatter::ROUND_HALFUP];
+//        }
+//
+//        if (preg_match('/\bde-CH\b|\bfr-CH\b|\bit-CH\b/', $this->locale)){
+//            // Swiss currency amounts must be rounded to 0.05 (5-Rappen) instead of
+//            // 0.01 as usual
+//            $this->roundingIncrCurrency = '0.05';
+//        }
+    }
+
+    /**
+     * Formats the value based on the given format type.
+     * This method will call one of the "as" methods available in this class to do the formatting.
+     * For type "xyz", the method "asXyz" will be used. For example, if the format is "html",
+     * then [[asHtml()]] will be used. Format names are case insensitive.
+     * @param mixed $value the value to be formatted
+     * @param string|array $format the format of the value, e.g., "html", "text". To specify additional
+     * parameters of the formatting method, you may use an array. The first element of the array
+     * specifies the format name, while the rest of the elements will be used as the parameters to the formatting
+     * method. For example, a format of `['date', 'Y-m-d']` will cause the invocation of `asDate($value, 'Y-m-d')`.
+     * @return string the formatting result.
+     * @throws InvalidParamException if the format type is not supported by this class.
+     */
+    public function format($value, $format)
+    {
+        if (is_array($format)) {
+            if (!isset($format[0])) {
+                throw new InvalidParamException('The $format array must contain at least one element.');
+            }
+            $f = $format[0];
+            $format[0] = $value;
+            $params = $format;
+            $format = $f;
+        } else {
+            $params = [$value];
+        }
+        $method = 'as' . $format;
+        if ($this->hasMethod($method)) {
+            return call_user_func_array([$this, $method], $params);
+        } else {
+            throw new InvalidParamException("Unknown format type: $format");
+        }
+    }
+
+
+    // simple formats
+
+
+    /**
+     * Formats the value as is without any formatting.
+     * This method simply returns back the parameter without any format.
+     * @param mixed $value the value to be formatted
+     * @return string the formatted result
+     */
+    public function asRaw($value)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        return $value;
+    }
+
+    /**
+     * Formats the value as an HTML-encoded plain text.
+     * @param mixed $value the value to be formatted
+     * @return string the formatted result
+     */
+    public function asText($value)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        return Html::encode($value);
+    }
+
+    /**
+     * Formats the value as an HTML-encoded plain text with newlines converted into breaks.
+     * @param mixed $value the value to be formatted
+     * @return string the formatted result
+     */
+    public function asNtext($value)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        return nl2br(Html::encode($value));
+    }
+
+    /**
+     * Formats the value as HTML-encoded text paragraphs.
+     * Each text paragraph is enclosed within a `<p>` tag.
+     * One or multiple consecutive empty lines divide two paragraphs.
+     * @param mixed $value the value to be formatted
+     * @return string the formatted result
+     */
+    public function asParagraphs($value)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        return str_replace('<p></p>', '', '<p>' . preg_replace('/[\r\n]{2,}/', "</p>\n<p>", Html::encode($value)) . '</p>');
+    }
+
+    /**
+     * Formats the value as HTML text.
+     * The value will be purified using [[HtmlPurifier]] to avoid XSS attacks.
+     * Use [[asRaw()]] if you do not want any purification of the value.
+     * @param mixed $value the value to be formatted
+     * @param array|null $config the configuration for the HTMLPurifier class.
+     * @return string the formatted result
+     */
+    public function asHtml($value, $config = null)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        return HtmlPurifier::process($value, $config);
+    }
+
+    /**
+     * Formats the value as a mailto link.
+     * @param mixed $value the value to be formatted
+     * @return string the formatted result
+     */
+    public function asEmail($value)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        return Html::mailto(Html::encode($value), $value);
+    }
+
+    /**
+     * Formats the value as an image tag.
+     * @param mixed $value the value to be formatted
+     * @return string the formatted result
+     */
+    public function asImage($value)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        return Html::img($value);
+    }
+
+    /**
+     * Formats the value as a hyperlink.
+     * @param mixed $value the value to be formatted
+     * @return string the formatted result
+     */
+    public function asUrl($value)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        $url = $value;
+        if (strpos($url, 'http://') !== 0 && strpos($url, 'https://') !== 0) { // TODO support other urls like IRC, XMPP etc.
+            $url = 'http://' . $url;
+        }
+
+        return Html::a(Html::encode($value), $url);
+    }
+
+    /**
+     * Formats the value as a boolean.
+     * @param mixed $value the value to be formatted
+     * @return string the formatted result
+     * @see booleanFormat
+     */
+    public function asBoolean($value)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+
+        return $value ? $this->booleanFormat[1] : $this->booleanFormat[0];
+    }
+
+
+    // date and time formats
+
+
+    /**
+     * Formats the value as a date.
+     * @param integer|string|DateTime $value the value to be formatted. The following
+     * types of value are supported:
+     *
+     * - an integer representing a UNIX timestamp
+     * - a string that can be parsed into a UNIX timestamp via `strtotime()`
+     * - a PHP DateTime object
+     *
+     * @param string $format the format used to convert the value into a date string.
+     * If null, [[dateFormat]] will be used.
+     *
+     * This can be "short", "medium", "long", or "full", which represents a preset format of different lengths.
+     * It can also be a custom format as specified in the [ICU manual](http://userguide.icu-project.org/formatparse/datetime).
+     *
+     * Alternatively this can be a string prefixed with `php:` representing a format that can be recognized by the
+     * PHP [date()](http://php.net/manual/de/function.date.php)-function.
+     *
+     * @throws InvalidParamException if the input value can not be evaluated as a date value.
+     * @throws InvalidConfigException if the date format is invalid.
+     * @return string the formatted result
+     * @see dateFormat
+     */
+    public function asDate($value, $format = null)
+    {
+        if ($format === null) {
+            $format = $this->dateFormat;
+        }
+        return $this->formatDateTimeValue($value, $format, 'date');
+    }
+
+    /**
+     * Formats the value as a time.
+     * @param integer|string|DateTime $value the value to be formatted. The following
+     * types of value are supported:
+     *
+     * - an integer representing a UNIX timestamp
+     * - a string that can be parsed into a UNIX timestamp via `strtotime()`
+     * - a PHP DateTime object
+     *
+     * @param string $format the format used to convert the value into a date string.
+     * If null, [[timeFormat]] will be used.
+     *
+     * This can be "short", "medium", "long", or "full", which represents a preset format of different lengths.
+     * It can also be a custom format as specified in the [ICU manual](http://userguide.icu-project.org/formatparse/datetime).
+     *
+     * Alternatively this can be a string prefixed with `php:` representing a format that can be recognized by the
+     * PHP [date()](http://php.net/manual/de/function.date.php)-function.
+     *
+     * @throws InvalidParamException if the input value can not be evaluated as a date value.
+     * @throws InvalidConfigException if the date format is invalid.
+     * @return string the formatted result
+     * @see timeFormat
+     */
+    public function asTime($value, $format = null)
+    {
+        if ($format === null) {
+            $format = $this->timeFormat;
+        }
+        return $this->formatDateTimeValue($value, $format, 'time');
+    }
+
+    /**
+     * Formats the value as a datetime.
+     * @param integer|string|DateTime $value the value to be formatted. The following
+     * types of value are supported:
+     *
+     * - an integer representing a UNIX timestamp
+     * - a string that can be parsed into a UNIX timestamp via `strtotime()`
+     * - a PHP DateTime object
+     *
+     * @param string $format the format used to convert the value into a date string.
+     * If null, [[dateFormat]] will be used.
+     *
+     * This can be "short", "medium", "long", or "full", which represents a preset format of different lengths.
+     * It can also be a custom format as specified in the [ICU manual](http://userguide.icu-project.org/formatparse/datetime).
+     *
+     * Alternatively this can be a string prefixed with `php:` representing a format that can be recognized by the
+     * PHP [date()](http://php.net/manual/de/function.date.php)-function.
+     *
+     * @throws InvalidParamException if the input value can not be evaluated as a date value.
+     * @throws InvalidConfigException if the date format is invalid.
+     * @return string the formatted result
+     * @see datetimeFormat
+     */
+    public function asDatetime($value, $format = null)
+    {
+        if ($format === null) {
+            $format = $this->datetimeFormat;
+        }
+        return $this->formatDateTimeValue($value, $format, 'datetime');
+    }
+
+    /**
+     * @var array map of short format names to IntlDateFormatter constant values.
+     */
+    private $_dateFormats = [
+        'short'  => 3, // IntlDateFormatter::SHORT,
+        'medium' => 2, // IntlDateFormatter::MEDIUM,
+        'long'   => 1, // IntlDateFormatter::LONG,
+        'full'   => 0, // IntlDateFormatter::FULL,
+    ];
+
+    /**
+     * @var array with the standard php definition for short, medium, long an full
+     * format as pattern for date, time and datetime.
+     * This is used as fallback when the intl extension is not installed.
+     */
+    private $_phpNameToPattern = [
+        'short' => [
+            'date' => 'd.m.Y',
+            'time' => 'H:i',
+            'datetime' => 'd.m.Y H:i',
+        ],
+        'medium' => [
+            'date' => 'M j, Y',
+            'time' => 'H:i:s',
+            'datetime' => 'M j, Y H:i:s',
+        ],
+        'long' => [
+            'date' => 'F j, Y',
+            'time' => 'g:i:sA',
+            'datetime' => 'F j, Y g:i:sA',
+        ],
+        'full' => [
+            'date' => 'l, F j, Y',
+            'time' => 'g:i:sA T',
+            'datetime' => 'l, F j, Y g:i:sA T',
+        ],
+    ];
+
+    /**
+     * @param integer $value normalized datetime value
+     * @param string $format the format used to convert the value into a date string.
+     * @param string $type 'date', 'time', or 'datetime'.
+     * @throws InvalidConfigException if the date format is invalid.
+     * @return string the formatted result
+     */
+    private function formatDateTimeValue($value, $format, $type)
+    {
+        $value = $this->normalizeDatetimeValue($value);
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+
+        if ($this->_intlLoaded) {
+            $format = $this->getIntlDatePattern($format);
+            if (isset($this->_dateFormats[$format])) {
+                if ($type === 'date') {
+                    $formatter = new IntlDateFormatter($this->locale, $this->_dateFormats[$format], IntlDateFormatter::NONE, $this->timeZone);
+                } elseif ($type === 'time') {
+                    $formatter = new IntlDateFormatter($this->locale, IntlDateFormatter::NONE, $this->_dateFormats[$format], $this->timeZone);
+                } else {
+                    $formatter = new IntlDateFormatter($this->locale, $this->_dateFormats[$format], $this->_dateFormats[$format], $this->timeZone);
+                }
+            } else {
+                $formatter = new IntlDateFormatter($this->locale, IntlDateFormatter::NONE, IntlDateFormatter::NONE, $this->timeZone, null, $format);
+            }
+            if ($formatter === null) {
+                throw new InvalidConfigException(intl_get_error_message());
+            }
+            return $formatter->format($value);
+        } else {
+            // replace short, medium, long and full with real patterns in case intl is not loaded.
+            if (isset($this->_phpNameToPattern[$format][$type])) {
+                $format = $this->_phpNameToPattern[$format][$type];
+            } else {
+                $format = $this->getPhpDatePattern($format);
+            }
+            $date = new DateTime(null, new \DateTimeZone($this->timeZone));
+            $date->setTimestamp($value);
+            return $date->format($format);
+        }
+    }
+
+    /**
+     * Normalizes the given datetime value as one that can be taken by various date/time formatting methods.
+     *
+     * @param mixed $value the datetime value to be normalized.
+     * @return float the normalized datetime value (int64)
+     */
+    protected function normalizeDatetimeValue($value)
+    {
+        if ($value === null) {
+            return null;
+        } elseif (is_string($value)) {
+            if (is_numeric($value) || $value === '') {
+                $value = (double)$value;
+            } else {
+                try {
+                    $date = new DateTime($value);
+                    /** $date = new DateTime($value); ==> constructor crashes with
+                     * an invalid date in $value (eg. 2014-06-35) and can't be
+                     * catched by php because is fatal error.
+                     * Consequence was to find another solution which doesn't crash
+                     */
+                    // TODO docs state strtotime()
+//                    foreach($FormatPatterns as $format){
+//                        $date = DateTime::createFromFormat($format, $value);
+//                        if ( !($date === false)) break;
+//                    }
+
+                    // TODO throw InvalidParamException on invalid value
+                } catch (\Exception $e) {
+                    return null;
+                }
+                if ($date === false){
+                    return null;
+                }
+                $value = (double)$date->format('U');
+            }
+            return $value;
+
+        } elseif ($value instanceof DateTime || $value instanceof \DateTimeInterface) {
+            return (double)$value->format('U');
+        } else {
+            return (double)$value;
+        }
+    }
+
+    private function getIntlDatePattern($pattern)
+    {
+        if (strpos($pattern, 'php:') === 0) {
+            return $this->convertPatternPhpToIcu(substr($pattern, 4));
+        } else {
+            return $pattern;
+        }
+    }
+
+    private function getPhpDatePattern($pattern)
+    {
+        if (strpos($pattern, 'php:') === 0) {
+            return substr($pattern, 4);
+        } else {
+            return $this->convertPatternIcuToPhp($pattern);
+        }
+    }
+
+    /**
+     * intlFormatter class (ICU based) and DateTime class don't have same format string.
+     * These format patterns are completely incompatible and must be converted.
+     *
+     * This method converts an ICU (php intl) formatted date, time or datetime string in
+     * a php compatible format string.
+     *
+     * @param string $pattern dateformat pattern like 'dd.mm.yyyy' or 'short'/'medium'/
+     *          'long'/'full' or 'db
+     * @return string with converted date format pattern.
+     * @throws InvalidConfigException
+     */
+    private function convertPatternIcuToPhp($pattern)
+    {
+        if (isset($this->_dateFormats[$pattern])) {
+            return $pattern;
+        }
+        return strtr($pattern, [
+            'dd' => 'd',    // day with leading zeros
+            'd' => 'j',     // day without leading zeros
+            'E' => 'D',     // day written in short form eg. Sun
+            'EE' => 'D',
+            'EEE' => 'D',
+            'EEEE' => 'l',  // day fully written eg. Sunday
+            'e' => 'N',     // ISO-8601 numeric representation of the day of the week 1=Mon to 7=Sun
+            'ee' => 'N',    // php 'w' 0=Sun to 6=Sat isn't supported by ICU -> 'w' means week number of year
+            // engl. ordinal st, nd, rd; it's not support by ICU but we added
+            'D' => 'z',     // day of the year 0 to 365
+            'w' => 'W',     // ISO-8601 week number of year, weeks starting on Monday
+            'W' => '',      // week of the current month; isn't supported by php
+            'F' => '',      // Day of Week in Month. eg. 2nd Wednesday in July
+            'g' => '',      // Modified Julian day. This is different from the conventional Julian day number in two regards.
+            'M' => 'n',     // Numeric representation of a month, without leading zeros
+            'MM' => 'm',    // Numeric representation of a month, with leading zeros
+            'MMM' => 'M',   // A short textual representation of a month, three letters
+            'MMMM' => 'F',  // A full textual representation of a month, such as January or March
+            'Q' => '',      // number of quarter not supported in php
+            'QQ' => '',     // number of quarter '02' not supported in php
+            'QQQ' => '',    // quarter 'Q2' not supported in php
+            'QQQQ' => '',   // quarter '2nd quarter' not supported in php
+            'QQQQQ' => '',  // number of quarter '2' not supported in php
+            'Y' => 'Y',     // 4digit year number eg. 2014
+            'y' => 'Y',     // 4digit year also
+            'yyyy' => 'Y',  // 4digit year also
+            'yy' => 'y',    // 2digit year number eg. 14
+            'r' => '',      // related Gregorian year, not supported by php
+            'G' => '',      // ear designator like AD
+            'a' => 'a',     // Lowercase Ante meridiem and Post
+            'h' => 'g',     // 12-hour format of an hour without leading zeros 1 to 12h
+            'K' => 'g',     // 12-hour format of an hour without leading zeros 0 to 11h, not supported by php
+            'H' => 'G',     // 24-hour format of an hour without leading zeros 0 to 23h
+            'k' => 'G',     // 24-hour format of an hour without leading zeros 1 to 24h, not supported by php
+            'hh' => 'h',    // 12-hour format of an hour with leading zeros, 01 to 12 h
+            'KK' => 'h',    // 12-hour format of an hour with leading zeros, 00 to 11 h, not supported by php
+            'HH' => 'H',    // 24-hour format of an hour with leading zeros, 00 to 23 h
+            'kk' => 'H',    // 24-hour format of an hour with leading zeros, 01 to 24 h, not supported by php
+            'm' => 'i',     // Minutes without leading zeros, not supported by php
+            'mm' => 'i',    // Minutes with leading zeros
+            's' => 's',     // Seconds, without leading zeros, not supported by php
+            'ss' => 's',    // Seconds, with leading zeros
+            'SSS' => '',    // millisecond (maximum of 3 significant digits), not supported by php
+            'A' => '',      // milliseconds in day, not supported by php
+            'Z' => 'O',     // Difference to Greenwich time (GMT) in hours
+            'ZZ' => 'O',     // Difference to Greenwich time (GMT) in hours
+            'ZZZ' => 'O',     // Difference to Greenwich time (GMT) in hours
+            'z' => 'T',     // Timezone abbreviation
+            'zz' => 'T',     // Timezone abbreviation
+            'zzz' => 'T',     // Timezone abbreviation
+            'zzzz' => 'T',  // Timzone full name, not supported by php
+            'V' => 'e',      // Timezone identifier eg. Europe/Berlin
+            'VV' => 'e',
+            'VVV' => 'e',
+            'VVVV' => 'e'
+        ]);
+    }
+
+    /**
+     * intlFormatter class (ICU based) and DateTime class don't have same format string.
+     * These format patterns are completely incompatible and must be converted.
+     *
+     * This method converts PHP formatted date, time or datetime string in
+     * an ICU (php intl) compatible format string.
+     *
+     * @param string $pattern dateformat pattern like 'd.m.Y' or 'short'/'medium'/
+     *          'long'/'full' or 'db
+     * @return string with converted date format pattern.
+     * @throws InvalidConfigException
+     */
+    private function convertPatternPhpToIcu($pattern)
+    {
+        if (isset($this->_dateFormats[$pattern])) {
+            return $pattern;
+        }
+        return strtr($pattern, [
+            'd' => 'dd',    // day with leading zeros
+            'j' => 'd',     // day without leading zeros
+            'D' => 'EEE',   // day written in short form eg. Sun
+            'l' => 'EEEE',  // day fully written eg. Sunday
+            'N' => 'e',     // ISO-8601 numeric representation of the day of the week 1=Mon to 7=Sun
+            // php 'w' 0=Sun to 6=Sat isn't supported by ICU -> 'w' means week number of year
+            'S' => '',      // engl. ordinal st, nd, rd; it's not support by ICU
+            'z' => 'D',     // day of the year 0 to 365
+            'W' => 'w',     // ISO-8601 week number of year, weeks starting on Monday
+            // week of the current month; isn't supported by php
+            // Day of Week in Month. eg. 2nd Wednesday in July not supported by php
+            // Modified Julian day. This is different from the conventional Julian day number in two regards.
+            'n'=> 'M',      // Numeric representation of a month, without leading zeros
+            'm' => 'MM',    // Numeric representation of a month, with leading zeros
+            'M' => 'MMM',   // A short textual representation of a month, three letters
+            'F' => 'MMMM',  // A full textual representation of a month, such as January or March
+            // number of quarter not supported in php
+            // number of quarter '02' not supported in php
+            // quarter 'Q2' not supported in php
+            // quarter '2nd quarter' not supported in php
+            // number of quarter '2' not supported in php
+            'Y' => 'yyyy',  // 4digit year eg. 2014
+            'y' => 'yy',    // 2digit year number eg. 14
+            // related Gregorian year, not supported by php
+            // ear designator like AD
+            'a' => 'a',     // Lowercase Ante meridiem and Post am. or pm.
+            'A' => 'a',     // Upercase Ante meridiem and Post AM or PM, not supported by ICU
+            'g' => 'h',     // 12-hour format of an hour without leading zeros 1 to 12h
+            // 12-hour format of an hour without leading zeros 0 to 11h, not supported by php
+            'G' => 'H',     // 24-hour format of an hour without leading zeros 0 to 23h
+            // 24-hour format of an hour without leading zeros 1 to 24h, not supported by php
+            'h' => 'hh',    // 12-hour format of an hour with leading zeros, 01 to 12 h
+            // 12-hour format of an hour with leading zeros, 00 to 11 h, not supported by php
+            'H' => 'HH',    // 24-hour format of an hour with leading zeros, 00 to 23 h
+            // 24-hour format of an hour with leading zeros, 01 to 24 h, not supported by php
+            // Minutes without leading zeros, not supported by php
+            'i' => 'mm',    // Minutes with leading zeros
+            // Seconds, without leading zeros, not supported by php
+            's' => 'ss',    // Seconds, with leading zeros
+            // millisecond (maximum of 3 significant digits), not supported by php
+            // milliseconds in day, not supported by php
+            'O' => 'Z',     // Difference to Greenwich time (GMT) in hours
+            'T' => 'z',     // Timezone abbreviation
+            // Timzone full name, not supported by php
+            'e' => 'VV',    // Timezone identifier eg. Europe/Berlin
+            'w' => '',      // Numeric representation of the day of the week 0=Sun, 6=Sat, not sup. ICU
+            // TODO
+            'T' => '',      // Number of days in the given month eg. 28 through 31, not sup. ICU
+            'L' => '',      //Whether it's a leap year 1= leap, 0= normal year, not sup. ICU
+            'O' => '',      // ISO-8601 year number. This has the same value as Y, except that if the ISO week number (W) belongs to the previous or next year, that year is used instead. not sup. ICU
+            'B' => '',      // Swatch Internet time, 000 to 999, not sup. ICU
+            'u' => '',      // Microseconds Note that date() will always generate 000000 since it takes an integer parameter, not sup. ICU
+            'P' => '',      // Difference to Greenwich time (GMT) with colon between hours and minutes, not sup. ICU
+            'Z' => '',      // Timezone offset in seconds. The offset for timezones west of UTC is always negative, and for those east of UTC is always positive, not sup. ICU
+            'c' => 'yyy-MM-dd\'T\'mm:HH:ssZ', //ISO 8601 date, it works only if nothing else than 'c' is in pattern.
+            'r' => 'eee, dd MMM yyyy mm:HH:ss Z', // » RFC 2822 formatted date, it works only if nothing else than 'r' is in pattern
+            'U' => ''       // Seconds since the Unix Epoch (January 1 1970 00:00:00 GMT), not supported in ICU
+
+        ]);
+    }
+
+    /**
+     * Formats a date, time or datetime in a float number as timestamp (seconds since 01-01-1970).
+     * @param string $value
+     * @return float timestamp TODO
+     */
+    public function asTimestamp($value)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        return number_format($this->normalizeDatetimeValue($value), 0, '.', '');
+    }
+
+    /**
+     * Formats the value as the time interval between a date and now in human readable form.
+     *
+     * @param integer|string|DateTime|\DateInterval $value the value to be formatted. The following
+     * types of value are supported:
+     *
+     * - an integer representing a UNIX timestamp
+     * - a string that can be parsed into a UNIX timestamp via `strtotime()` or that can be passed to a DateInterval constructor.
+     * - a PHP DateTime object
+     * - a PHP DateInterval object (a positive time interval will refer to the past, a negative one to the future)
+     *
+     * @param integer|string|DateTime|\DateInterval $referenceTime if specified the value is used instead of now
+     * @return string the formatted result
+     * @throws InvalidParamException if the input value can not be evaluated as a date value.
+     */
+    public function asRelativeTime($value, $referenceTime = null)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+
+        if ($value instanceof \DateInterval) {
+            $interval = $value;
+        } else {
+            $timestamp = $this->normalizeDatetimeValue($value);
+
+            if ($timestamp === false) {
+                // $value is not a valid date/time value, so we try
+                // to create a DateInterval with it
+                try {
+                    $interval = new \DateInterval($value);
+                } catch (\Exception $e) {
+                    // invalid date/time and invalid interval
+                    return $this->nullDisplay;
+                }
+            } else {
+                $timezone = new \DateTimeZone($this->timeZone);
+
+                if ($referenceTime === null) {
+                    $dateNow = new DateTime('now', $timezone);
+                } else {
+                    $referenceTime = $this->normalizeDatetimeValue($referenceTime);
+                    $dateNow = new DateTime(null, $timezone);
+                    $dateNow->setTimestamp($referenceTime);
+                }
+
+                $dateThen = new DateTime(null, $timezone);
+                $dateThen->setTimestamp($timestamp);
+
+                $interval = $dateThen->diff($dateNow);
+            }
+        }
+
+        if ($interval->invert) {
+            if ($interval->y >= 1) {
+                return Yii::t('yii', 'in {delta, plural, =1{a year} other{# years}}', ['delta' => $interval->y]);
+            }
+            if ($interval->m >= 1) {
+                return Yii::t('yii', 'in {delta, plural, =1{a month} other{# months}}', ['delta' => $interval->m]);
+            }
+            if ($interval->d >= 1) {
+                return Yii::t('yii', 'in {delta, plural, =1{a day} other{# days}}', ['delta' => $interval->d]);
+            }
+            if ($interval->h >= 1) {
+                return Yii::t('yii', 'in {delta, plural, =1{an hour} other{# hours}}', ['delta' => $interval->h]);
+            }
+            if ($interval->i >= 1) {
+                return Yii::t('yii', 'in {delta, plural, =1{a minute} other{# minutes}}', ['delta' => $interval->i]);
+            }
+
+            return Yii::t('yii', 'in {delta, plural, =1{a second} other{# seconds}}', ['delta' => $interval->s]);
+        } else {
+            if ($interval->y >= 1) {
+                return Yii::t('yii', '{delta, plural, =1{a year} other{# years}} ago', ['delta' => $interval->y]);
+            }
+            if ($interval->m >= 1) {
+                return Yii::t('yii', '{delta, plural, =1{a month} other{# months}} ago', ['delta' => $interval->m]);
+            }
+            if ($interval->d >= 1) {
+                return Yii::t('yii', '{delta, plural, =1{a day} other{# days}} ago', ['delta' => $interval->d]);
+            }
+            if ($interval->h >= 1) {
+                return Yii::t('yii', '{delta, plural, =1{an hour} other{# hours}} ago', ['delta' => $interval->h]);
+            }
+            if ($interval->i >= 1) {
+                return Yii::t('yii', '{delta, plural, =1{a minute} other{# minutes}} ago', ['delta' => $interval->i]);
+            }
+
+            return Yii::t('yii', '{delta, plural, =1{a second} other{# seconds}} ago', ['delta' => $interval->s]);
+        }
+    }
+
+
+    // number formats
+
+
+    /**
+     * Formats the value as an integer number by removing any digits without rounding.
+     * @param mixed $value the value to be formatted
+     * @return string the formatting result.
+     * @throws InvalidParamException if the input value is not numeric.
+     */
+    public function asInteger($value) // TODO customizing
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        $value = $this->normalizeNumericValue($value);
+        if ($this->_intlLoaded) {
+            $f = $this->createNumberFormatter(NumberFormatter::DECIMAL);
+            return $f->format($value, NumberFormatter::TYPE_INT64);
+        } else {
+            return number_format((int) $value, 0, $this->decimalSeparator, $this->thousandSeparator);
+        }
+    }
+
+    /**
+     * Formats the value as a decimal number.
+     *
+     * Property [[decimalSeparator]] will be used to represent the decimal point. The
+     * value is rounded automatically to the defined decimal digits.
+     *
+     * PHP and ICU has different behaviour about number of zeros in fraction digits.
+     * PHP fills up to defined decimals (eg. 2.500000 [6]) while ICU hide unnecessary digits.
+     * (eg. 2.5 [6]). Until 5 fractional digits in this function is defined to 5 up with zeros.
+     *
+     * @param mixed $value the value to be formatted
+     * @param integer|string $decimals the number of digits after the decimal point if the value is an integer
+     *          otherwise it's is a format pattern string (this works only with [PHP intl extension](http://php.net/manual/en/book.intl.php) [icu]).
+//     * @param float $roundIncr Amount to which smaller fractation are rounded. Ex. 0.05 -> <=2.024 to 2.00 / >=2.025 to 2.05
+//     *          works with [PHP intl extension](http://php.net/manual/en/book.intl.php) library only.
+//     * @param boolean $grouping Per standard numbers are grouped in thousands. False = no grouping
+     * @return string the formatting result.
+     * @throws InvalidParamException if the input value is not numeric.
+     * @see decimalSeparator
+     * @see thousandSeparator
+     */
+    public function asDecimal($value, $decimals = 2)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        $value = $this->normalizeNumericValue($value);
+
+        if ($this->_intlLoaded) {
+            $f = $this->createNumberFormatter(NumberFormatter::DECIMAL);
+//            if ($decimals !== null){
+//                $f->setAttribute(NumberFormatter::MAX_FRACTION_DIGITS, $decimals);
+//                if ($decimals <= 5){
+//                    $f->setAttribute(NumberFormatter::MIN_FRACTION_DIGITS, $decimals);
+//                }
+//            }
+//            if ($roundIncr == null and $this->roundingIncrement != null){
+//                $roundIncr = $this->roundingIncrement;
+//            }
+//            if ($roundIncr != null){
+//                $f->setAttribute(NumberFormatter::ROUNDING_INCREMENT, $roundIncr);
+//            }
+//            if ($grouping === false){
+//                $f->setAttribute(NumberFormatter::GROUPING_USED, false);
+//            }
+            return $f->format($value);
+        } else {
+
+//            if ($roundIncr !== null){
+//                $part = explode('.', (string)$roundIncr);
+//                if ((string)$roundIncr != '0.05'){  // exception for Swiss rounding.
+//                    $roundIncr = $decimals;
+//                    if (intval($part[0]) > 0){
+//                        if (substr($part[0], 0, 1) === '1'){
+//                            $roundIncr = (strlen($part[0]) -1) * -1 ;
+//                        } else {
+//                            throw new InvalidParamException('$roundIncr must have "1" only eg. 0.01 or 10 but not 0.02 or 20');
+//                        }
+//                    } elseif (isset($part[1]) and intval($part[1])>0) {
+//                        if (substr($part[1], -1) === '1'){
+//                            $roundIncr = strlen($part[1]);
+//                        } else {
+//                            throw new InvalidParamException('$roundIncr must have "1" only eg. 0.01 or 10 but not 0.02 or 20');
+//                        }
+//                    }
+//                    $value = round($value, $roundIncr);
+//                } else {
+//                    $value = round($value/5,2)*5;
+//                }
+//            }
+//            if ($decimals === null){
+//                $decimals = 0;
+//            }
+//            $grouping = $grouping === true ? $this->thousandSeparator : '';
+            return number_format($value, $decimals, $this->decimalSeparator, $this->thousandSeparator);
+        }
+    }
+
+
+    /**
+     * Formats the value as a percent number with "%" sign.
+     * @param mixed $value the value to be formatted. It must be a factor eg. 0.75 -> 75%
+//     * @param string $format Number of decimals (default = 2) or format pattern ICU
+//     * Please refer to [ICU manual](http://www.icu-project.org/apiref/icu4c/classDecimalFormat.html#_details)
+//     * for details on how to specify a format.
+     * @param int $decimals
+//     * @param bool $grouping
+     * @return string the formatted result.
+     * @throws InvalidParamException if the input value is not numeric.
+     */
+    public function asPercent($value, $decimals = 0)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        $value = $this->normalizeNumericValue($value);
+
+        if ($this->_intlLoaded) {
+            $f = $this->createNumberFormatter(NumberFormatter::PERCENT);
+//            if ($decimals !== null){
+//                $f->setAttribute(NumberFormatter::MAX_FRACTION_DIGITS, $decimals);
+//                if ($decimals <= 5){
+//                    $f->setAttribute(NumberFormatter::MIN_FRACTION_DIGITS, $decimals);
+//                }
+//            }
+//            if ($grouping === false){
+//                $f->setAttribute(NumberFormatter::GROUPING_USED, false);
+//            }
+            return $f->format($value);
+        } else {
+            $value = $value * 100;
+            return number_format($value, $decimals, $this->decimalSeparator, $this->thousandSeparator) . '%';
+        }
+    }
+
+    /**
+     * Formats the value as a scientific number.
+     * @param mixed $value the value to be formatted
+//     * @param string $format the format to be used. Please refer to [ICU manual](http://www.icu-project.org/apiref/icu4c/classDecimalFormat.html#_details)
+//     * for details on how to specify a format.
+     * @param int $decimals
+     * @return string the formatted result.
+     * @throws InvalidParamException if the input value is not numeric.
+     */
+    public function asScientific($value, $decimals = 0)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        $value = $this->normalizeNumericValue($value);
+
+        if ($this->_intlLoaded){
+            $f = $this->createNumberFormatter(NumberFormatter::SCIENTIFIC);
+//            if ($decimals !== null){
+//                $f->setAttribute(NumberFormatter::MAX_FRACTION_DIGITS, $decimals);
+//            }
+            return $f->format($value);
+        } else {
+            if ($decimals !== null) {
+                return sprintf("%.{$decimals}E", $value);
+            } else {
+                return sprintf("%.E", $value);
+            }
+        }
+    }
+
+    /**
+     * Formats the value as a currency number.
+     * @param mixed $value the value to be formatted
+     * @param string $currency the 3-letter ISO 4217 currency code indicating the currency to use.
+     * @param string $format the format to be used. Please refer to [ICU manual](http://www.icu-project.org/apiref/icu4c/classDecimalFormat.html#_details)
+     * for details on how to specify a format. TODO ignored when not [PHP intl extension](http://php.net/manual/en/book.intl.php)
+     * @param float $roundIncrement : Amount to which smaller fractation are rounded. Ex. 0.05 -> <=2.024 to 2.00 / >=2.025 to 2.05
+     *         works with "intl" library only.
+     * @param null $grouping
+     * @return string the formatted result.
+     * @throws InvalidParamException if the input value is not numeric.
+     */
+    public function asCurrency($value, $currency = null) //, $format = null, $roundIncrement = null,  $grouping = null)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        $value = $this->normalizeNumericValue($value); // TODO maybe not a good idea to cast money values?
+
+        if ($currency === null) {
+            $currency = $this->currencyCode;
+        }
+//        if ($roundIncrement === null and $this->roundingIncrCurrency != null){
+//            $roundIncrement = $this->roundingIncrCurrency;
+//        }
+
+        if ($this->_intlLoaded) {
+            $formatter = $this->createNumberFormatter(NumberFormatter::CURRENCY);
+//            if ($grouping !== null){
+//                $formatter->setAttribute(NumberFormatter::GROUPING_USED, false);
+//            }
+//            if ($roundIncrement !== null){
+//                $formatter->setAttribute(NumberFormatter::ROUNDING_INCREMENT, $roundIncrement);
+//            }
+            return $formatter->formatCurrency($value, $currency);
+        } else {
+            return $currency . ' ' . $this->asDecimal($value, 2);
+        }
+    }
+
+    /**
+     * Formats the value as a number spellout.
+     * // TODO requires intl
+     * @param mixed $value the value to be formatted
+     * @return string the formatted result.
+     * @throws InvalidParamException if the input value is not numeric.
+     * @throws NotSupportedException
+     */
+    public function asSpellout($value)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        $value = $this->normalizeNumericValue($value);
+        if ($this->_intlLoaded){
+            $f = $this->createNumberFormatter(NumberFormatter::SPELLOUT);
+            return $f->format($value);
+        } else {
+            throw new NotSupportedException('Format as Spellout is only supported when PHP intl extension is installed.');
+        }
+    }
+
+    /**
+     * Formats the value as a ordinal value of a number.
+     * // TODO requires intl
+     * @param mixed $value the value to be formatted
+     * @return string the formatted result.
+     * @throws InvalidParamException if the input value is not numeric.
+     * @throws NotSupportedException
+     */
+    public function asOrdinal($value)
+    {
+        if ($value === null) {
+            return $this->nullDisplay;
+        }
+        $value = $this->normalizeNumericValue($value);
+        if ($this->_intlLoaded){
+            $f = $this->createNumberFormatter(NumberFormatter::ORDINAL);
+            return $f->format($value);
+        } else {
+            throw new NotSupportedException('Format as Ordinal is only supported when PHP intl extension is installed.');
+        }
+    }
+
+    /**
+     * Formats the value in bytes as a size in human readable form.
+     * @param integer $value value in bytes to be formatted
+     * @param boolean $verbose if full names should be used (e.g. bytes, kilobytes, ...).
+     * Defaults to false meaning that short names will be used (e.g. B, KB, ...).
+     * @return string the formatted result
+     * @throws InvalidParamException if the input value is not numeric.
+     * @see sizeFormat
+     */
+    public function asSize($value, $verbose = false)
+    {
+        $position = 0;
+        do {
+            if ($value < $this->sizeFormat['base']) {
+                break;
+            }
+            $value = $value / $this->sizeFormat['base'];
+            $position++;
+        } while ($position < 6);
+
+        $value = round($value, $this->sizeFormat['decimals']); // todo
+        $formattedValue = isset($this->sizeFormat['decimalSeparator']) ? str_replace('.', $this->sizeFormat['decimalSeparator'], $value) : $value;
+        $params = ['n' => $formattedValue];
+
+        switch ($position) {
+            case 0:
+                return $verbose ? Yii::t('yii', '{n, plural, =1{# byte} other{# bytes}}', $params) : Yii::t('yii', '{n} B', $params);
+            case 1:
+                return $verbose ? Yii::t('yii', '{n, plural, =1{# kilobyte} other{# kilobytes}}', $params) : Yii::t('yii', '{n} KB', $params);
+            case 2:
+                return $verbose ? Yii::t('yii', '{n, plural, =1{# megabyte} other{# megabytes}}', $params) : Yii::t('yii', '{n} MB', $params);
+            case 3:
+                return $verbose ? Yii::t('yii', '{n, plural, =1{# gigabyte} other{# gigabytes}}', $params) : Yii::t('yii', '{n} GB', $params);
+            case 4:
+                return $verbose ? Yii::t('yii', '{n, plural, =1{# terabyte} other{# terabytes}}', $params) : Yii::t('yii', '{n} TB', $params);
+            default:
+                return $verbose ? Yii::t('yii', '{n, plural, =1{# petabyte} other{# petabytes}}', $params) : Yii::t('yii', '{n} PB', $params);
+        }
+    }
+
+    protected function normalizeNumericValue($value)
+    {
+        if (is_string($value) && is_numeric($value)) {
+            $value = (float) $value;
+        }
+        if (!is_numeric($value)) {
+            throw new InvalidParamException("'$value' is not a numeric value.");
+        }
+        return $value;
+    }
+
+
+    /**
+     * Creates a number formatter based on the given type and format.
+     * @param integer $type the type of the number formatter
+     * Values: NumberFormatter::DECIMAL, ::CURRENCY, ::PERCENT, ::SCIENTIFIC, ::SPELLOUT, ::ORDINAL
+     *          ::DURATION, ::PATTERN_RULEBASED, ::DEFAULT_STYLE, ::IGNORE
+     * @param string $format the format to be used. Please refer to
+     * [ICU manual](http://www.icu-project.org/apiref/icu4c/classDecimalFormat.html#_details)
+     * @return NumberFormatter the created formatter instance
+     */
+    protected function createNumberFormatter($style)
+    {
+        $formatter = new NumberFormatter($this->locale, $style);
+
+        if ($this->decimalSeparator !== null) {
+            $formatter->setSymbol(NumberFormatter::DECIMAL_SEPARATOR_SYMBOL, $this->decimalSeparator);
+        }
+        if ($this->thousandSeparator !== null) {
+            $formatter->setSymbol(NumberFormatter::GROUPING_SEPARATOR_SYMBOL, $this->thousandSeparator);
+        }
+
+//        if ($format !== null) {
+//            $formatter->setPattern($format);
+//        } else {
+//            $formatter->setSymbol(NumberFormatter::DECIMAL_SEPARATOR_SYMBOL, $this->decimalSeparator);
+//            $formatter->setSymbol(NumberFormatter::GROUPING_SEPARATOR_SYMBOL, $this->thousandSeparator);
+//        }
+
+//        if (!empty($this->numberFormatOptions)) {
+//            foreach ($this->numberFormatOptions as $name => $attribute) {
+//                $formatter->setAttribute($name, $attribute);
+//            }
+//        }
+//        if (!empty($this->numberTextFormatOptions)) {
+//            foreach ($this->numberTextFormatOptions as $name => $attribute) {
+//                $formatter->setTextAttribute($name, $attribute);
+//            }
+//        }
+
+        return $formatter;
+    }
+
+}
