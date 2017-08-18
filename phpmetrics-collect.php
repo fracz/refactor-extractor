@@ -1,9 +1,9 @@
 <?php
 require 'vendor/autoload.php';
 
-const POSITIVE_VECTORS_FILE = __DIR__ . '/results/positive.csv';
-const NEGATIVE_VECTORS_FILE = __DIR__ . '/results/negative.csv';
-const DELTA_VECTORS_FILE = __DIR__ . '/results/delta.csv';
+const POSITIVE_VECTORS_FILE = __DIR__ . '/results/single-file-commits-positive.csv';
+const NEGATIVE_VECTORS_FILE = __DIR__ . '/results/single-file-commits-negative.csv';
+const DELTA_VECTORS_FILE = __DIR__ . '/results/single-file-commits-delta.csv';
 
 @unlink(POSITIVE_VECTORS_FILE);
 @unlink(NEGATIVE_VECTORS_FILE);
@@ -27,6 +27,9 @@ foreach ($projects as $project) {
             ++$changesCount;
             $metricsAfter = createAssocArrayFromMetrics(json_decode(file_get_contents($metricsAfterPath), true));
             $metricsBefore = createAssocArrayFromMetrics(json_decode(file_get_contents($metricsBeforePath), true));
+            if (count($metricsAfter) != count($metricsBefore) || count($metricsAfter) != 1) {
+                continue;
+            }
             foreach ($metricsBefore as $filename => $fileMetricsBefore) {
                 if (isset($metricsAfter[$filename])) {
                     $fileMetricsAfter = $metricsAfter[$filename];
