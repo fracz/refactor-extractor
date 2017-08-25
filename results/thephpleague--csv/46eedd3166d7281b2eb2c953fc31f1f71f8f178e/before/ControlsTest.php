@@ -1,0 +1,227 @@
+<?php
+
+namespace League\Csv\test;
+
+use League\Csv\Reader;
+use League\Csv\Writer;
+use PHPUnit_Framework_TestCase;
+use SplFileObject;
+use SplTempFileObject;
+
+date_default_timezone_set('UTC');
+
+/**
+ * @group controls
+ */
+class ControlsTest extends PHPUnit_Framework_TestCase
+{
+    private $csv;
+
+    private $expected = [
+        ['john', 'doe', 'john.doe@example.com'],
+        ['jane','doe','jane.doe@example.com'],
+    ];
+
+    public function setUp()
+    {
+        $csv = new SplTempFileObject();
+        foreach ($this->expected as $row) {
+            $csv->fputcsv($row);
+        }
+
+        $this->csv = Reader::createFromFileObject($csv, "\n");
+    }
+
+    public function tearDown()
+    {
+        $this->csv = null;
+    }
+
+    /**
+     * @expectedException InvalidArgumentException
+     * @expectedExceptionMessage The delimiter must be a single character
+     */
+    public function testDelimeter()
+    {
+        $this->csv->setDelimiter('o');
+        $this->assertSame('o', $this->csv->getDelimiter());
+
+        $this->csv->setDelimiter('foo');
+    }
+
+    public function testBOMSettings()
+    {
+        $this->assertNull($this->csv->getOutputBOM());
+        $this->csv->setOutputBOM(Reader::BOM_UTF8);
+        $this->assertSame(Reader::BOM_UTF8, $this->csv->getOutputBOM());
+        $this->csv->setOutputBOM();
+        $this->assertNull($this->csv->getOutputBOM());
+    }
+
+    public function testAddBOMSequences()
+    {
+        $this->csv->setOutputBOM(Reader::BOM_UTF8);
+        $expected = chr(239).chr(187).chr(191).'john,doe,john.doe@example.com'.PHP_EOL
+            .'jane,doe,jane.doe@example.com'.PHP_EOL;
+        $this->assertSame($expected, $this->csv->__toString());
+    }
+
+    public function testGetBomOnInputWithNoBOM()
+    {
+        $expected = 'john,doe,john.doe@example.com'.PHP_EOL
+            .'jane,doe,jane.doe@example.com'.PHP_EOL;
+        $reader = Reader::createFromString($expected);
+        $this->assertEmpty($reader->getInputBOM());
+    }
+
+    public function testGetBomOnInputWithBOM()
+    {
+        $expected = Reader::BOM_UTF32_BE.'john,doe,john.doe@example.com'.PHP_EOL
+            .'jane,doe,jane.doe@example.com'.PHP_EOL;
+        $reader = Reader::createFromString($expected);
+        $this->assertSame(Reader::BOM_UTF32_BE, $reader->getInputBOM());
+        $this->assertSame(Reader::BOM_UTF32_BE, $reader->getInputBOM());
+    }
+
+    public function testChangingBOMOnOutput()
+    {
+        $text = 'john,doe,john.doe@example.com'.PHP_EOL
+            .'jane,doe,jane.doe@example.com'.PHP_EOL;
+        $reader = Reader::createFromString(Reader::BOM_UTF32_BE.$text);
+        $reader->setOutputBOM(Reader::BOM_UTF8);
+        $this->assertSame(Reader::BOM_UTF8.$text, $reader->__toString());
+    }
+
+    public function testDetectDelimiterList()
+    {
+        $this->assertSame([4 => ','], $this->csv->detectDelimiterList());
+    }
+
+    /**
+     * @expectedException InvalidArgumentException
+     * @expectedExceptionMessage The number of rows to consider must be a valid positive integer
+     */
+    public function testDetectDelimiterListWithInvalidRowLimit()
+    {
+        $this->csv->detectDelimiterList(-4);
+    }
+
+    public function testDetectDelimiterListWithNoCSV()
+    {
+        $file = new SplTempFileObject();
+        $file->fwrite("How are you today ?\nI'm doing fine thanks!");
+        $csv = Writer::createFromFileObject($file);
+        $this->assertSame([], $csv->detectDelimiterList(5, ['toto', '|']));
+    }
+
+    public function testDetectDelimiterListWithInconsistentCSV()
+    {
+        $data = new SplTempFileObject();
+        $data->setCsvControl(';');
+        $data->fputcsv(['toto', 'tata', 'tutu']);
+        $data->setCsvControl('|');
+        $data->fputcsv(['toto', 'tata', 'tutu']);
+        $data->fputcsv(['toto', 'tata', 'tutu']);
+        $data->fputcsv(['toto', 'tata', 'tutu']);
+
+        $csv = Writer::createFromFileObject($data);
+        $this->assertSame([12 => '|', 4 => ';'], $csv->detectDelimiterList(5, ['|']));
+    }
+
+    /**
+     * @expectedException InvalidArgumentException
+     * @expectedExceptionMessage The escape character must be a single character
+     */
+    public function testEscape()
+    {
+        $this->csv->setEscape('o');
+        $this->assertSame('o', $this->csv->getEscape());
+
+        $this->csv->setEscape('foo');
+    }
+
+    /**
+     * @expectedException InvalidArgumentException
+     * @expectedExceptionMessage The enclosure must be a single character
+     */
+    public function testEnclosure()
+    {
+        $this->csv->setEnclosure('o');
+        $this->assertSame('o', $this->csv->getEnclosure());
+
+        $this->csv->setEnclosure('foo');
+    }
+
+    /**
+     * @expectedException InvalidArgumentException
+     * @expectedExceptionMessage you should use a valid charset
+     */
+    public function testEncoding()
+    {
+        $expected = 'iso-8859-15';
+        $this->csv->setEncodingFrom($expected);
+        $this->assertSame(strtoupper($expected), $this->csv->getEncodingFrom());
+
+        $this->csv->setEncodingFrom('');
+    }
+
+    /**
+     * @expectedException InvalidArgumentException
+     * @expectedExceptionMessage you should use a `SplFileObject` Constant
+     */
+    public function testSetFlags()
+    {
+        $this->assertSame(SplFileObject::READ_CSV, $this->csv->getFlags() & SplFileObject::READ_CSV);
+        $this->assertSame(SplFileObject::SKIP_EMPTY, $this->csv->getFlags() & SplFileObject::SKIP_EMPTY);
+        $this->assertSame(SplFileObject::READ_AHEAD, $this->csv->getFlags() & SplFileObject::READ_AHEAD);
+        $this->csv->setFlags(SplFileObject::DROP_NEW_LINE);
+        $this->assertSame(SplFileObject::DROP_NEW_LINE, $this->csv->getFlags() & SplFileObject::DROP_NEW_LINE);
+        $this->assertSame(SplFileObject::READ_CSV, $this->csv->getFlags() & SplFileObject::READ_CSV);
+
+        $this->csv->setFlags(-3);
+    }
+
+    public function testCustomNewline()
+    {
+        $csv = Writer::createFromFileObject(new SplTempFileObject());
+        $this->assertSame("\n", $csv->getNewline());
+        $csv->setNewline("\r\n");
+        $this->assertSame("\r\n", $csv->getNewline());
+    }
+
+    /**
+     * @param $flag
+     * @param $line_count
+     * @dataProvider appliedFlagsProvider
+     */
+    public function testAppliedFlags($flag, $line_count)
+    {
+        if (defined('HHVM_VERSION')) {
+            $this->markTestSkipped('HHVM CSV parsing is different');
+        }
+        $path = __DIR__.'/data/tmp.txt';
+        $obj  = new SplFileObject($path, 'w+');
+        $obj->fwrite("1st\n2nd\n");
+        $reader = Reader::createFromFileObject($obj);
+        $reader->setFlags($flag);
+        $this->assertCount($line_count, $reader->fetchAll());
+        unlink($path);
+    }
+
+    public function appliedFlagsProvider()
+    {
+        return [
+            'NONE' => [0, 3],
+            'DROP_NEW_LINE' => [SplFileObject::DROP_NEW_LINE, 3],
+            'READ_AHEAD' => [SplFileObject::READ_AHEAD, 3],
+            'SKIP_EMPTY' => [SplFileObject::SKIP_EMPTY, 2],
+            'READ_AHEAD|DROP_NEW_LINE' => [SplFileObject::READ_AHEAD | SplFileObject::DROP_NEW_LINE, 3],
+            'READ_AHEAD|SKIP_EMPTY' => [SplFileObject::READ_AHEAD | SplFileObject::SKIP_EMPTY, 2],
+            'DROP_NEW_LINE|SKIP_EMPTY' => [SplFileObject::DROP_NEW_LINE | SplFileObject::SKIP_EMPTY, 2],
+            'READ_AHEAD|DROP_NEW_LINE|SKIP_EMPTY' => [
+                SplFileObject::READ_AHEAD | SplFileObject::DROP_NEW_LINE | SplFileObject::SKIP_EMPTY,
+                2,
+            ],
+        ];
+    }
+}

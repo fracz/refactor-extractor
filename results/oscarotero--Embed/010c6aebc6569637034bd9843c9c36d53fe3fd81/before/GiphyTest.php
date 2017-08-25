@@ -1,0 +1,15 @@
+<?php
+class GiphyTest extends PHPUnit_Framework_TestCase
+{
+    public function testOne()
+    {
+        $info = Embed\Embed::create('http://giphy.com/gifs/puppies-cute-animals-asdfghjkl-6UZFwMYqCeXi8');
+
+        $this->assertEquals($info->title, 'Puppies Animated GIF');
+        $this->assertEquals($info->type, 'video');
+        $this->assertEquals($info->providerName, 'Giphy');
+        $this->assertEquals($info->code, '<iframe src="https://giphy.com/embed/6UZFwMYqCeXi8?html5=true" frameborder="0" allowTransparency="true" style="border:none;overflow:hidden;width:500px;height:280px;"></iframe>');
+        $this->assertEquals($info->width, 500);
+        $this->assertEquals($info->height, 280);
+    }
+}

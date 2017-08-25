@@ -1,0 +1,251 @@
+<?php
+/**
+ * RedUNIT_Base_Association
+ * @file 			RedUNIT/Base/Beancan.php
+ * @description		Tests BeanCan Server
+ * 					This class is part of the RedUNIT test suite for RedBeanPHP.
+ * @author			Gabor de Mooij
+ * @license			BSD
+ *
+ *
+ * (c) G.J.G.T. (Gabor) de Mooij
+ * This source file is subject to the BSD/GPLv2 License that is bundled
+ * with this source code in the file license.txt.
+ */
+class RedUNIT_Base_Beancan extends RedUNIT_Base {
+
+	/**
+	 * Begin testing.
+	 * This method runs the actual test pack.
+	 *
+	 * @return void
+	 */
+	public function run() {
+		$rs = ( s("candybar:store",array( array("brand"=>"funcandy","taste"=>"sweet") ) ) );
+		testpack("Test create");
+		asrt(is_string($rs),true);
+		$rs = json_decode($rs,true);
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),true);
+		asrt(($rs["id"]),"1234");
+		asrt(isset($rs["result"]),true);
+		asrt(($rs["result"]>0),true);
+		asrt(isset($rs["error"]),false);
+		asrt(count($rs),3);
+		$oldid = $rs["result"];
+		testpack("Test retrieve");
+		$rs = json_decode( s("candybar:load",array( $oldid ) ),true );
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(count($rs),3);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),true);
+		asrt(($rs["id"]),"1234");
+		asrt(isset($rs["result"]),true);
+		asrt(isset($rs["error"]),false);
+		asrt(is_array($rs["result"]),true);
+		asrt(count($rs["result"]),3);
+		asrt($rs["result"]["id"],(string)$oldid);
+		asrt($rs["result"]["brand"],"funcandy");
+		asrt($rs["result"]["taste"],"sweet");
+		testpack("Test update");
+		$rs = json_decode( s("candybar:store",array( array( "id"=>$oldid, "taste"=>"salty" ) ),"42" ),true );
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(count($rs),3);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),true);
+		asrt(($rs["id"]),"42");
+		asrt(isset($rs["result"]),true);
+		asrt(isset($rs["error"]),false);
+		$rs = json_decode( s("candybar:load",array( $oldid ) ),true );
+		asrt($rs["result"]["taste"],"salty");
+		$rs = json_decode( s("candybar:store",array( array("brand"=>"darkchoco","taste"=>"bitter") ) ), true );
+		$id2 = $rs["result"];
+		$rs = json_decode( s("candybar:load",array( $oldid ) ),true );
+		asrt($rs["result"]["brand"],"funcandy");
+		asrt($rs["result"]["taste"],"salty");
+		$rs = json_decode( s("candybar:load",array( $id2 ) ),true );
+		asrt($rs["result"]["brand"],"darkchoco");
+		asrt($rs["result"]["taste"],"bitter");
+		testpack("Test delete");
+		$rs = json_decode( s("candybar:trash",array( $oldid )), true );
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(count($rs),3);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),true);
+		asrt(($rs["id"]),"1234");
+		asrt(isset($rs["result"]),true);
+		asrt(isset($rs["error"]),false);
+		asrt($rs["result"],"OK");
+		$rs = json_decode( s("candybar:load",array( $oldid ) ),true );
+		asrt(isset($rs["result"]),true);
+		asrt(isset($rs["error"]),false);
+		asrt($rs["result"]["id"],0);
+		$rs = json_decode( s("candybar:load",array( $id2 ) ),true );
+		asrt($rs["result"]["brand"],"darkchoco");
+		asrt($rs["result"]["taste"],"bitter");
+		testpack("Test Custom Method");
+		$rs = json_decode( s("candybar:customMethod",array( "test" )), true );
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(count($rs),3);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),true);
+		asrt(($rs["id"]),"1234");
+		asrt(isset($rs["result"]),true);
+		asrt(isset($rs["error"]),false);
+		asrt($rs["result"],"test!");
+
+		testpack("Test Negatives: parse error");
+		$can = new RedBean_BeanCan;
+		$rs =  json_decode( $can->handleJSONRequest( "crap" ), true);
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(count($rs),2);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),false);
+		asrt(isset($rs["result"]),false);
+		asrt(isset($rs["error"]),true);
+		asrt(isset($rs["error"]["code"]),true);
+		asrt($rs["error"]["code"],-32700);
+		testpack("invalid request");
+		$can = new RedBean_BeanCan;
+		$rs =  json_decode( $can->handleJSONRequest( '{"aa":"bb"}' ), true);
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(count($rs),2);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),false);
+		asrt(isset($rs["result"]),false);
+		asrt(isset($rs["error"]),true);
+		asrt(isset($rs["error"]["code"]),true);
+		asrt($rs["error"]["code"],-32600);
+		$rs =  json_decode( $can->handleJSONRequest( '{"jsonrpc":"9.1"}' ), true);
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(count($rs),2);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),false);
+		asrt(isset($rs["result"]),false);
+		asrt(isset($rs["error"]),true);
+		asrt(isset($rs["error"]["code"]),true);
+		asrt($rs["error"]["code"],-32600);
+		$rs =  json_decode( $can->handleJSONRequest( '{"id":9876,"jsonrpc":"9.1"}' ), true);
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(count($rs),2);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),false);
+		asrt(isset($rs["result"]),false);
+		asrt(isset($rs["error"]),true);
+		asrt(isset($rs["error"]["code"]),true);
+		asrt($rs["error"]["code"],-32600);
+		$rs = json_decode( s("wrong",array( "test" )), true );
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(count($rs),3);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),true);
+		asrt(($rs["id"]),"1234");
+		asrt(isset($rs["result"]),false);
+		asrt(isset($rs["error"]),true);
+		asrt($rs["error"]["code"],-32600);
+		asrt($rs["error"]["message"],"Invalid method signature. Use: BEAN:ACTION");
+
+		$rs = json_decode( s(".;':wrong",array( "test" )), true );
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(count($rs),3);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),true);
+		asrt(($rs["id"]),"1234");
+		asrt(isset($rs["result"]),false);
+		asrt(isset($rs["error"]),true);
+		asrt($rs["error"]["code"],-32600);
+		asrt($rs["error"]["message"],"Invalid Bean Type String");
+
+		$rs = json_decode( s("wrong:.;'",array( "test" )), true );
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(count($rs),3);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),true);
+		asrt(($rs["id"]),"1234");
+		asrt(isset($rs["result"]),false);
+		asrt(isset($rs["error"]),true);
+		asrt($rs["error"]["code"],-32600);
+		asrt($rs["error"]["message"],"Invalid Action String");
+
+		$rs = json_decode( s("wrong:wrong",array( "test" )), true );
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(count($rs),3);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),true);
+		asrt(($rs["id"]),"1234");
+		asrt(isset($rs["result"]),false);
+		asrt(isset($rs["error"]),true);
+		asrt($rs["error"]["code"],-32601);
+		asrt($rs["error"]["message"],"No such bean in the can!");
+		$rs = json_decode( s("candybar:beHealthy",array( "test" )), true );
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(count($rs),3);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),true);
+		asrt(($rs["id"]),"1234");
+		asrt(isset($rs["result"]),false);
+		asrt(isset($rs["error"]),true);
+		asrt($rs["error"]["code"],-32601);
+		asrt($rs["error"]["message"],"Method not found in Bean: candybar ");
+		$rs = json_decode( s("candybar:store"), true );
+		asrt(is_array($rs),true);
+		asrt(empty($rs),false);
+		asrt(count($rs),3);
+		asrt(isset($rs["jsonrpc"]),true);
+		asrt($rs["jsonrpc"],"2.0");
+		asrt(isset($rs["id"]),true);
+		asrt(($rs["id"]),"1234");
+		asrt(isset($rs["result"]),false);
+		asrt(isset($rs["error"]),true);
+		asrt($rs["error"]["code"],-32602);
+		$rs = json_decode( s("pdo:connect",array("abc")), true );
+		asrt($rs["error"]["code"],-32601);
+		$rs = json_decode( s("stdClass:__toString",array("abc")), true );
+		asrt($rs["error"]["code"],-32601);
+
+		R::nuke();
+		$server = new RedBean_BeanCan();
+		$book = R::dispense('book');
+		$book->title = 'book 1';
+		$id1 = R::store($book);
+		$book = R::dispense('book');
+		$book->title = 'book 2';
+		$id2 = R::store($book);
+
+		asrt(json_decode($server->handleRESTGetRequest('book/'.$id1))->result->title,'book 1');
+		asrt(json_decode($server->handleRESTGetRequest('book/'.$id2))->result->title,'book 2');
+		$r = json_decode($server->handleRESTGetRequest('book'),true);
+		$a = $r['result'];
+		asrt(count($a),2);
+	}
+
+}
