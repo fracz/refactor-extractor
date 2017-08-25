@@ -1,0 +1,174 @@
+<?php  //$Id$
+
+// This file keeps track of upgrades to
+// the forum module
+//
+// Sometimes, changes between versions involve
+// alterations to database structures and other
+// major things that may break installations.
+//
+// The upgrade function in this file will attempt
+// to perform all the necessary actions to upgrade
+// your older installtion to the current version.
+//
+// If there's something it cannot do itself, it
+// will tell you what you need to do.
+//
+// The commands in here will all be database-neutral,
+// using the methods of database_manager class
+//
+// Please do not forget to use upgrade_set_timeout()
+// before any action that may take longer time to finish.
+
+function xmldb_forum_upgrade($oldversion) {
+    global $CFG, $DB;
+
+    $dbman = $DB->get_manager(); // loads ddl manager and xmldb classes
+    $result = true;
+
+//===== 1.9.0 upgrade line ======//
+
+    if ($result and $oldversion < 2007101511) {
+        //MDL-13866 - send forum ratins to gradebook again
+        require_once($CFG->dirroot.'/mod/forum/lib.php');
+        forum_upgrade_grades();
+        upgrade_mod_savepoint($result, 2007101511, 'forum');
+    }
+
+    if ($result && $oldversion < 2007101512) {
+
+    /// Cleanup the forum subscriptions
+        notify('Removing stale forum subscriptions', 'notifysuccess');
+
+        $roles = get_roles_with_capability('moodle/course:view', CAP_ALLOW);
+        $roles = array_keys($roles);
+
+        list($usql, $params) = $DB->get_in_or_equal($roles);
+        $sql = "SELECT fs.userid, f.id AS forumid
+                  FROM {forum} f
+                       JOIN {course} c                 ON c.id = f.course
+                       JOIN {context} ctx              ON (ctx.instanceid = c.id AND ctx.contextlevel = ".CONTEXT_COURSE.")
+                       JOIN {forum_subscriptions} fs   ON fs.forum = f.id
+                       LEFT JOIN {role_assignments} ra ON (ra.contextid = ctx.id AND ra.userid = fs.userid AND ra.roleid $usql)
+                 WHERE ra.id IS NULL";
+
+        if ($rs = $DB->get_recordset_sql($sql, $params)) {
+            $DB->set_debug(false);
+            foreach ($rs as $remove) {
+                $DB->delete_records('forum_subscriptions', array('userid'=>$remove->userid, 'forum'=>$remove->forumid));
+                echo '.';
+            }
+            $DB->set_debug(true);
+            $rs->close();
+        }
+
+        upgrade_mod_savepoint($result, 2007101512, 'forum');
+    }
+
+    if ($result && $oldversion < 2008072800) {
+    /// Define field completiondiscussions to be added to forum
+        $table = new xmldb_table('forum');
+        $field = new xmldb_field('completiondiscussions');
+        $field->set_attributes(XMLDB_TYPE_INTEGER, '9', XMLDB_UNSIGNED, XMLDB_NOTNULL, null, null, null, '0', 'blockperiod');
+
+    /// Launch add field completiondiscussions
+        if(!$dbman->field_exists($table,$field)) {
+            $dbman->add_field($table, $field);
+        }
+
+        $field = new xmldb_field('completionreplies');
+        $field->set_attributes(XMLDB_TYPE_INTEGER, '9', XMLDB_UNSIGNED, XMLDB_NOTNULL, null, null, null, '0', 'completiondiscussions');
+
+    /// Launch add field completionreplies
+        if(!$dbman->field_exists($table,$field)) {
+            $dbman->add_field($table, $field);
+        }
+
+    /// Define field completionposts to be added to forum
+        $field = new xmldb_field('completionposts');
+        $field->set_attributes(XMLDB_TYPE_INTEGER, '9', XMLDB_UNSIGNED, XMLDB_NOTNULL, null, null, null, '0', 'completionreplies');
+
+    /// Launch add field completionposts
+        if(!$dbman->field_exists($table,$field)) {
+            $dbman->add_field($table, $field);
+        }
+        upgrade_mod_savepoint($result, 2008072800, 'forum');
+    }
+
+    if ($result && $oldversion < 2008081605) {
+
+        /////////////////////////////////////
+        /// new file storage upgrade code ///
+        /////////////////////////////////////
+
+        $fs = get_file_storage();
+
+        $empty = $DB->sql_empty(); // silly oracle empty string handling workaround
+
+        $sqlfrom = "FROM {forum_posts} p
+                    JOIN {forum_discussions} d ON d.id = p.discussion
+                    JOIN {forum} f ON f.id = d.forum
+                    JOIN {modules} m ON m.name = 'forum'
+                    JOIN {course_modules} cm ON (cm.module = m.id AND cm.instance = f.id)
+                   WHERE p.attachment <> '$empty' AND p.attachment <> '1'
+                ORDER BY f.course, f.id, d.id";
+
+        $count = $DB->count_records_sql("SELECT COUNT('x') $sqlfrom");
+
+        if ($rs = $DB->get_recordset_sql("SELECT p.*, d.forum, f.course, cm.id AS cmid $sqlfrom")) {
+
+            $pbar = new progress_bar('migrateforumfiles', 500, true);
+
+            $olddebug = $DB->get_debug();
+            $DB->set_debug(false); // lower debug level, there might be very many files
+            $i = 0;
+            foreach ($rs as $post) {
+                $i++;
+                upgrade_set_timeout(60); // set up timeout, may also abort execution
+                $pbar->update($i, $count, "Migrating forum posts - $i/$count.");
+
+                $filepath = "$CFG->dataroot/$post->course/$CFG->moddata/forum/$post->forum/$post->id/$post->attachment";
+                if (!is_readable($filepath)) {
+                    //file missing??
+                    notify("File not readable, skipping: ".$filepath);
+                    $post->attachment = '';
+                    $DB->update_record('forum_posts', $post);
+                    continue;
+                }
+                $context = get_context_instance(CONTEXT_MODULE, $post->cmid);
+
+                $filearea = 'forum_attachment';
+                $filename = clean_param($post->attachment, PARAM_FILE);
+                if ($filename === '') {
+                    notify("Unsupported post filename, skipping: ".$filepath);
+                    $post->attachment = '';
+                    $DB->update_record('forum_posts', $post);
+                    continue;
+                }
+                if (!$fs->file_exists($context->id, $filearea, $post->id, '/', $filename)) {
+                    $file_record = array('contextid'=>$context->id, 'filearea'=>$filearea, 'itemid'=>$post->id, 'filepath'=>'/', 'filename'=>$filename, 'userid'=>$post->userid);
+                    if ($fs->create_file_from_pathname($file_record, $filepath)) {
+                        $post->attachment = '1';
+                        if ($DB->update_record('forum_posts', $post)) {
+                            unlink($filepath);
+                        }
+                    }
+                }
+
+                // remove dirs if empty
+                @rmdir("$CFG->dataroot/$post->course/$CFG->moddata/forum/$post->forum/$post->id");
+                @rmdir("$CFG->dataroot/$post->course/$CFG->moddata/forum/$post->forum");
+                @rmdir("$CFG->dataroot/$post->course/$CFG->moddata/forum");
+            }
+            $DB->set_debug($olddebug); // reset debug level
+            $rs->close();
+        }
+
+        upgrade_mod_savepoint($result, 2008081605, 'forum');
+    }
+
+
+    return $result;
+}
+
+?>

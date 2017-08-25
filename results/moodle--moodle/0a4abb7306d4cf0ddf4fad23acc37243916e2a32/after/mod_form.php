@@ -1,0 +1,351 @@
+<?php
+
+// This file is part of Moodle - http://moodle.org/
+//
+// Moodle is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Moodle is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with Moodle.  If not, see <http://www.gnu.org/licenses/>.
+
+/**
+ * Form to define a new instance of lesson or edit an instance.
+ * It is used from /course/modedit.php.
+ *
+ * @package   lesson
+ * @copyright 1999 onwards Martin Dougiamas  {@link http://moodle.com}
+ * @license   http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or late
+ **/
+
+require_once($CFG->dirroot.'/course/moodleform_mod.php');
+require_once($CFG->dirroot.'/mod/lesson/locallib.php');
+
+class mod_lesson_mod_form extends moodleform_mod {
+
+    protected $course = null;
+
+    public function mod_lesson_mod_form($current, $section, $cm, $course) {
+        $this->course = $course;
+        parent::moodleform_mod($current, $section, $cm, $course);
+    }
+
+    function definition() {
+        global $CFG, $COURSE, $DB;
+
+        $mform    = $this->_form;
+
+//-------------------------------------------------------------------------------
+        $mform->addElement('header', 'general', get_string('general', 'form'));
+
+        /** Legacy slideshow width element to maintain backwards compatibility */
+        $mform->addElement('hidden', 'width');
+        $mform->setType('width', PARAM_INT);
+        $mform->setDefault('width', $CFG->lesson_slideshowwidth);
+
+        /** Legacy slideshow height element to maintain backwards compatibility */
+        $mform->addElement('hidden', 'height');
+        $mform->setType('height', PARAM_INT);
+        $mform->setDefault('height', $CFG->lesson_slideshowheight);
+
+        /** Legacy slideshow background color element to maintain backwards compatibility */
+        $mform->addElement('hidden', 'bgcolor');
+        $mform->setType('bgcolor', PARAM_TEXT);
+        $mform->setDefault('bgcolor', $CFG->lesson_slideshowbgcolor);
+
+        /** Legacy media popup width element to maintain backwards compatibility */
+        $mform->addElement('hidden', 'mediawidth');
+        $mform->setType('mediawidth', PARAM_INT);
+        $mform->setDefault('mediawidth', $CFG->lesson_mediawidth);
+
+        /** Legacy media popup height element to maintain backwards compatibility */
+        $mform->addElement('hidden', 'mediaheight');
+        $mform->setType('mediaheight', PARAM_INT);
+        $mform->setDefault('mediaheight', $CFG->lesson_mediaheight);
+
+        /** Legacy media popup close button element to maintain backwards compatibility */
+        $mform->addElement('hidden', 'mediaclose');
+        $mform->setType('mediaclose', PARAM_BOOL);
+        $mform->setDefault('mediaclose', $CFG->lesson_mediaclose);
+
+        /** Legacy maximum highscores element to maintain backwards compatibility */
+        $mform->addElement('hidden', 'maxhighscores');
+        $mform->setType('maxhighscores', PARAM_INT);
+        $mform->setDefault('maxhighscores', $CFG->lesson_maxhighscores);
+
+        $mform->addElement('text', 'name', get_string('name'), array('size'=>'64'));
+        if (!empty($CFG->formatstringstriptags)) {
+            $mform->setType('name', PARAM_TEXT);
+        } else {
+            $mform->setType('name', PARAM_CLEAN);
+        }
+        $mform->addRule('name', null, 'required', null, 'client');
+
+        // Create a text box that can be enabled/disabled for lesson time limit
+        $timedgrp = array();
+        $timedgrp[] = &$mform->createElement('text', 'maxtime');
+        $timedgrp[] = &$mform->createElement('checkbox', 'timed', '', get_string('enable'));
+        $mform->addGroup($timedgrp, 'timedgrp', get_string('maxtime', 'lesson'), array(' '), false);
+        $mform->disabledIf('timedgrp', 'timed');
+
+        // Add numeric rule to text field
+        $timedgrprules = array();
+        $timedgrprules['maxtime'][] = array(null, 'numeric', null, 'client');
+        $mform->addGroupRule('timedgrp', $timedgrprules);
+
+        // Rest of group setup
+        $mform->setDefault('timed', 0);
+        $mform->setDefault('maxtime', 20);
+        $mform->setType('maxtime', PARAM_INT);
+        $mform->setHelpButton('timedgrp', array('timed', get_string('timed', 'lesson'), 'lesson'));
+
+        $numbers = array();
+        for ($i=20; $i>1; $i--) {
+            $numbers[$i] = $i;
+        }
+
+        $mform->addElement('date_time_selector', 'available', get_string('available', 'lesson'), array('optional'=>true));
+        $mform->setDefault('available', 0);
+
+        $mform->addElement('date_time_selector', 'deadline', get_string('deadline', 'lesson'), array('optional'=>true));
+        $mform->setDefault('deadline', 0);
+
+        $mform->addElement('select', 'maxanswers', get_string('maximumnumberofanswersbranches', 'lesson'), $numbers);
+        $mform->setDefault('maxanswers', $CFG->lesson_maxanswers);
+        $mform->setType('maxanswers', PARAM_INT);
+        $mform->setHelpButton('maxanswers', array('maxanswers', get_string('maximumnumberofanswersbranches', 'lesson'), 'lesson'));
+
+        $mform->addElement('selectyesno', 'usepassword', get_string('usepassword', 'lesson'));
+        $mform->setHelpButton('usepassword', array('usepassword', get_string('usepassword', 'lesson'), 'lesson'));
+        $mform->setDefault('usepassword', 0);
+        $mform->setAdvanced('usepassword');
+
+        $mform->addElement('passwordunmask', 'password', get_string('password', 'lesson'));
+        $mform->setHelpButton('password', array('password', get_string('password', 'lesson'), 'lesson'));
+        $mform->setDefault('password', '');
+        $mform->setType('password', PARAM_RAW);
+        $mform->setAdvanced('password');
+        $mform->disabledIf('password', 'usepassword', 'eq', 0);
+
+//-------------------------------------------------------------------------------
+        $mform->addElement('header', 'gradeoptions', get_string('gradeoptions', 'lesson'));
+
+        $mform->addElement('selectyesno', 'practice', get_string('practice', 'lesson'));
+        $mform->setHelpButton('practice', array('practice', get_string('practice', 'lesson'), 'lesson'));
+        $mform->setDefault('practice', 0);
+
+        $mform->addElement('selectyesno', 'custom', get_string('customscoring', 'lesson'));
+        $mform->setHelpButton('custom', array('custom', get_string('customscoring', 'lesson'), 'lesson'));
+        $mform->setDefault('custom', 1);
+
+        $grades = array();
+        for ($i=100; $i>=0; $i--) {
+            $grades[$i] = $i;
+        }
+        $mform->addElement('select', 'grade', get_string('maximumgrade'), $grades);
+        $mform->setDefault('grade', 0);
+        $mform->setHelpButton('grade', array('grade', get_string('maximumgrade'), 'lesson'));
+        $mform->disabledIf('grade', 'practice', 'eq', '1');
+
+        $mform->addElement('selectyesno', 'retake', get_string('retakesallowed', 'lesson'));
+        $mform->setHelpButton('retake', array('retake', get_string('retakesallowed', 'lesson'), 'lesson'));
+        $mform->setDefault('retake', 0);
+
+        $options = array();
+        $options[0] = get_string('usemean', 'lesson');
+        $options[1] = get_string('usemaximum', 'lesson');
+        $mform->addElement('select', 'usemaxgrade', get_string('handlingofretakes', 'lesson'), $options);
+        $mform->setHelpButton('usemaxgrade', array('handlingofretakes', get_string('handlingofretakes', 'lesson'), 'lesson'));
+        $mform->setDefault('usemaxgrade', 0);
+        $mform->disabledIf('usemaxgrade', 'retake', 'eq', '0');
+
+        $mform->addElement('selectyesno', 'ongoing', get_string('ongoing', 'lesson'));
+        $mform->setHelpButton('ongoing', array('ongoing', get_string('ongoing', 'lesson'), 'lesson'));
+        $mform->setDefault('ongoing', 0);
+
+//-------------------------------------------------------------------------------
+        $mform->addElement('header', 'flowcontrol', get_string('flowcontrol', 'lesson'));
+
+        $mform->addElement('selectyesno', 'modattempts', get_string('modattempts', 'lesson'));
+        $mform->setHelpButton('modattempts', array('modattempts', get_string('modattempts', 'lesson'), 'lesson'));
+        $mform->setDefault('modattempts', 0);
+
+        $mform->addElement('selectyesno', 'review', get_string('displayreview', 'lesson'));
+        $mform->setHelpButton('review', array('review', get_string('displayreview', 'lesson'), 'lesson'));
+        $mform->setDefault('review', 0);
+
+        $numbers = array();
+        for ($i=10; $i>0; $i--) {
+            $numbers[$i] = $i;
+        }
+        $mform->addElement('select', 'maxattempts', get_string('maximumnumberofattempts', 'lesson'), $numbers);
+        $mform->setHelpButton('maxattempts', array('maxattempts', get_string('maximumnumberofattempts', 'lesson'), 'lesson'));
+        $mform->setDefault('maxattempts', 1);
+
+        $defaultnextpages = array();
+        $defaultnextpages[0] = get_string("normal", "lesson");
+        $defaultnextpages[LESSON_UNSEENPAGE] = get_string("showanunseenpage", "lesson");
+        $defaultnextpages[LESSON_UNANSWEREDPAGE] = get_string("showanunansweredpage", "lesson");
+        $mform->addElement('select', 'nextpagedefault', get_string('actionaftercorrectanswer', 'lesson'), $defaultnextpages);
+        $mform->setHelpButton('nextpagedefault', array('nextpageaction', get_string('actionaftercorrectanswer', 'lesson'), 'lesson'));
+        $mform->setDefault('nextpagedefault', $CFG->lesson_defaultnextpage);
+        $mform->setAdvanced('nextpagedefault');
+
+        $mform->addElement('selectyesno', 'feedback', get_string('displaydefaultfeedback', 'lesson'));
+        $mform->setHelpButton('feedback', array('feedback', get_string('displaydefaultfeedback', 'lesson'), 'lesson'));
+        $mform->setDefault('feedback', 0);
+
+        $mform->addElement('selectyesno', 'progressbar', get_string('progressbar', 'lesson'));
+        $mform->setHelpButton('progressbar', array('progressbar', get_string('progressbar', 'lesson'), 'lesson'));
+        $mform->setDefault('progressbar', 0);
+
+        $mform->addElement('selectyesno', 'displayleft', get_string('displayleftmenu', 'lesson'));
+        $mform->setHelpButton('displayleft', array('displayleft', get_string('displayleftmenu', 'lesson'), 'lesson'));
+        $mform->setDefault('displayleft', 0);
+
+        $options = array();
+        for($i = 100; $i >= 0; $i--) {
+            $options[$i] = $i.'%';
+        }
+        $mform->addElement('select', 'displayleftif', get_string('displayleftif', 'lesson'), $options);
+        $mform->setHelpButton('displayleftif', array('displayleftif', get_string('displayleftmenuif', 'lesson'), 'lesson'));
+        $mform->setDefault('displayleftif', 0);
+        $mform->setAdvanced('displayleftif');
+
+        $numbers = array();
+        for ($i = 100; $i >= 0; $i--) {
+            $numbers[$i] = $i;
+        }
+        $mform->addElement('select', 'minquestions', get_string('minimumnumberofquestions', 'lesson'), $numbers);
+        $mform->setHelpButton('minquestions', array('minquestions', get_string('minimumnumberofquestions', 'lesson'), 'lesson'));
+        $mform->setDefault('minquestions', 0);
+        $mform->setAdvanced('minquestions');
+
+        $numbers = array();
+        for ($i = 100; $i >= 0; $i--) {
+            $numbers[$i] = $i;
+        }
+        $mform->addElement('select', 'maxpages', get_string('numberofpagestoshow', 'lesson'), $numbers);
+        $mform->setHelpButton('maxpages', array('maxpages', get_string('numberofpagestoshow', 'lesson'), 'lesson'));
+        $mform->setAdvanced('maxpages');
+        $mform->setDefault('maxpages', 0);
+
+        $mform->addElement('selectyesno', 'slideshow', get_string('slideshow', 'lesson'));
+        $mform->setHelpButton('slideshow', array('slideshow', get_string('slideshow', 'lesson'), 'lesson'));
+        $mform->setDefault('slideshow', 0);
+        $mform->setAdvanced('slideshow');
+
+        // get the modules
+        if ($mods = get_course_mods($COURSE->id)) {
+            $modinstances = array();
+            foreach ($mods as $mod) {
+
+                // get the module name and then store it in a new array
+                if ($module = get_coursemodule_from_instance($mod->modname, $mod->instance, $COURSE->id)) {
+                    if (isset($this->_cm->id) and $this->_cm->id != $mod->id){
+                        $modinstances[$mod->id] = $mod->modname.' - '.$module->name;
+                    }
+                }
+            }
+            asort($modinstances); // sort by module name
+            $modinstances=array(0=>get_string('none'))+$modinstances;
+
+            $mform->addElement('select', 'activitylink', get_string('activitylink', 'lesson'), $modinstances);
+            $mform->setHelpButton('activitylink', array('activitylink', get_string('activitylink', 'lesson'), 'lesson'));
+            $mform->setDefault('activitylink', 0);
+            $mform->setAdvanced('activitylink');
+        }
+
+//-------------------------------------------------------------------------------
+        $mform->addElement('header', 'mediafileheader', get_string('mediafile', 'lesson'));
+
+        $filepickeroptions = array();
+        $filepickeroptions['filetypes'] = '*';
+        $filepickeroptions['maxbytes'] = $this->course->maxbytes;
+        $mform->addElement('filepicker', 'mediafile', get_string('mediafile', 'lesson'), null, $filepickeroptions);
+        $mform->setHelpButton('mediafile', array('mediafile', get_string('mediafile', 'lesson'), 'lesson'));
+        $mform->setDefault('mediafile', '');
+
+//-------------------------------------------------------------------------------
+        $mform->addElement('header', 'dependencyon', get_string('dependencyon', 'lesson'));
+
+        $options = array(0=>get_string('none'));
+        if ($lessons = get_all_instances_in_course('lesson', $COURSE)) {
+            foreach($lessons as $lesson) {
+                if ($lesson->id != $this->_instance){
+                    $options[$lesson->id] = format_string($lesson->name, true);
+                }
+
+            }
+        }
+        $mform->addElement('select', 'dependency', get_string('dependencyon', 'lesson'), $options);
+        $mform->setHelpButton('dependency', array('dependency', get_string('dependencyon', 'lesson'), 'lesson'));
+        $mform->setDefault('dependency', 0);
+
+        $mform->addElement('text', 'timespent', get_string('timespentminutes', 'lesson'));
+        $mform->setDefault('timespent', 0);
+        $mform->setType('timespent', PARAM_INT);
+
+        $mform->addElement('checkbox', 'completed', get_string('completed', 'lesson'));
+        $mform->setDefault('completed', 0);
+
+        $mform->addElement('text', 'gradebetterthan', get_string('gradebetterthan', 'lesson'));
+        $mform->setDefault('gradebetterthan', 0);
+        $mform->setType('gradebetterthan', PARAM_INT);
+
+//-------------------------------------------------------------------------------
+        $this->standard_coursemodule_elements();
+//-------------------------------------------------------------------------------
+// buttons
+        $this->add_action_buttons();
+    }
+
+    /**
+     * Enforce defaults here
+     *
+     * @param array $default_values Form defaults
+     * @return void
+     **/
+    function data_preprocessing(&$default_values) {
+        global $DB;
+        global $module;
+        if (isset($default_values['conditions'])) {
+            $conditions = unserialize($default_values['conditions']);
+            $default_values['timespent'] = $conditions->timespent;
+            $default_values['completed'] = $conditions->completed;
+            $default_values['gradebetterthan'] = $conditions->gradebetterthan;
+        }
+        // after this passwords are clear text, MDL-11090
+        if (isset($default_values['password']) and ($module->version<2008112600)) {
+            unset($default_values['password']);
+        }
+        if (!empty($this->_cm) && !empty($default_values['mediafile'])) {
+            $context = get_context_instance(CONTEXT_MODULE, $this->_cm->id);
+            $draftitemid = file_get_submitted_draft_itemid('mediafile');
+            file_prepare_draft_area($draftitemid, $context->id, 'lesson_media_file', $this->_cm->instance, array('subdirs' => 0, 'maxbytes' => $this->course->maxbytes, 'maxfiles' => 1));
+            $default_values['mediafile'] = $draftitemid;
+        }
+    }
+
+    /**
+     * Enforce validation rules here
+     *
+     * @param object $data Post data to validate
+     * @return array
+     **/
+    function validation($data, $files) {
+        $errors = parent::validation($data, $files);
+
+        if (empty($data['maxtime']) and !empty($data['timed'])) {
+            $errors['timedgrp'] = get_string('err_numeric', 'form');
+        }
+
+        return $errors;
+    }
+}

@@ -1,0 +1,69 @@
+<?php declare(strict_types=1);
+namespace Phan;
+
+/**
+ * Program configuration
+ */
+class Configuration {
+
+    /**
+     * Configuration options
+     */
+    private $configuration = [
+        // Backwards Compatibility Checking
+        'backward_compatibility_checks' => true,
+
+        // A set of fully qualified class-names for which
+        // a call to parent::__construct() is required
+        'parent_constructor_required' => [],
+
+        // Include a progress bar in the output
+        'progress_bar' => false,
+
+        // The probability of actually emitting any
+        // progress bar update
+        'progress_bar_sample_rate' => 0.1,
+
+        // Run a quick version of checks that takes less
+        // time
+        'quick_mode' => false,
+
+        // The vesion of the AST (defined in php-ast)
+        // we're using
+        'ast_version' => 30,
+
+        // Set to true in order to prepend all emitted error
+        // messages with an ID indicating the distinct class
+        // of issue seen. This allows us to get counts of
+        // distinct error types.
+        'emit_trace_id' => true,
+    ];
+
+    /**
+     * Disallow the constructor to force a singleton
+     */
+    private function __construct() {}
+
+    /**
+     * @return Configuration
+     * Get a Configuration singleton
+     */
+    public static function instance() : Configuration {
+        static $instance;
+
+        if ($instance) {
+            return $instance;
+        }
+
+        $instance = new Configuration();
+        return $instance;
+    }
+
+    public function __get(string $name) {
+        return $this->configuration[$name];
+    }
+
+    public function __set(string $name, $value) {
+        $this->configuration[$name] = $value;
+    }
+}

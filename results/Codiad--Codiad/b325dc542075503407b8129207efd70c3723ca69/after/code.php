@@ -1,0 +1,14 @@
+<?php
+$languages = array(
+    "en" => "english",
+    "fr" => "français",
+    "it" => "italiano",
+    "ru" => "русский",
+    "de" => "deutsch",
+    "es" => "español",
+    "pt" => "português",
+    "ro" => "romanian",
+    "hu" => "magyar",
+    "sv" => "swedish"
+);
+?>

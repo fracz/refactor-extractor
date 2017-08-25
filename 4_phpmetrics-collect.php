@@ -1,9 +1,9 @@
 <?php
 require 'vendor/autoload.php';
 
-const POSITIVE_VECTORS_FILE = __DIR__ . '/results/single-file-commits-positive.csv';
-const NEGATIVE_VECTORS_FILE = __DIR__ . '/results/single-file-commits-negative.csv';
-const DELTA_VECTORS_FILE = __DIR__ . '/results/single-file-commits-delta.csv';
+const POSITIVE_VECTORS_FILE = __DIR__ . '/input/metrics/single-file-commits-positive.csv';
+const NEGATIVE_VECTORS_FILE = __DIR__ . '/input/metrics//single-file-commits-negative.csv';
+const DELTA_VECTORS_FILE = __DIR__ . '/input/metrics//single-file-commits-delta.csv';
 
 @unlink(POSITIVE_VECTORS_FILE);
 @unlink(NEGATIVE_VECTORS_FILE);

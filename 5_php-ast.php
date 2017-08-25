@@ -40,18 +40,18 @@ foreach ($projects as $project) {
                     $changedMethods = array_diff_assoc($methods['before'], $methods['after']);
                     $changedMethods = array_diff_key($changedMethods, $deletedMethods);
                     $changedMethods = array_diff_key($changedMethods, $addedMethods);
-                    foreach ($changedMethods as $changedMethodName => $changedMethodAst) {
+                    $allMethodsToDump = array_merge($changedMethods, $addedMethods, $deletedMethods);
+                    foreach ($allMethodsToDump as $changedMethodName => $changedMethodAst) {
                         $diff = implode(DIFF_SEPARATOR, [
-                            implode('', array_slice(file($changeDir . "/before/$file"), $methods['beforeLines'][$changedMethodName][0] - 1, $methods['beforeLines'][$changedMethodName][1] - $methods['beforeLines'][$changedMethodName][0])),
-                            implode('', array_slice(file($changeDir . "/after/$file"), $methods['afterLines'][$changedMethodName][0] - 1, $methods['afterLines'][$changedMethodName][1] - $methods['afterLines'][$changedMethodName][0])),
-                            $methods['before'][$changedMethodName],
-                            $methods['after'][$changedMethodName],
+                            isset($methods['before'][$changedMethodName]) ? implode('', array_slice(file($changeDir . "/before/$file"), $methods['beforeLines'][$changedMethodName][0] - 1, $methods['beforeLines'][$changedMethodName][1] - $methods['beforeLines'][$changedMethodName][0])) : '',
+                            isset($methods['after'][$changedMethodName]) ? implode('', array_slice(file($changeDir . "/after/$file"), $methods['afterLines'][$changedMethodName][0] - 1, $methods['afterLines'][$changedMethodName][1] - $methods['afterLines'][$changedMethodName][0])) : '',
+                            $methods['before'][$changedMethodName] ?? '',
+                            $methods['after'][$changedMethodName] ?? '',
                         ]);
                         file_put_contents($changeDir . '/diffs/' . $file . $changedMethodName . '.txt', $diff);
                     }
                 }
             }
-//                file_put_contents($changeDir . "/$part-ast/$file.txt", $tree);
         }
     }
     $progress->advance();

@@ -1,0 +1,30 @@
+<?php
+
+class Reply extends \Eloquent {
+
+	protected $fillable = [
+		'body',
+		'user_id',
+		'topic_id'
+	];
+
+	public function user()
+	{
+		return $this->belongsTo('User');
+	}
+
+	public function topic()
+	{
+		return $this->belongsTo('Topic');
+	}
+
+	public function scopeWhose($query, $user_id)
+	{
+        return $query->where('user_id','=',$user_id)->with('topic');
+    }
+
+    public function scopeRecent($query)
+    {
+        return $query->orderBy('created_at','desc');
+    }
+}
