@@ -1,0 +1,552 @@
+||||||||    public static function get_applicable_publish_states() {
+        global $CFG;
+        $options = array();
+
+        // everyone gets draft access
+        if ($CFG->bloglevel >= BLOG_USER_LEVEL) {
+            $options['draft'] = get_string('publishtonoone', 'blog');
+        }
+
+        if ($CFG->bloglevel > BLOG_USER_LEVEL) {
+            $options['site'] = get_string('publishtosite', 'blog');
+        }
+
+        if ($CFG->bloglevel >= BLOG_GLOBAL_LEVEL) {
+            $options['public'] = get_string('publishtoworld', 'blog');
+        }
+
+        return $options;
+    }
+}
+
+/**
+ * Abstract Blog_Listing class: used to gather blog entries and output them as listings. One of the subclasses must be used.
+ *
+ * @package    moodlecore
+ * @subpackage blog
+ * @copyright  2009 Nicolas Connault
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+class blog_listing {
+    /**
+     * Array of blog_entry objects.
+     * @var array $entries
+     */
+    public $entries = array();
+
+    /**
+     * An array of blog_filter_* objects
+     * @var array $filters
+     */
+    public $filters = array();
+
+    /**
+     * Constructor
+     *
+     * @param array $filters An associative array of filtername => filterid
+     */
+    public function __construct($filters=array()) {
+        // Unset filters overridden by more specific filters
+        foreach ($filters as $type => $id) {
+            if (!empty($type) && !empty($id)) {
+                $this->filters[$type] = blog_filter::get_instance($id, $type);
+            }
+        }
+
+        foreach ($this->filters as $type => $filter) {
+            foreach ($filter->overrides as $override) {
+                if (array_key_exists($override, $this->filters)) {
+                    unset($this->filters[$override]);
+                }
+            }
+        }
+    }
+
+    /**
+     * Fetches the array of blog entries.
+     *
+     * @return array
+     */
+    public function get_entries($start=0, $limit=10) {
+        global $DB;
+
+        if (empty($this->entries)) {
+            if ($sql_array = $this->get_entry_fetch_sql()) {
+                $this->entries = $DB->get_records_sql($sql_array['sql'] . " LIMIT $start, $limit", $sql_array['params']);
+            } else {
+                return false;
+            }
+        }
+
+        return $this->entries;
+    }
+
+    public function get_entry_fetch_sql($count=false, $sort='lastmodified DESC', $userid = false) {
+        global $DB, $USER, $CFG;
+
+        if(!$userid) {
+            $userid = $USER->id;
+        }
+
+        // The query used to locate blog entries is complicated.  It will be built from the following components:
+        $requiredfields = "p.*, u.firstname, u.lastname, u.email";  // the SELECT clause
+        $tables = array('p' => 'post', 'u' => 'user');   // components of the FROM clause (table_id => table_name)
+        $conditions = array('u.deleted = 0', 'p.userid = u.id', 'p.module = \'blog\'');  // components of the WHERE clause (conjunction)
+
+        // build up a clause for permission constraints
+
+        $params = array();
+
+        // fix for MDL-9165, use with readuserblogs capability in a user context can read that user's private blogs
+        // admins can see all blogs regardless of publish states, as described on the help page
+        if (has_capability('moodle/user:readuserblogs', get_context_instance(CONTEXT_SYSTEM))) {
+            // don't add permission constraints
+
+        } else if(!empty($this->filters['user']) && has_capability('moodle/user:readuserblogs',
+                get_context_instance(CONTEXT_USER, (empty($this->filters['user']->id) ? 0 : $this->filters['user']->id)))) {
+            // don't add permission constraints
+
+        } else {
+            if (isloggedin() && !has_capability('moodle/legacy:guest', get_context_instance(CONTEXT_SYSTEM, SITEID), $userid, false)) {
+                $assocexists = $DB->record_exists('blog_association', array());  //dont check association records if there aren't any
+
+                //begin permission sql clause
+                $permissionsql =  '(p.userid = ? ';
+                $params[] = $userid;
+
+                if ($CFG->bloglevel >= BLOG_SITE_LEVEL) { // add permission to view site-level entries
+                    $permissionsql .= " OR p.publishstate = 'site' ";
+                }
+
+                if ($CFG->bloglevel >= BLOG_GLOBAL_LEVEL) { // add permission to view global entries
+                    $permissionsql .= " OR p.publishstate = 'public' ";
+                }
+
+                $permissionsql .= ') ';   //close permissions sql clause
+            } else {  // default is access to public entries
+                $permissionsql = "p.publishstate = 'public'";
+            }
+            $conditions[] = $permissionsql;  //add permission constraints
+        }
+
+        foreach ($this->filters as $type => $blog_filter) {
+            $conditions = array_merge($conditions, $blog_filter->conditions);
+            $params = array_merge($params, $blog_filter->params);
+            $tables = array_merge($tables, $blog_filter->tables);
+        }
+
+        $tablessql = '';  // build up the FROM clause
+        foreach ($tables as $tablename => $table) {
+            $tablessql .= ($tablessql ? ', ' : '').'{'.$table.'} '.$tablename;
+        }
+
+        $sql = ($count) ? 'SELECT COUNT(*)' : 'SELECT ' . $requiredfields;
+        $sql .= " FROM $tablessql WHERE " . implode(' AND ', $conditions);
+        $sql .= ($count) ? '' : " GROUP BY p.id ORDER BY $sort";
+
+        return array('sql' => $sql, 'params' => $params);
+    }
+
+    /**
+     * Outputs all the blog entries aggregated by this blog listing.
+     *
+     * @return void
+     */
+    public function print_entries() {
+        global $CFG, $USER, $DB, $OUTPUT;
+        $sitecontext = get_context_instance(CONTEXT_SYSTEM);
+
+        $page  = optional_param('blogpage', 0, PARAM_INT);
+        $limit = optional_param('limit', get_user_preferences('blogpagesize', 10), PARAM_INT);
+        $start = $page * $limit;
+
+        $morelink = '<br />&nbsp;&nbsp;';
+
+        if ($sql_array = $this->get_entry_fetch_sql(true)) {
+            $totalentries = $DB->count_records_sql($sql_array['sql'], $sql_array['params']);
+        } else {
+            $totalentries = 0;
+        }
+
+        $entries = $this->get_entries($start, $limit);
+        $pagingbar = moodle_paging_bar::make($totalentries, $page, $limit, $this->get_baseurl());
+        $pagingbar->pagevar = 'blogpage';
+
+        echo $OUTPUT->paging_bar($pagingbar);
+
+        /* TODO RSS link
+        if ($CFG->enablerssfeeds) {
+            $this->blog_rss_print_link($filtertype, $filterselect, $tag);
+        }
+        */
+
+        if (has_capability('moodle/blog:create', $sitecontext)) {
+            //the user's blog is enabled and they are viewing their own blog
+            $userid = optional_param('userid', null, PARAM_INT);
+
+            if (empty($userid) || (!empty($userid) && $userid == $USER->id)) {
+                $add_url = new moodle_url("$CFG->wwwroot/blog/edit.php");
+                $url_params = array('action' => 'add',
+                                    'userid' => $userid,
+                                    'courseid' => optional_param('courseid', null, PARAM_INT),
+                                    'groupid' => optional_param('groupid', null, PARAM_INT),
+                                    'modid' => optional_param('modid', null, PARAM_INT),
+                                    'tagid' => optional_param('tagid', null, PARAM_INT),
+                                    'tag' => optional_param('tag', null, PARAM_INT),
+                                    'search' => optional_param('search', null, PARAM_INT));
+
+                foreach ($url_params as $var => $val) {
+                    if (empty($val)) {
+                        unset($url_params[$var]);
+                    }
+                }
+                $add_url->params($url_params);
+
+                $addlink = '<div class="addbloglink">';
+                $addlink .= '<a href="'.$add_url->out().'">'. get_string('addnewentry', 'blog').'</a>';
+                $addlink .= '</div>';
+                echo $addlink;
+            }
+        }
+
+        if ($entries) {
+            $count = 0;
+
+            foreach ($entries as $entry) {
+                $blog_entry = new blog_entry($entry);
+                $blog_entry->print_html();
+                $count++;
+            }
+
+            echo $OUTPUT->paging_bar($pagingbar);
+
+            if (!$count) {
+                print '<br /><div style="text-align:center">'. get_string('noentriesyet', 'blog') .'</div><br />';
+            }
+
+            print $morelink.'<br />'."\n";
+            return;
+        }
+    }
+
+    /// Find the base url from $_GET variables, for print_paging_bar
+    public function get_baseurl() {
+        $getcopy  = $_GET;
+
+        unset($getcopy['blogpage']);
+
+        if (!empty($getcopy)) {
+            $first = false;
+            $querystring = '';
+
+            foreach ($getcopy as $var => $val) {
+                if (!$first) {
+                    $first = true;
+                    $querystring .= "?$var=$val";
+                } else {
+                    $querystring .= '&amp;'.$var.'='.$val;
+                    $hasparam = true;
+                }
+            }
+        } else {
+            $querystring = '?';
+        }
+
+        return strip_querystring(qualified_me()) . $querystring;
+
+    }
+}
+
+/**
+ * Abstract class for blog_filter objects.
+ * A set of core filters are implemented here. To write new filters, you need to subclass
+ * blog_filter and give it the name of the type you want (for example, blog_filter_entry).
+ * The blog_filter abstract class will automatically use it when the filter is added to the
+ * URL. The first parameter of the constructor is the ID of your filter, but it can be a string
+ * or have any other meaning you wish it to have. The second parameter is called $type and is
+ * used as a sub-type for filters that have a very similar implementation (see blog_filter_context for an example)
+ */
+abstract class blog_filter {
+    /**
+     * An array of strings representing the available filter types for each blog_filter.
+     * @var array $available_types
+     */
+    public $available_types = array();
+
+    /**
+     * The type of filter (for example, types of blog_filter_context are site, course and module)
+     * @var string $type
+     */
+    public $type;
+
+    /**
+     * The unique ID for a filter's associated record
+     * @var int $id
+     */
+    public $id;
+
+    /**
+     * An array of table aliases that are used in the WHERE conditions
+     * @var array $tables
+     */
+    public $tables = array();
+
+    /**
+     * An array of WHERE conditions
+     * @var array $conditions
+     */
+    public $conditions = array();
+
+    /**
+     * An array of SQL params
+     * @var array $params
+     */
+    public $params = array();
+
+    /**
+     * An array of filter types which this particular filter type overrides: their conditions will not be evaluated
+     */
+    public $overrides = array();
+
+    public function __construct($id, $type=null) {
+        $this->id = $id;
+        $this->type = $type;
+    }
+
+    /**
+     * TODO This is poor design. A parent class should not know anything about its children.
+     * The default case helps to resolve this design issue
+     */
+    public static function get_instance($id, $type) {
+
+        switch ($type) {
+            case 'site':
+            case 'course':
+            case 'module':
+                return new blog_filter_context($id, $type);
+                break;
+
+            case 'group':
+            case 'user':
+                return new blog_filter_user($id, $type);
+                break;
+
+            case 'tag':
+                return new blog_filter_tag($id);
+                break;
+
+            default:
+                $class_name = "blog_filter_$type";
+                if (class_exists($class_name)) {
+                    return new $class_name($id, $type);
+                }
+        }
+    }
+}
+
+/**
+ * This filter defines the context level of the blog entries being searched: site, course, module
+ */
+class blog_filter_context extends blog_filter {
+    /**
+     * Constructor
+     *
+     * @param string $type
+     * @param int    $id
+     */
+    public function __construct($id=null, $type='site') {
+        global $SITE, $CFG, $DB;
+
+        if (empty($id)) {
+            $this->type = 'site';
+        } else {
+            $this->id = $id;
+            $this->type = $type;
+        }
+
+        $this->available_types = array('site' => get_string('site'), 'course' => get_string('course'), 'module' => get_string('module'));
+
+        switch ($this->type) {
+            case 'course': // Careful of site course!
+                // Ignore course filter if blog associations are not enabled
+                if ($this->id != $SITE->id && !empty($CFG->useblogassociations)) {
+                    $this->overrides = array('site');
+                    $context = get_context_instance(CONTEXT_COURSE, $this->id);
+                    $this->tables['ba'] = 'blog_association';
+                    $this->conditions[] = 'p.id = ba.blogid';
+                    $this->conditions[] = 'ba.contextid = '.$context->id;
+                    break;
+                } else {
+                    // We are dealing with the site course, do not break from the current case
+                }
+
+            case 'site':
+                // No special constraints
+                break;
+            case 'module':
+                if (!empty($CFG->useblogassociations)) {
+                    $this->overrides = array('course', 'site');
+
+                    $context = get_context_instance(CONTEXT_MODULE, $this->id);
+                    $this->tables['ba'] = 'blog_association';
+                    $this->tables['p']  = 'post';
+                    $this->conditions = array('p.id = ba.blogid', 'ba.contextid = ?');
+                    $this->params = array($context->id);
+                }
+                break;
+        }
+    }
+}
+
+/**
+ * This filter defines the user level of the blog entries being searched: a userid or a groupid.
+ * It can be combined with a context filter in order to refine the search.
+ */
+class blog_filter_user extends blog_filter {
+    public $tables = array('u' => 'user');
+
+    /**
+     * Constructor
+     *
+     * @param string $type
+     * @param int    $id
+     */
+    public function __construct($id=null, $type='user') {
+        $this->available_types = array('user' => get_string('user'), 'group' => get_string('group'));
+
+        if (empty($id)) {
+            $this->id = $USER->id;
+            $this->type = 'user';
+        } else {
+            $this->id = $id;
+            $this->type = $type;
+        }
+
+        if ($this->type == 'user') {
+            $this->conditions = array('u.id = ?');
+            $this->params = array($this->id);
+            $this->overrides = array('group');
+
+        } elseif ($this->type == 'group') {
+            $this->overrides = array('course', 'site');
+
+            $this->tables['gm'] = 'groups_members';
+            $this->conditions[] = 'p.userid = gm.userid';
+            $this->conditions[] = 'gm.groupid = ?';
+            $this->params[]     = $this->id;
+
+            if (!empty($CFG->useblogassociations)) {  // only show blog entries associated with this course
+                $course_context     = get_context_instance(CONTEXT_COURSE, $DB->get_field('groups', 'courseid', array('id' => $this->id)));
+                $this->tables['ba'] = 'blog_association';
+                $this->conditions[] = 'gm.groupid = ?';
+                $this->conditions[] = 'ba.contextid = ?';
+                $this->conditions[] = 'ba.blogid = p.id';
+                $this->params[]     = $this->id;
+                $this->params[]     = $course_context->id;
+            }
+        }
+    }
+}
+
+/**
+ * This filter defines a tag by which blog entries should be searched.
+ */
+class blog_filter_tag extends blog_filter {
+    public $tables = array('t' => 'tag', 'ti' => 'tag_instance', 'p' => 'post');
+
+    /**
+     * Constructor
+     *
+     * @return void
+     */
+    public function __construct($id) {
+        global $DB;
+        $this->id = $id;
+
+        $this->conditions = array('ti.tagid = t.id',
+                                  "ti.itemtype = 'post'",
+                                  'ti.itemid = p.id',
+                                  't.id = ?');
+        $this->params = array($this->id);
+    }
+}
+
+/**
+ * This filter defines a specific blog entry id.
+ */
+class blog_filter_entry extends blog_filter {
+    public $conditions = array('p.id = ?');
+    public $overrides  = array('site', 'course', 'module', 'group', 'user', 'tag');
+
+    public function __construct($id) {
+        $this->id = $id;
+        $this->params[] = $this->id;
+    }
+}
+
+/**
+ * Filter used to perform full-text search on an entry's subject, summary and content
+ */
+class blog_filter_search extends blog_filter {
+
+    public function __construct($search_term) {
+        global $DB;
+        $ilike = $DB->sql_ilike();
+        $this->conditions = array("(p.summary $ilike '%$search_term%' OR
+                                    p.content $ilike '%$search_term%' OR
+                                    p.subject $ilike '%$search_term%')");
+    }
+}||||||||||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(
+    (AST_GLOBAL
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_PROP
+                    (AST_VAR))
+                (AST_CONST))
+            (
+                (AST_ASSIGN
+                    (AST_DIM
+                        (AST_VAR)
+                        (SCALAR))
+                    (AST_CALL
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_PROP
+                    (AST_VAR))
+                (AST_CONST))
+            (
+                (AST_ASSIGN
+                    (AST_DIM
+                        (AST_VAR)
+                        (SCALAR))
+                    (AST_CALL
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_PROP
+                    (AST_VAR))
+                (AST_CONST))
+            (
+                (AST_ASSIGN
+                    (AST_DIM
+                        (AST_VAR)
+                        (SCALAR))
+                    (AST_CALL
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_RETURN
+        (AST_VAR)))

@@ -24,7 +24,11 @@ foreach ($projects as $project) {
     foreach ($changes as $commitId) {
         $changeDir = $projectDir . '/' . $commitId;
         $filesBefore = array_diff(scandir($changeDir . '/before'), ['.', '..']);
-        @mkdir($changeDir . '/diffs');
+        $diffsDir = $changeDir . '/diffs';
+        if (is_dir($diffsDir)) {
+            continue;
+        }
+        @mkdir($diffsDir);
         foreach ($filesBefore as $file) {
             if (file_exists($changeDir . "/after/$file")) {
                 $methods = ['before' => [], 'after' => [], 'beforeLines' => [], 'afterLines' => []];
@@ -48,7 +52,7 @@ foreach ($projects as $project) {
                             $methods['before'][$changedMethodName] ?? '',
                             $methods['after'][$changedMethodName] ?? '',
                         ]);
-                        file_put_contents($changeDir . '/diffs/' . $file . $changedMethodName . '.txt', $diff);
+                        file_put_contents($diffsDir . '/' . $file . $changedMethodName . '.txt', $diff);
                     }
                 }
             }

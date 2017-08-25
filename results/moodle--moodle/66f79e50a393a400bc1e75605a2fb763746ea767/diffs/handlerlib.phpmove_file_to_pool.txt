@@ -1,0 +1,655 @@
+    protected function move_file_to_pool($pathname) {
+
+        if (!is_readable($pathname)) {
+            throw new moodle1_convert_exception('file_not_readable');
+        }
+
+        $contenthash = sha1_file($pathname);
+        $filesize    = filesize($pathname);
+        $hashpath    = $this->converter->get_workdir_path().'/files/'.substr($contenthash, 0, 2);
+        $hashfile    = "$hashpath/$contenthash";
+
+        if (file_exists($hashfile)) {
+            if (filesize($hashfile) !== $filesize) {
+                // congratulations! you have found two files with different size and the same
+                // content hash. or, something were wrong (which is more likely)
+                throw new moodle1_convert_exception('same_has_different_size');
+            }
+            $newfile = false;
+
+        } else {
+            check_dir_exists($hashpath);
+            $newfile = true;
+
+            if (!rename($pathname, $hashfile)) {
+                throw new moodle1_convert_exception('unable_to_move_file');
+            }
+
+            if (filesize($hashfile) !== $filesize) {
+                throw new moodle1_convert_exception('filesize_different_after_move');
+            }
+        }
+
+        return array($contenthash, $filesize, $newfile);
+    }
+}
+
+
+/**
+ * Handles the conversion of /MOODLE_BACKUP/INFO paths
+ *
+ * We do not produce any XML file here, just storing the data in the temp
+ * table so thay can be used by a later handler.
+ */
+class moodle1_info_handler extends moodle1_handler {
+
+    /** @var array list of mod names included in info_details */
+    protected $modnames = array();
+
+    /** @var array the in-memory cache of the currently parsed info_details_mod element */
+    protected $currentmod;
+
+    public function get_paths() {
+        return array(
+            new convert_path('info', '/MOODLE_BACKUP/INFO'),
+            new convert_path('info_details', '/MOODLE_BACKUP/INFO/DETAILS'),
+            new convert_path('info_details_mod', '/MOODLE_BACKUP/INFO/DETAILS/MOD'),
+            new convert_path('info_details_mod_instance', '/MOODLE_BACKUP/INFO/DETAILS/MOD/INSTANCES/INSTANCE'),
+        );
+    }
+
+    /**
+     * Stashes the backup info for later processing by {@link moodle1_root_handler}
+     */
+    public function process_info($data) {
+        $this->converter->set_stash('backup_info', $data);
+    }
+
+    /**
+     * Initializes the in-memory cache for the current mod
+     */
+    public function process_info_details_mod($data) {
+        $this->currentmod = $data;
+        $this->currentmod['instances'] = array();
+    }
+
+    /**
+     * Appends the current instance data to the temporary in-memory cache
+     */
+    public function process_info_details_mod_instance($data) {
+        $this->currentmod['instances'][$data['id']] = $data;
+    }
+
+    /**
+     * Stashes the backup info for later processing by {@link moodle1_root_handler}
+     */
+    public function on_info_details_mod_end($data) {
+        global $CFG;
+
+        // keep only such modules that seem to have the support for moodle1 implemented
+        $modname = $this->currentmod['name'];
+        if (file_exists($CFG->dirroot.'/mod/'.$modname.'/backup/moodle1/lib.php')) {
+            $this->converter->set_stash('modinfo_'.$modname, $this->currentmod);
+            $this->modnames[] = $modname;
+        }
+
+        $this->currentmod = array();
+    }
+
+    /**
+     * Stashes the list of activity module types for later processing by {@link moodle1_root_handler}
+     */
+    public function on_info_details_end() {
+        $this->converter->set_stash('modnameslist', $this->modnames);
+    }
+}
+
+
+/**
+ * Handles the conversion of /MOODLE_BACKUP/COURSE/HEADER paths
+ */
+class moodle1_course_header_handler extends moodle1_xml_handler {
+
+    /** @var array we need to merge course information because it is dispatched twice */
+    protected $course = array();
+
+    /** @var array we need to merge course information because it is dispatched twice */
+    protected $courseraw = array();
+
+    /** @var array */
+    protected $category;
+
+    public function get_paths() {
+        return array(
+            new convert_path(
+                'course_header', '/MOODLE_BACKUP/COURSE/HEADER',
+                array(
+                    'newfields' => array(
+                        'summaryformat'          => 1,
+                        'legacyfiles'            => 2,
+                        'requested'              => 0, // @todo not really new, but maybe never backed up?
+                        'restrictmodules'        => 0,
+                        'enablecompletion'       => 0,
+                        'completionstartonenrol' => 0,
+                        'completionnotify'       => 0,
+                        'tags'                   => array(),
+                        'allowed_modules'        => array(),
+                    ),
+                    'dropfields' => array(
+                        'roles_overrides',
+                        'roles_assignments',
+                        'cost',
+                        'currancy',
+                        'defaultrole',
+                        'enrol',
+                        'enrolenddate',
+                        'enrollable',
+                        'enrolperiod',
+                        'enrolstartdate',
+                        'expirynotify',
+                        'expirythreshold',
+                        'guest',
+                        'notifystudents',
+                        'password',
+                        'student',
+                        'students',
+                        'teacher',
+                        'teachers',
+                        'metacourse',
+                    )
+                )
+            ),
+            new convert_path(
+                'course_header_category', '/MOODLE_BACKUP/COURSE/HEADER/CATEGORY',
+                array(
+                    'newfields' => array(
+                        'description' => null,
+                    )
+                )
+            ),
+        );
+    }
+
+    /**
+     * Because there is the CATEGORY branch in the middle of the COURSE/HEADER
+     * branch, this is dispatched twice. We use $this->coursecooked to merge
+     * the result. Once the parser is fixed, it can be refactored.
+     */
+    public function process_course_header($data, $raw) {
+       $this->course    = array_merge($this->course, $data);
+       $this->courseraw = array_merge($this->courseraw, $raw);
+    }
+
+    public function process_course_header_category($data) {
+        $this->category = $data;
+    }
+
+    public function on_course_header_end() {
+
+        $contextid = $this->converter->get_contextid(CONTEXT_COURSE);
+
+        // stash the information needed by other handlers
+        $info = array(
+            'original_course_id'        => $this->course['id'],
+            'original_course_fullname'  => $this->course['fullname'],
+            'original_course_shortname' => $this->course['shortname'],
+            'original_course_startdate' => $this->course['startdate'],
+            'original_course_contextid' => $contextid
+        );
+        $this->converter->set_stash('original_course_info', $info);
+
+        $this->course['contextid'] = $contextid;
+        $this->course['category'] = $this->category;
+
+        $this->open_xml_writer('course/course.xml');
+        $this->write_xml('course', $this->course, array('/course/id', '/course/contextid'));
+        $this->close_xml_writer();
+
+        // convert file - @todo move this to on_root_start()
+        $fileshandler = new moodle1_files_handler($this->converter);
+        $fileshandler->process();
+        unset($fileshandler);
+
+        // generate course/inforef.xml
+        $this->open_xml_writer('course/inforef.xml');
+        $this->xmlwriter->begin_tag('inforef');
+
+        $this->xmlwriter->begin_tag('fileref');
+        foreach ($this->converter->get_stash_itemids('course_files') as $fileid) {
+            $this->write_xml('file', array('id' => $fileid));
+        }
+        $this->xmlwriter->end_tag('fileref');
+
+        $this->xmlwriter->end_tag('inforef');
+        $this->close_xml_writer();
+    }
+}
+
+
+/**
+ * Handles the conversion of course sections and course modules
+ */
+class moodle1_course_outline_handler extends moodle1_xml_handler {
+
+    /** @var array list of section ids */
+    protected $sectionids = array();
+
+    /** @var array current section data */
+    protected $currentsection;
+
+    /**
+     * This handler is interested in course sections and course modules within them
+     */
+    public function get_paths() {
+        return array(
+            new convert_path('course_sections', '/MOODLE_BACKUP/COURSE/SECTIONS'),
+            new convert_path(
+                'course_section', '/MOODLE_BACKUP/COURSE/SECTIONS/SECTION',
+                array(
+                    'newfields' => array(
+                        'name'          => null,
+                        'summaryformat' => 1,
+                        'sequence'      => null,
+                    ),
+                )
+            ),
+            new convert_path(
+                'course_module', '/MOODLE_BACKUP/COURSE/SECTIONS/SECTION/MODS/MOD',
+                array(
+                    'newfields' => array(
+                        'completion'                => 0,
+                        'completiongradeitemnumber' => null,
+                        'completionview'            => 0,
+                        'completionexpected'        => 0,
+                        'availablefrom'             => 0,
+                        'availableuntil'            => 0,
+                        'showavailability'          => 0,
+                        'availability_info'         => array(),
+                        'visibleold'                => 1,
+                    ),
+                    'dropfields' => array(
+                        'instance',
+                        'roles_overrides',
+                        'roles_assignments',
+                    ),
+                    'renamefields' => array(
+                        'type' => 'modulename',
+                    ),
+                )
+            ),
+            new convert_path('course_modules', '/MOODLE_BACKUP/COURSE/MODULES'),
+            // todo new convert_path('course_module_roles_overrides', '/MOODLE_BACKUP/COURSE/SECTIONS/SECTION/MODS/MOD/ROLES_OVERRIDES'),
+            // todo new convert_path('course_module_roles_assignments', '/MOODLE_BACKUP/COURSE/SECTIONS/SECTION/MODS/MOD/ROLES_ASSIGNMENTS'),
+        );
+    }
+
+    public function process_course_section($data) {
+        $this->sectionids[]   = $data['id'];
+        $this->currentsection = $data;
+    }
+
+    /**
+     * Populates the section sequence field (order of course modules) and stashes the
+     * course module info so that is can be dumped to activities/xxxx_x/module.xml later
+     */
+    public function process_course_module($data, $raw) {
+        global $CFG;
+
+        // add the course module id into the section's sequence
+        if (is_null($this->currentsection['sequence'])) {
+            $this->currentsection['sequence'] = $data['id'];
+        } else {
+            $this->currentsection['sequence'] .= ',' . $data['id'];
+        }
+
+        // add the sectionid and sectionnumber
+        $data['sectionid']      = $this->currentsection['id'];
+        $data['sectionnumber']  = $this->currentsection['number'];
+
+        // generate the module version - this is a bit tricky as this information
+        // is not present in 1.9 backups. we will use the currently installed version
+        // whenever we can but that might not be accurate for some modules.
+        // also there might be problem with modules that are not present at the target
+        // host...
+        $versionfile = $CFG->dirroot.'/mod/'.$data['modulename'].'/version.php';
+        if (file_exists($versionfile)) {
+            include($versionfile);
+            $data['version'] = $module->version;
+        } else {
+            $data['version'] = null;
+        }
+
+        // stash the course module info in stashes like 'cminfo_forum' with
+        // itemid set to the instance id. this is needed so that module handlers
+        // can later obtain information about the course module and dump it into
+        // the module.xml file
+        $this->converter->set_stash('cminfo_'.$data['modulename'], $data, $raw['INSTANCE']);
+    }
+
+    /**
+     * Writes sections/section_xxx/section.xml file and stashes it, too
+     */
+    public function on_course_section_end() {
+
+        $this->converter->set_stash('sectioninfo', $this->currentsection, $this->currentsection['id']);
+        $this->open_xml_writer('sections/section_' . $this->currentsection['id'] . '/section.xml');
+        $this->write_xml('section', $this->currentsection);
+        $this->close_xml_writer();
+        unset($this->currentsection);
+    }
+
+    /**
+     * Stashes the list of section ids
+     */
+    public function on_course_sections_end() {
+        $this->converter->set_stash('sectionidslist', $this->sectionids);
+        unset($this->sectionids);
+    }
+
+    /**
+     * Writes the information collected by mod handlers
+     */
+    public function on_course_modules_end() {
+
+        foreach ($this->converter->get_stash('modnameslist') as $modname) {
+            $modinfo = $this->converter->get_stash('modinfo_'.$modname);
+            foreach ($modinfo['instances'] as $modinstanceid => $modinstance) {
+                $cminfo    = $this->converter->get_stash('cminfo_'.$modname, $modinstanceid);
+                $directory = 'activities/'.$modname.'_'.$cminfo['id'];
+
+                // write module.xml
+                $this->open_xml_writer($directory.'/module.xml');
+                $this->write_xml('module', $cminfo, array('/module/id', '/module/version'));
+                $this->close_xml_writer();
+
+                // todo: write proper grades.xml and roles.xml, for now we just make
+                // sure that those files are present
+                $this->make_sure_xml_exists($directory.'/roles.xml', 'roles');
+                $this->make_sure_xml_exists($directory.'/grades.xml', 'activity_gradebook');
+            }
+        }
+    }
+}
+
+
+/**
+ * Handles the conversion of the defined roles
+ */
+class moodle1_roles_definition_handler extends moodle1_xml_handler {
+
+    /**
+     * Where the roles are defined in the source moodle.xml
+     */
+    public function get_paths() {
+        return array(
+            new convert_path('roles', '/MOODLE_BACKUP/ROLES'),
+            new convert_path(
+                'roles_role', '/MOODLE_BACKUP/ROLES/ROLE',
+                array(
+                    'newfields' => array(
+                        'description'   => '',
+                        'sortorder'     => 0,
+                        'archetype'     => ''
+                    )
+                )
+            )
+        );
+    }
+
+    /**
+     * If there are any roles defined in moodle.xml, convert them to roles.xml
+     */
+    public function process_roles_role($data) {
+
+        if (!$this->has_xml_writer()) {
+            $this->open_xml_writer('roles.xml');
+            $this->xmlwriter->begin_tag('roles_definition');
+        }
+        if (!isset($data['nameincourse'])) {
+            $data['nameincourse'] = null;
+        }
+        $this->write_xml('role', $data, array('role/id'));
+    }
+
+    /**
+     * Finishes writing roles.xml
+     */
+    public function on_roles_end() {
+
+        if (!$this->has_xml_writer()) {
+            // no roles defined in moodle.xml so {link self::process_roles_role()}
+            // was never executed
+            $this->open_xml_writer('roles.xml');
+            $this->write_xml('roles_definition', array());
+
+        } else {
+            // some roles were dumped into the file, let us close their wrapper now
+            $this->xmlwriter->end_tag('roles_definition');
+        }
+        $this->close_xml_writer();
+    }
+}
+
+
+/**
+ * Handles the conversion of question categories
+ */
+class moodle1_question_categories_handler extends moodle1_xml_handler {
+
+    /**
+     * Where the roles are defined in the source moodle.xml
+     */
+    public function get_paths() {
+        return array(new convert_path('question_categories', '/MOODLE_BACKUP/QUESTION_CATEGORIES'));
+    }
+
+    public function process_question_categories() {
+        // @todo
+    }
+}
+
+
+/**
+ * Shared base class for activity modules and blocks handlers
+ */
+abstract class moodle1_plugin_handler extends moodle1_xml_handler {
+
+    /** @var string */
+    protected $plugintype;
+
+    /** @var string */
+    protected $pluginname;
+
+    /**
+     * @param moodle1_converter $converter the converter that requires us
+     * @param string $plugintype
+     * @param string $pluginname
+     */
+    public function __construct(moodle1_converter $converter, $plugintype, $pluginname) {
+
+        parent::__construct($converter);
+        $this->plugintype = $plugintype;
+        $this->pluginname = $pluginname;
+    }
+}
+
+
+/**
+ * Base class for activity module handlers
+ */
+abstract class moodle1_mod_handler extends moodle1_plugin_handler {
+
+    /**
+     * Returns the name of the module, eg. 'forum'
+     *
+     * @return string
+     */
+    public function get_modname() {
+        return $this->pluginname;
+    }
+
+    /**
+     * Returns course module information for the given instance id
+     *
+     * The information for this instance id has been stashed by
+     * {@link moodle1_course_outline_handler::process_course_module()}
+     *
+     * @param int $instance the module instance id
+     * @param string $modname the module type, defaults to $this->pluginname
+     * @return int
+     */
+    protected function get_cminfo($instance, $modname = null) {
+
+        if (is_null($modname)) {
+            $modname = $this->pluginname;
+        }
+        return $this->converter->get_stash('cminfo_'.$modname, $instance);
+    }
+}
+
+
+/**
+ * Base class for activity module handlers
+ */
+abstract class moodle1_block_handler extends moodle1_plugin_handler {
+
+}
+
+
+/**
+ * Base class for the activity modules' subplugins
+ */
+abstract class moodle1_submod_handler extends moodle1_plugin_handler {
+
+    /** @var moodle1_mod_handler */
+    protected $parenthandler;
+
+    /**
+     * @param moodle1_mod_handler $parenthandler the handler of a module we are subplugin of
+     * @param string $subplugintype the type of the subplugin
+     * @param string $subpluginname the name of the subplugin
+     */
+    public function __construct(moodle1_mod_handler $parenthandler, $subplugintype, $subpluginname) {
+        $this->parenthandler = $parenthandler;
+        parent::__construct($parenthandler->converter, $subplugintype, $subpluginname);
+    }
+
+    /**
+     * Activity module subplugins can't declare any paths to handle
+     *
+     * The paths must be registered by the parent module and then re-dispatched to the
+     * relevant subplugins for eventual processing.
+     *
+     * @return array empty array
+     */
+    final public function get_paths() {
+        return array();
+    }
+}||||||||||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_CALL
+                    (
+                        (AST_VAR))))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_BINARY_OP
+            (AST_BINARY_OP
+                (AST_METHOD_CALL
+                    (AST_PROP
+                        (AST_VAR)))
+                (SCALAR))
+            (AST_CALL
+                (
+                    (AST_VAR)
+                    (SCALAR)
+                    (SCALAR)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ENCAPS_LIST
+            (AST_VAR)
+            (SCALAR)
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_CALL
+                (
+                    (AST_VAR)))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_VAR)))
+                            (AST_VAR))
+                        (
+                            (AST_THROW
+                                (AST_NEW
+                                    (
+                                        (SCALAR)))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_CALL
+                    (
+                        (AST_VAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))
+                        (
+                            (AST_THROW
+                                (AST_NEW
+                                    (
+                                        (SCALAR)))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_VAR)))
+                            (AST_VAR))
+                        (
+                            (AST_THROW
+                                (AST_NEW
+                                    (
+                                        (SCALAR))))))))))
+    (AST_RETURN
+        (AST_ARRAY
+            (AST_ARRAY_ELEM
+                (AST_VAR)
+                (NULL))
+            (AST_ARRAY_ELEM
+                (AST_VAR)
+                (NULL))
+            (AST_ARRAY_ELEM
+                (AST_VAR)
+                (NULL)))))||||||||

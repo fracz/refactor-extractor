@@ -1,0 +1,1363 @@
+    private function aggregate_grades($userid,
+                                      $items,
+                                      $grade_values,
+                                      $oldgrade,
+                                      $excluded,
+                                      $grademinoverrides,
+                                      $grademaxoverrides) {
+        global $CFG;
+
+        // Remember these so we can set flags on them to describe how they were used in the aggregation.
+        $novalue = array();
+        $dropped = array();
+        $extracredit = array();
+        $usedweights = array();
+
+        if (empty($userid)) {
+            //ignore first call
+            return;
+        }
+
+        if ($oldgrade) {
+            $oldfinalgrade = $oldgrade->finalgrade;
+            $grade = new grade_grade($oldgrade, false);
+            $grade->grade_item =& $this->grade_item;
+
+        } else {
+            // insert final grade - it will be needed later anyway
+            $grade = new grade_grade(array('itemid'=>$this->grade_item->id, 'userid'=>$userid), false);
+            $grade->grade_item =& $this->grade_item;
+            $grade->insert('system');
+            $oldfinalgrade = null;
+        }
+
+        // no need to recalculate locked or overridden grades
+        if ($grade->is_locked() or $grade->is_overridden()) {
+            return;
+        }
+
+        // can not use own final category grade in calculation
+        unset($grade_values[$this->grade_item->id]);
+
+        // Make sure a grade_grade exists for every grade_item.
+        // We need to do this so we can set the aggregationstatus
+        // with a set_field call instead of checking if each one exists and creating/updating.
+        foreach ($items as $itemid => $gradeitem) {
+            $gradegrade = new grade_grade(array('itemid' => $gradeitem->id,
+                                                'userid' => $userid,
+                                                'rawgrademin' => $gradeitem->grademin,
+                                                'rawgrademax' => $gradeitem->grademax), false);
+            $gradegrade->grade_item = $this->grade_item;
+            if (!$gradegrade->fetch(array('itemid'=>$gradeitem->id, 'userid'=>$userid))) {
+                $gradegrade->insert('system');
+            }
+
+        }
+
+        // if no grades calculation possible or grading not allowed clear final grade
+        if (empty($grade_values) or empty($items) or ($this->grade_item->gradetype != GRADE_TYPE_VALUE and $this->grade_item->gradetype != GRADE_TYPE_SCALE)) {
+            $grade->finalgrade = null;
+
+            if (!is_null($oldfinalgrade)) {
+                $grade->update('aggregation');
+            }
+            $dropped = $grade_values;
+            $this->set_usedinaggregation($userid, $usedweights, $novalue, $dropped, $extracredit);
+            return;
+        }
+
+        // Normalize the grades first - all will have value 0...1
+        // ungraded items are not used in aggregation.
+        foreach ($grade_values as $itemid=>$v) {
+            if (is_null($v)) {
+                // If null, it means no grade.
+                if ($this->aggregateonlygraded) {
+                    unset($grade_values[$itemid]);
+                    // Mark this item as dropped because it has no grade.
+                    $novalue[$itemid] = 0;
+                    continue;
+                }
+            }
+            if (in_array($itemid, $excluded)) {
+                unset($grade_values[$itemid]);
+                $dropped[$itemid] = 0;
+                continue;
+            }
+            // Check for user specific grade min/max overrides.
+            $usergrademin = $items[$itemid]->grademin;
+            $usergrademax = $items[$itemid]->grademax;
+            if (isset($grademinoverrides[$itemid])) {
+                $usergrademin = $grademinoverrides[$itemid];
+            }
+            if (isset($grademaxoverrides[$itemid])) {
+                $usergrademax = $grademaxoverrides[$itemid];
+            }
+            $grade_values[$itemid] = grade_grade::standardise_score($v, $usergrademin, $usergrademax, 0, 1);
+        }
+
+        // Use min grade if grade missing for these types.
+        foreach ($items as $itemid=>$value) {
+            if (!isset($grade_values[$itemid]) and !in_array($itemid, $excluded)) {
+                if (!$this->aggregateonlygraded) {
+                    $grade_values[$itemid] = 0;
+                } else {
+                    // We are specifically marking these items that get dropped
+                    // because they are empty.
+                    $novalue[$itemid] = 0;
+                }
+            }
+        }
+
+        // limit and sort
+        $allvalues = $grade_values;
+        if ($this->can_apply_limit_rules()) {
+            $this->apply_limit_rules($grade_values, $items);
+        }
+
+        $moredropped = array_diff($allvalues, $grade_values);
+        foreach ($moredropped as $drop => $unused) {
+            $dropped[$drop] = 0;
+        }
+
+        foreach ($grade_values as $itemid => $val) {
+            if (self::is_extracredit_used() && ($items[$itemid]->aggregationcoef > 0)) {
+                $extracredit[$itemid] = 0;
+            }
+        }
+
+        asort($grade_values, SORT_NUMERIC);
+
+        // let's see we have still enough grades to do any statistics
+        if (count($grade_values) == 0) {
+            // not enough attempts yet
+            $grade->finalgrade = null;
+
+            if (!is_null($oldfinalgrade)) {
+                $grade->update('aggregation');
+            }
+            $this->set_usedinaggregation($userid, $usedweights, $novalue, $dropped, $extracredit);
+            return;
+        }
+
+        // do the maths
+        $result = $this->aggregate_values_and_adjust_bounds($grade_values,
+                                                            $items,
+                                                            $usedweights,
+                                                            $grademinoverrides,
+                                                            $grademaxoverrides);
+        $agg_grade = $result['grade'];
+
+        // Recalculate the grade back to requested range.
+        $finalgrade = grade_grade::standardise_score($agg_grade, 0, 1, $result['grademin'], $result['grademax']);
+
+        $grade->finalgrade = $this->grade_item->bounded_grade($finalgrade);
+        $oldrawgrademax = $grade->rawgrademax;
+        $grade->rawgrademax = $result['grademax'];
+
+        // update in db if changed
+        if (grade_floats_different($grade->finalgrade, $oldfinalgrade) ||
+            grade_floats_different($grade->rawgrademax, $oldrawgrademax)) {
+            $grade->update('aggregation');
+        }
+
+        $this->set_usedinaggregation($userid, $usedweights, $novalue, $dropped, $extracredit);
+
+        return;
+    }
+
+    /**
+     * Set the flags on the grade_grade items to indicate how individual grades are used
+     * in the aggregation.
+     *
+     * @param int $userid The user we have aggregated the grades for.
+     * @param array $usedweights An array with keys for each of the grade_item columns included in the aggregation. The value are the relative weight.
+     * @param array $novalue An array with keys for each of the grade_item columns skipped because
+     *                       they had no value in the aggregation.
+     * @param array $dropped An array with keys for each of the grade_item columns dropped
+     *                       because of any drop lowest/highest settings in the aggregation.
+     * @param array $extracredit An array with keys for each of the grade_item columns
+     *                       considered extra credit by the aggregation.
+     */
+||||||||    private function aggregate_grades($userid,
+                                      $items,
+                                      $grade_values,
+                                      $oldgrade,
+                                      $excluded,
+                                      $grademinoverrides,
+                                      $grademaxoverrides) {
+        global $CFG, $DB;
+
+        // Remember these so we can set flags on them to describe how they were used in the aggregation.
+        $novalue = array();
+        $dropped = array();
+        $extracredit = array();
+        $usedweights = array();
+
+        if (empty($userid)) {
+            //ignore first call
+            return;
+        }
+
+        if ($oldgrade) {
+            $oldfinalgrade = $oldgrade->finalgrade;
+            $grade = new grade_grade($oldgrade, false);
+            $grade->grade_item =& $this->grade_item;
+
+        } else {
+            // insert final grade - it will be needed later anyway
+            $grade = new grade_grade(array('itemid'=>$this->grade_item->id, 'userid'=>$userid), false);
+            $grade->grade_item =& $this->grade_item;
+            $grade->insert('system');
+            $oldfinalgrade = null;
+        }
+
+        // no need to recalculate locked or overridden grades
+        if ($grade->is_locked() or $grade->is_overridden()) {
+            return;
+        }
+
+        // can not use own final category grade in calculation
+        unset($grade_values[$this->grade_item->id]);
+
+        // Make sure a grade_grade exists for every grade_item.
+        // We need to do this so we can set the aggregationstatus
+        // with a set_field call instead of checking if each one exists and creating/updating.
+        if (count($items) > 0) {
+            list($ggsql, $params) = $DB->get_in_or_equal(array_keys($items), SQL_PARAMS_NAMED, 'g');
+
+
+            $params['userid'] = $userid;
+            $sql = "SELECT itemid
+                      FROM {grade_grades}
+                     WHERE itemid $ggsql AND userid = :userid";
+            $existingitems = $DB->get_records_sql($sql, $params);
+
+            $notexisting = array_diff(array_keys($items), array_keys($existingitems));
+            foreach ($notexisting as $itemid) {
+                $gradeitem = $this->grade_item;
+                $gradegrade = new grade_grade(array('itemid' => $itemid,
+                                                    'userid' => $userid,
+                                                    'rawgrademin' => $gradeitem->grademin,
+                                                    'rawgrademax' => $gradeitem->grademax), false);
+                $gradegrade->grade_item = $gradeitem;
+                $gradegrade->insert('system');
+            }
+        }
+
+        // if no grades calculation possible or grading not allowed clear final grade
+        if (empty($grade_values) or empty($items) or ($this->grade_item->gradetype != GRADE_TYPE_VALUE and $this->grade_item->gradetype != GRADE_TYPE_SCALE)) {
+            $grade->finalgrade = null;
+
+            if (!is_null($oldfinalgrade)) {
+                $grade->update('aggregation');
+            }
+            $dropped = $grade_values;
+            $this->set_usedinaggregation($userid, $usedweights, $novalue, $dropped, $extracredit);
+            return;
+        }
+
+        // Normalize the grades first - all will have value 0...1
+        // ungraded items are not used in aggregation.
+        foreach ($grade_values as $itemid=>$v) {
+            if (is_null($v)) {
+                // If null, it means no grade.
+                if ($this->aggregateonlygraded) {
+                    unset($grade_values[$itemid]);
+                    // Mark this item as "excluded empty" because it has no grade.
+                    $novalue[$itemid] = 0;
+                    continue;
+                }
+            }
+            if (in_array($itemid, $excluded)) {
+                unset($grade_values[$itemid]);
+                $dropped[$itemid] = 0;
+                continue;
+            }
+            // Check for user specific grade min/max overrides.
+            $usergrademin = $items[$itemid]->grademin;
+            $usergrademax = $items[$itemid]->grademax;
+            if (isset($grademinoverrides[$itemid])) {
+                $usergrademin = $grademinoverrides[$itemid];
+            }
+            if (isset($grademaxoverrides[$itemid])) {
+                $usergrademax = $grademaxoverrides[$itemid];
+            }
+            $grade_values[$itemid] = grade_grade::standardise_score($v, $usergrademin, $usergrademax, 0, 1);
+        }
+
+        // For items with no value, and not excluded - either set their grade to 0 or exclude them.
+        foreach ($items as $itemid=>$value) {
+            if (!isset($grade_values[$itemid]) and !in_array($itemid, $excluded)) {
+                if (!$this->aggregateonlygraded) {
+                    $grade_values[$itemid] = 0;
+                } else {
+                    // We are specifically marking these items as "excluded empty".
+                    $novalue[$itemid] = 0;
+                }
+            }
+        }
+
+        // limit and sort
+        $allvalues = $grade_values;
+        if ($this->can_apply_limit_rules()) {
+            $this->apply_limit_rules($grade_values, $items);
+        }
+
+        $moredropped = array_diff($allvalues, $grade_values);
+        foreach ($moredropped as $drop => $unused) {
+            $dropped[$drop] = 0;
+        }
+
+        foreach ($grade_values as $itemid => $val) {
+            if (self::is_extracredit_used() && ($items[$itemid]->aggregationcoef > 0)) {
+                $extracredit[$itemid] = 0;
+            }
+        }
+
+        asort($grade_values, SORT_NUMERIC);
+
+        // let's see we have still enough grades to do any statistics
+        if (count($grade_values) == 0) {
+            // not enough attempts yet
+            $grade->finalgrade = null;
+
+            if (!is_null($oldfinalgrade)) {
+                $grade->update('aggregation');
+            }
+            $this->set_usedinaggregation($userid, $usedweights, $novalue, $dropped, $extracredit);
+            return;
+        }
+
+        // do the maths
+        $result = $this->aggregate_values_and_adjust_bounds($grade_values,
+                                                            $items,
+                                                            $usedweights,
+                                                            $grademinoverrides,
+                                                            $grademaxoverrides);
+        $agg_grade = $result['grade'];
+
+        // Recalculate the grade back to requested range.
+        $finalgrade = grade_grade::standardise_score($agg_grade, 0, 1, $result['grademin'], $result['grademax']);
+
+        $grade->finalgrade = $this->grade_item->bounded_grade($finalgrade);
+        $oldrawgrademax = $grade->rawgrademax;
+        $grade->rawgrademax = $result['grademax'];
+
+        // update in db if changed
+        if (grade_floats_different($grade->finalgrade, $oldfinalgrade) ||
+            grade_floats_different($grade->rawgrademax, $oldrawgrademax)) {
+            $grade->update('aggregation');
+        }
+
+        $this->set_usedinaggregation($userid, $usedweights, $novalue, $dropped, $extracredit);
+
+        return;
+    }
+
+    /**
+     * Set the flags on the grade_grade items to indicate how individual grades are used
+     * in the aggregation.
+     *
+     * @param int $userid The user we have aggregated the grades for.
+     * @param array $usedweights An array with keys for each of the grade_item columns included in the aggregation. The value are the relative weight.
+     * @param array $novalue An array with keys for each of the grade_item columns skipped because
+     *                       they had no value in the aggregation.
+     * @param array $dropped An array with keys for each of the grade_item columns dropped
+     *                       because of any drop lowest/highest settings in the aggregation.
+     * @param array $extracredit An array with keys for each of the grade_item columns
+     *                       considered extra credit by the aggregation.
+     */
+||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_GLOBAL
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_EMPTY
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (NULL)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_VAR)
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_PROP
+                        (AST_VAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_NEW
+                        (
+                            (AST_VAR)
+                            (AST_CONST))))
+                (AST_ASSIGN_REF
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_PROP
+                        (AST_VAR)))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_NEW
+                        (
+                            (AST_ARRAY
+                                (AST_ARRAY_ELEM
+                                    (AST_PROP
+                                        (AST_PROP
+                                            (AST_VAR)))
+                                    (SCALAR))
+                                (AST_ARRAY_ELEM
+                                    (AST_VAR)
+                                    (SCALAR)))
+                            (AST_CONST))))
+                (AST_ASSIGN_REF
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_PROP
+                        (AST_VAR)))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (SCALAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_METHOD_CALL
+                    (AST_VAR))
+                (AST_METHOD_CALL
+                    (AST_VAR)))
+            (
+                (AST_RETURN
+                    (NULL)))))
+    (AST_UNSET
+        (AST_DIM
+            (AST_VAR)
+            (AST_PROP
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (AST_VAR)
+        (
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_NEW
+                    (
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR))
+                            (AST_ARRAY_ELEM
+                                (AST_VAR)
+                                (SCALAR))
+                            (AST_ARRAY_ELEM
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR))
+                            (AST_ARRAY_ELEM
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR)))
+                        (AST_CONST))))
+            (AST_ASSIGN
+                (AST_PROP
+                    (AST_VAR))
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_UNARY_OP
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_ARRAY
+                                    (AST_ARRAY_ELEM
+                                        (AST_PROP
+                                            (AST_VAR))
+                                        (SCALAR))
+                                    (AST_ARRAY_ELEM
+                                        (AST_VAR)
+                                        (SCALAR))))))
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (SCALAR))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_EMPTY
+                        (AST_VAR))
+                    (AST_EMPTY
+                        (AST_VAR)))
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_PROP
+                            (AST_PROP
+                                (AST_VAR)))
+                        (AST_CONST))
+                    (AST_BINARY_OP
+                        (AST_PROP
+                            (AST_PROP
+                                (AST_VAR)))
+                        (AST_CONST))))
+            (
+                (AST_ASSIGN
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_CONST))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_VAR))))
+                        (
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (SCALAR))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_VAR))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)))
+                (AST_RETURN
+                    (NULL)))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (AST_VAR)
+        (
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_CALL
+                        (
+                            (AST_VAR)))
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_PROP
+                                    (AST_VAR))
+                                (
+                                    (AST_UNSET
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (AST_VAR)))
+                                    (AST_ASSIGN
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (AST_VAR))
+                                        (SCALAR))
+                                    (AST_CONTINUE
+                                        (NULL))))))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (AST_VAR)))
+                    (
+                        (AST_UNSET
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR)))
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR))
+                            (SCALAR))
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_PROP
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_VAR))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_PROP
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_VAR))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_ISSET
+                        (AST_DIM
+                            (AST_VAR)
+                            (AST_VAR)))
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR))))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_ISSET
+                        (AST_DIM
+                            (AST_VAR)
+                            (AST_VAR)))
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR))))))
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_VAR)
+                    (AST_VAR))
+                (AST_STATIC_CALL
+                    (
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)
+                        (SCALAR)
+                        (SCALAR))))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (AST_VAR)
+        (
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_UNARY_OP
+                            (AST_ISSET
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (AST_VAR))))
+                        (AST_UNARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR)))))
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_UNARY_OP
+                                    (AST_PROP
+                                        (AST_VAR)))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (AST_VAR))
+                                        (SCALAR))))
+                            (AST_IF_ELEM
+                                (NULL)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (AST_VAR))
+                                        (SCALAR))))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_METHOD_CALL
+                (AST_VAR))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (AST_VAR)
+        (
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_VAR)
+                    (AST_VAR))
+                (SCALAR))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (AST_VAR)
+        (
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_STATIC_CALL)
+                        (AST_BINARY_OP
+                            (AST_PROP
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (AST_VAR)))
+                            (SCALAR)))
+                    (
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR))
+                            (SCALAR)))))))
+    (AST_CALL
+        (
+            (AST_VAR)
+            (AST_CONST)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_CALL
+                    (
+                        (AST_VAR)))
+                (SCALAR))
+            (
+                (AST_ASSIGN
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_CONST))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_VAR))))
+                        (
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (SCALAR))))))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)))
+                (AST_RETURN
+                    (NULL)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_DIM
+            (AST_VAR)
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_STATIC_CALL
+            (
+                (AST_VAR)
+                (SCALAR)
+                (SCALAR)
+                (AST_DIM
+                    (AST_VAR)
+                    (SCALAR))
+                (AST_DIM
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_METHOD_CALL
+            (AST_PROP
+                (AST_VAR))
+            (
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_PROP
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_DIM
+            (AST_VAR)
+            (SCALAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_CALL
+                    (
+                        (AST_PROP
+                            (AST_VAR))
+                        (AST_VAR)))
+                (AST_CALL
+                    (
+                        (AST_PROP
+                            (AST_VAR))
+                        (AST_VAR))))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (SCALAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)
+            (AST_VAR)
+            (AST_VAR)
+            (AST_VAR)
+            (AST_VAR)))
+    (AST_RETURN
+        (NULL)))||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_GLOBAL
+        (AST_VAR))
+    (AST_GLOBAL
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_EMPTY
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (NULL)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_VAR)
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_PROP
+                        (AST_VAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_NEW
+                        (
+                            (AST_VAR)
+                            (AST_CONST))))
+                (AST_ASSIGN_REF
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_PROP
+                        (AST_VAR)))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_NEW
+                        (
+                            (AST_ARRAY
+                                (AST_ARRAY_ELEM
+                                    (AST_PROP
+                                        (AST_PROP
+                                            (AST_VAR)))
+                                    (SCALAR))
+                                (AST_ARRAY_ELEM
+                                    (AST_VAR)
+                                    (SCALAR)))
+                            (AST_CONST))))
+                (AST_ASSIGN_REF
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_PROP
+                        (AST_VAR)))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (SCALAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_METHOD_CALL
+                    (AST_VAR))
+                (AST_METHOD_CALL
+                    (AST_VAR)))
+            (
+                (AST_RETURN
+                    (NULL)))))
+    (AST_UNSET
+        (AST_DIM
+            (AST_VAR)
+            (AST_PROP
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_CALL
+                    (
+                        (AST_VAR)))
+                (SCALAR))
+            (
+                (AST_ASSIGN
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (AST_VAR)
+                            (NULL))
+                        (AST_ARRAY_ELEM
+                            (AST_VAR)
+                            (NULL)))
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_CALL
+                                (
+                                    (AST_VAR)))
+                            (AST_CONST)
+                            (SCALAR))))
+                (AST_ASSIGN
+                    (AST_DIM
+                        (AST_VAR)
+                        (SCALAR))
+                    (AST_VAR))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ENCAPS_LIST
+                        (SCALAR)
+                        (AST_VAR)
+                        (SCALAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (AST_CALL
+                                (
+                                    (AST_VAR)))
+                            (AST_CALL
+                                (
+                                    (AST_VAR))))))
+                (AST_FOREACH
+                    (AST_VAR)
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_NEW
+                                (
+                                    (AST_ARRAY
+                                        (AST_ARRAY_ELEM
+                                            (AST_VAR)
+                                            (SCALAR))
+                                        (AST_ARRAY_ELEM
+                                            (AST_VAR)
+                                            (SCALAR))
+                                        (AST_ARRAY_ELEM
+                                            (AST_PROP
+                                                (AST_VAR))
+                                            (SCALAR))
+                                        (AST_ARRAY_ELEM
+                                            (AST_PROP
+                                                (AST_VAR))
+                                            (SCALAR)))
+                                    (AST_CONST))))
+                        (AST_ASSIGN
+                            (AST_PROP
+                                (AST_VAR))
+                            (AST_VAR))
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (SCALAR))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_EMPTY
+                        (AST_VAR))
+                    (AST_EMPTY
+                        (AST_VAR)))
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_PROP
+                            (AST_PROP
+                                (AST_VAR)))
+                        (AST_CONST))
+                    (AST_BINARY_OP
+                        (AST_PROP
+                            (AST_PROP
+                                (AST_VAR)))
+                        (AST_CONST))))
+            (
+                (AST_ASSIGN
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_CONST))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_VAR))))
+                        (
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (SCALAR))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_VAR))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)))
+                (AST_RETURN
+                    (NULL)))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (AST_VAR)
+        (
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_CALL
+                        (
+                            (AST_VAR)))
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_PROP
+                                    (AST_VAR))
+                                (
+                                    (AST_UNSET
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (AST_VAR)))
+                                    (AST_ASSIGN
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (AST_VAR))
+                                        (SCALAR))
+                                    (AST_CONTINUE
+                                        (NULL))))))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (AST_VAR)))
+                    (
+                        (AST_UNSET
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR)))
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR))
+                            (SCALAR))
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_PROP
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_VAR))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_PROP
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_VAR))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_ISSET
+                        (AST_DIM
+                            (AST_VAR)
+                            (AST_VAR)))
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR))))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_ISSET
+                        (AST_DIM
+                            (AST_VAR)
+                            (AST_VAR)))
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR))))))
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_VAR)
+                    (AST_VAR))
+                (AST_STATIC_CALL
+                    (
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)
+                        (SCALAR)
+                        (SCALAR))))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (AST_VAR)
+        (
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_UNARY_OP
+                            (AST_ISSET
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (AST_VAR))))
+                        (AST_UNARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR)))))
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_UNARY_OP
+                                    (AST_PROP
+                                        (AST_VAR)))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (AST_VAR))
+                                        (SCALAR))))
+                            (AST_IF_ELEM
+                                (NULL)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (AST_VAR))
+                                        (SCALAR))))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_METHOD_CALL
+                (AST_VAR))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (AST_VAR)
+        (
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_VAR)
+                    (AST_VAR))
+                (SCALAR))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (AST_VAR)
+        (
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_STATIC_CALL)
+                        (AST_BINARY_OP
+                            (AST_PROP
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (AST_VAR)))
+                            (SCALAR)))
+                    (
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR))
+                            (SCALAR)))))))
+    (AST_CALL
+        (
+            (AST_VAR)
+            (AST_CONST)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_CALL
+                    (
+                        (AST_VAR)))
+                (SCALAR))
+            (
+                (AST_ASSIGN
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_CONST))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_VAR))))
+                        (
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (SCALAR))))))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)))
+                (AST_RETURN
+                    (NULL)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_DIM
+            (AST_VAR)
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_STATIC_CALL
+            (
+                (AST_VAR)
+                (SCALAR)
+                (SCALAR)
+                (AST_DIM
+                    (AST_VAR)
+                    (SCALAR))
+                (AST_DIM
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_METHOD_CALL
+            (AST_PROP
+                (AST_VAR))
+            (
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_PROP
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_DIM
+            (AST_VAR)
+            (SCALAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_CALL
+                    (
+                        (AST_PROP
+                            (AST_VAR))
+                        (AST_VAR)))
+                (AST_CALL
+                    (
+                        (AST_PROP
+                            (AST_VAR))
+                        (AST_VAR))))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (SCALAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)
+            (AST_VAR)
+            (AST_VAR)
+            (AST_VAR)
+            (AST_VAR)))
+    (AST_RETURN
+        (NULL)))

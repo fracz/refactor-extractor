@@ -1,0 +1,544 @@
+||||||||    protected function readProperty($line) {
+
+        if ($this->options & self::OPTION_FORGIVING) {
+            $propNameToken = 'A-Z0-9\-\._\\/';
+        } else {
+            $propNameToken = 'A-Z0-9\-\.';
+        }
+
+        $paramNameToken = 'A-Z0-9\-';
+        $safeChar = '^";:,';
+        $qSafeChar = '^"';
+
+        $regex = "/
+            ^(?P<name> [$propNameToken]+ ) (?=[;:])        # property name
+            |
+            (?<=:)(?P<propValue> .*)$                      # property value
+            |
+            ;(?P<paramName> [$paramNameToken]+) (?=[=;:])  # parameter name
+            |
+            (=|,)(?P<paramValue>                           # parameter value
+                (?: [$safeChar]*) |
+                \"(?: [$qSafeChar]+)\"
+            ) (?=[;:,])
+            /xi";
+
+        //echo $regex, "\n"; die();
+        preg_match_all($regex, $line, $matches,  PREG_SET_ORDER );
+
+        $property = array(
+            'name' => null,
+            'parameters' => array(),
+            'value' => null
+        );
+
+        $lastParam = null;
+
+        /**
+         * Looping through all the tokens.
+         *
+         * Note that we are looping through them in reverse order, because if a
+         * sub-pattern matched, the subsequent named patterns will not show up
+         * in the result.
+         */
+        foreach($matches as $match) {
+
+            if (isset($match['paramValue'])) {
+                if ($match['paramValue'] && $match['paramValue'][0] === '"') {
+                    $value = substr($match['paramValue'], 1, -1);
+                } else {
+                    $value = $match['paramValue'];
+                }
+
+                $value = $this->unescapeParam($value);
+
+                if (is_null($property['parameters'][$lastParam])) {
+                    $property['parameters'][$lastParam] = $value;
+                } elseif (is_array($property['parameters'][$lastParam])) {
+                    $property['parameters'][$lastParam][] = $value;
+                } else {
+                    $property['parameters'][$lastParam] = array(
+                        $property['parameters'][$lastParam],
+                        $value
+                    );
+                }
+                continue;
+            }
+            if (isset($match['paramName'])) {
+                $lastParam = strtoupper($match['paramName']);
+                if (!isset($property['parameters'][$lastParam])) {
+                    $property['parameters'][$lastParam] = null;
+                }
+                continue;
+            }
+            if (isset($match['propValue'])) {
+                $property['value'] = $match['propValue'];
+                continue;
+            }
+            if (isset($match['name']) && $match['name']) {
+                $property['name'] = strtoupper($match['name']);
+                continue;
+            }
+
+            // @codeCoverageIgnoreStart
+            throw new \LogicException('This code should not be reachable');
+            // @codeCoverageIgnoreEnd
+
+        }
+
+        if (is_null($property['value']) || !$property['name']) {
+            if ($this->options & self::OPTION_IGNORE_INVALID_LINES) {
+                return false;
+            }
+            throw new ParseException('Invalid Mimedir file. Line starting at ' . $this->startLine . ' did not follow iCalendar/vCard conventions');
+        }
+
+        // vCard 2.1 states that parameters may appear without a name, and only
+        // a value. We can deduce the value based on it's name.
+        //
+        // Our parser will get those as parameters without a value instead, so
+        // we're filtering these parameters out first.
+        $namedParameters = array();
+        $namelessParameters = array();
+
+        foreach($property['parameters'] as $name=>$value) {
+            if (!is_null($value)) {
+                $namedParameters[$name] = $value;
+            } else {
+                $namelessParameters[] = $name;
+            }
+        }
+
+        $propObj = $this->root->createProperty($property['name'], null, $namedParameters);
+
+        foreach($namelessParameters as $namelessParameter) {
+            $propObj->add(null, $namelessParameter);
+        }
+
+        if (strtoupper($propObj['ENCODING']) === 'QUOTED-PRINTABLE') {
+            $propObj->setQuotedPrintableValue($this->extractQuotedPrintableValue());
+        } else {
+            $propObj->setRawMimeDirValue($property['value']);
+        }
+
+        return $propObj;
+
+    }
+
+    /**
+     * Unescapes a property value.
+     *
+     * vCard 2.1 says:
+     *   * Semi-colons must be escaped in some property values, specifically
+     *     ADR, ORG and N.
+     *   * Semi-colons must be escaped in parameter values, because semi-colons
+     *     are also use to separate values.
+     *   * No mention of escaping backslashes with another backslash.
+     *   * newlines are not escaped either, instead QUOTED-PRINTABLE is used to
+     *     span values over more than 1 line.
+     *
+     * vCard 3.0 says:
+     *   * (rfc2425) Backslashes, newlines (\n or \N) and comma's must be
+     *     escaped, all time time.
+     *   * Comma's are used for delimeters in multiple values
+     *   * (rfc2426) Adds to to this that the semi-colon MUST also be escaped,
+     *     as in some properties semi-colon is used for separators.
+     *   * Properties using semi-colons: N, ADR, GEO, ORG
+     *   * Both ADR and N's individual parts may be broken up further with a
+     *     comma.
+     *   * Properties using commas: NICKNAME, CATEGORIES
+     *
+     * vCard 4.0 (rfc6350) says:
+     *   * Commas must be escaped.
+     *   * Semi-colons may be escaped, an unescaped semi-colon _may_ be a
+     *     delimiter, depending on the property.
+     *   * Backslashes must be escaped
+     *   * Newlines must be escaped as either \N or \n.
+     *   * Some compound properties may contain multiple parts themselves, so a
+     *     comma within a semi-colon delimited property may also be unescaped
+     *     to denote multiple parts _within_ the compound property.
+     *   * Text-properties using semi-colons: N, ADR, ORG, CLIENTPIDMAP.
+     *   * Text-properties using commas: NICKNAME, RELATED, CATEGORIES, PID.
+     *
+     * Even though the spec says that commas must always be escaped, the
+     * example for GEO in Section 6.5.2 seems to violate this.
+     *
+     * iCalendar 2.0 (rfc5545) says:
+     *   * Commas or semi-colons may be used as delimiters, depending on the
+     *     property.
+     *   * Commas, semi-colons, backslashes, newline (\N or \n) are always
+     *     escaped, unless they are delimiters.
+     *   * Colons shall not be escaped.
+     *   * Commas can be considered the 'default delimiter' and is described as
+     *     the delimiter in cases where the order of the multiple values is
+     *     insignificant.
+     *   * Semi-colons are described as the delimiter for 'structured values'.
+     *     They are specifically used in Semi-colons are used as a delimiter in
+     *     REQUEST-STATUS, RRULE, GEO and EXRULE. EXRULE is deprecated however.
+     *
+     * Now for the parameters
+     *
+     * If delimiter is not set (null) this method will just return a string.
+     * If it's a comma or a semi-colon the string will be split on those
+     * characters, and always return an array.
+     *
+     * @param string $input
+     * @param string $delimiter
+     * @return string|string[]
+     */
+||||||||||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_PROP
+                    (AST_VAR))
+                (AST_CLASS_CONST
+                    (SCALAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (SCALAR))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (SCALAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (SCALAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (SCALAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ENCAPS_LIST
+            (SCALAR)
+            (AST_VAR)
+            (SCALAR)
+            (AST_VAR)
+            (SCALAR)
+            (AST_VAR)
+            (SCALAR)
+            (AST_VAR)
+            (SCALAR)))
+    (AST_CALL
+        (
+            (AST_VAR)
+            (AST_VAR)
+            (AST_VAR)
+            (AST_CONST)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY
+            (AST_ARRAY_ELEM
+                (AST_CONST)
+                (SCALAR))
+            (AST_ARRAY_ELEM
+                (AST_ARRAY)
+                (SCALAR))
+            (AST_ARRAY_ELEM
+                (AST_CONST)
+                (SCALAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONST))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_ISSET
+                        (AST_DIM
+                            (AST_VAR)
+                            (SCALAR)))
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_BINARY_OP
+                                    (AST_DIM
+                                        (AST_VAR)
+                                        (SCALAR))
+                                    (AST_BINARY_OP
+                                        (AST_DIM
+                                            (AST_DIM
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (SCALAR))
+                                        (SCALAR)))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_CALL
+                                            (
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (SCALAR))
+                                                (SCALAR)
+                                                (AST_UNARY_OP
+                                                    (SCALAR)))))))
+                            (AST_IF_ELEM
+                                (NULL)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (SCALAR))))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR))))
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_CALL
+                                    (
+                                        (AST_DIM
+                                            (AST_DIM
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (AST_VAR))))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_DIM
+                                            (AST_DIM
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (AST_VAR))
+                                        (AST_VAR))))
+                            (AST_IF_ELEM
+                                (AST_CALL
+                                    (
+                                        (AST_DIM
+                                            (AST_DIM
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (AST_VAR))))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_DIM
+                                            (AST_DIM
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (SCALAR))
+                                                (AST_VAR))
+                                            (NULL))
+                                        (AST_VAR))))
+                            (AST_IF_ELEM
+                                (NULL)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_DIM
+                                            (AST_DIM
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (AST_VAR))
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (AST_DIM
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR))
+                                                    (AST_VAR))
+                                                (NULL))
+                                            (AST_ARRAY_ELEM
+                                                (AST_VAR)
+                                                (NULL)))))))
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_ISSET
+                        (AST_DIM
+                            (AST_VAR)
+                            (SCALAR)))
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_DIM
+                                        (AST_VAR)
+                                        (SCALAR)))))
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_UNARY_OP
+                                    (AST_ISSET
+                                        (AST_DIM
+                                            (AST_DIM
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (AST_VAR))))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_DIM
+                                            (AST_DIM
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (AST_VAR))
+                                        (AST_CONST)))))
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_ISSET
+                        (AST_DIM
+                            (AST_VAR)
+                            (SCALAR)))
+                    (
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (SCALAR))
+                            (AST_DIM
+                                (AST_VAR)
+                                (SCALAR)))
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_ISSET
+                            (AST_DIM
+                                (AST_VAR)
+                                (SCALAR)))
+                        (AST_DIM
+                            (AST_VAR)
+                            (SCALAR)))
+                    (
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (SCALAR))
+                            (AST_CALL
+                                (
+                                    (AST_DIM
+                                        (AST_VAR)
+                                        (SCALAR)))))
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_THROW
+                (AST_NEW
+                    (
+                        (SCALAR))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_CALL
+                    (
+                        (AST_DIM
+                            (AST_VAR)
+                            (SCALAR))))
+                (AST_UNARY_OP
+                    (AST_DIM
+                        (AST_VAR)
+                        (SCALAR))))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_PROP
+                                (AST_VAR))
+                            (AST_CLASS_CONST
+                                (SCALAR)))
+                        (
+                            (AST_RETURN
+                                (AST_CONST)))))
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (SCALAR)
+                                    (AST_PROP
+                                        (AST_VAR)))
+                                (SCALAR))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_FOREACH
+        (AST_DIM
+            (AST_VAR)
+            (SCALAR))
+        (AST_VAR)
+        (AST_VAR)
+        (
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_UNARY_OP
+                        (AST_CALL
+                            (
+                                (AST_VAR))))
+                    (
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR))
+                            (AST_VAR))))
+                (AST_IF_ELEM
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (NULL))
+                            (AST_VAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_PROP
+                (AST_VAR))
+            (
+                (AST_DIM
+                    (AST_VAR)
+                    (SCALAR))
+                (AST_CONST)
+                (AST_VAR))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_METHOD_CALL
+                (AST_VAR)
+                (
+                    (AST_CONST)
+                    (AST_VAR)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_CALL
+                    (
+                        (AST_DIM
+                            (AST_VAR)
+                            (SCALAR))))
+                (SCALAR))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR))))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_DIM
+                            (AST_VAR)
+                            (SCALAR)))))))
+    (AST_RETURN
+        (AST_VAR)))

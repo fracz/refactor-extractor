@@ -1,0 +1,1339 @@
+    public function getAlterFieldSQL($xmldb_table, $xmldb_field, $skip_type_clause = NULL, $skip_default_clause = NULL, $skip_notnull_clause = NULL) {
+
+        $skip_type_clause = is_null($skip_type_clause) ? $this->alter_column_skip_type : $skip_type_clause;
+        $skip_default_clause = is_null($skip_default_clause) ? $this->alter_column_skip_default : $skip_default_clause;
+        $skip_notnull_clause = is_null($skip_notnull_clause) ? $this->alter_column_skip_notnull : $skip_notnull_clause;
+
+        $results = array(); /// To store all the needed SQL commands
+
+    /// Get the quoted name of the table and field
+        $tablename = $this->getTableName($xmldb_table);
+        $fieldname = $xmldb_field->getName();
+
+    /// Take a look to field metadata
+        $meta = $this->mdb->get_columns($xmldb_table->getName());
+        $metac = $meta[$fieldname];
+        $oldmetatype = $metac->meta_type;
+
+        $oldlength = $metac->max_length;
+    /// To calculate the oldlength if the field is numeric, we need to perform one extra query
+    /// because ADOdb has one bug here. http://phplens.com/lens/lensforum/msgs.php?id=15883
+        if ($oldmetatype == 'N') {
+            $uppertablename = strtoupper($tablename);
+            $upperfieldname = strtoupper($fieldname);
+            if ($col = get_record_sql("SELECT cname, precision
+                                   FROM col
+                                   WHERE tname = '$uppertablename'
+                                     AND cname = '$upperfieldname'")) {
+                $oldlength = $col->precision;
+            }
+        }
+        $olddecimals = empty($metac->scale) ? null : $metac->scale;
+        $oldnotnull = empty($metac->not_null) ? false : $metac->not_null;
+        $olddefault = empty($metac->default_value) || strtoupper($metac->default_value) == 'NULL' ? null : $metac->default_value;
+
+        $typechanged = true;  //By default, assume that the column type has changed
+        $precisionchanged = true;  //By default, assume that the column precision has changed
+        $decimalchanged = true;  //By default, assume that the column decimal has changed
+        $defaultchanged = true;  //By default, assume that the column default has changed
+        $notnullchanged = true;  //By default, assume that the column notnull has changed
+
+        $from_temp_fields = false; //By default don't assume we are going to use temporal fields
+
+    /// Detect if we are changing the type of the column
+        if (($xmldb_field->getType() == XMLDB_TYPE_INTEGER && $oldmetatype == 'I') ||
+            ($xmldb_field->getType() == XMLDB_TYPE_NUMBER  && $oldmetatype == 'N') ||
+            ($xmldb_field->getType() == XMLDB_TYPE_FLOAT   && $oldmetatype == 'F') ||
+            ($xmldb_field->getType() == XMLDB_TYPE_CHAR    && $oldmetatype == 'C') ||
+            ($xmldb_field->getType() == XMLDB_TYPE_TEXT    && $oldmetatype == 'X') ||
+            ($xmldb_field->getType() == XMLDB_TYPE_BINARY  && $oldmetatype == 'B')) {
+            $typechanged = false;
+        }
+    /// Detect if precision has changed
+        if (($xmldb_field->getType() == XMLDB_TYPE_TEXT) ||
+            ($xmldb_field->getType() == XMLDB_TYPE_BINARY) ||
+            ($oldlength == -1) ||
+            ($xmldb_field->getLength() == $oldlength)) {
+            $precisionchanged = false;
+        }
+    /// Detect if decimal has changed
+        if (($xmldb_field->getType() == XMLDB_TYPE_INTEGER) ||
+            ($xmldb_field->getType() == XMLDB_TYPE_CHAR) ||
+            ($xmldb_field->getType() == XMLDB_TYPE_TEXT) ||
+            ($xmldb_field->getType() == XMLDB_TYPE_BINARY) ||
+            (!$xmldb_field->getDecimals()) ||
+            (!$olddecimals) ||
+            ($xmldb_field->getDecimals() == $olddecimals)) {
+            $decimalchanged = false;
+        }
+    /// Detect if we are changing the default
+        if (($xmldb_field->getDefault() === null && $olddefault === null) ||
+            ($xmldb_field->getDefault() === $olddefault) ||             //Check both equality and
+            ("'" . $xmldb_field->getDefault() . "'" === $olddefault)) {  //Equality with quotes because ADOdb returns the default with quotes
+            $defaultchanged = false;
+        }
+
+    /// Detect if we are changing the nullability
+        if (($xmldb_field->getNotnull() === $oldnotnull)) {
+            $notnullchanged = false;
+        }
+
+    /// If type has changed or precision or decimal has changed and we are in one numeric field
+    ///     - create one temp column with the new specs
+    ///     - fill the new column with the values from the old one
+    ///     - drop the old column
+    ///     - rename the temp column to the original name
+        if (($typechanged) || (($oldmetatype == 'N' || $oldmetatype == 'I')  && ($precisionchanged || $decimalchanged))) {
+            $tempcolname = $xmldb_field->getName() . '_alter_column_tmp';
+        /// Prevent temp field to have both NULL/NOT NULL and DEFAULT constraints
+            $skip_notnull_clause = true;
+            $skip_default_clause = true;
+            $xmldb_field->setName($tempcolname);
+        /// Create the temporal column
+            $results = array_merge($results, $this->getAddFieldSQL($xmldb_table, $xmldb_field, $skip_type_clause, $skip_type_clause, $skip_notnull_clause));
+        /// Copy contents from original col to the temporal one
+            $results[] = 'UPDATE ' . $tablename . ' SET ' . $tempcolname . ' = ' . $fieldname;
+        /// Drop the old column
+            $xmldb_field->setName($fieldname); //Set back the original field name
+            $results = array_merge($results, $this->getDropFieldSQL($xmldb_table, $xmldb_field));
+        /// Rename the temp column to the original one
+            $results[] = 'ALTER TABLE ' . $tablename . ' RENAME COLUMN ' . $tempcolname . ' TO ' . $fieldname;
+        /// Mark we have performed one change based in temp fields
+            $from_temp_fields = true;
+        /// Re-enable the notnull and default sections so the general AlterFieldSQL can use it
+            $skip_notnull_clause = false;
+            $skip_default_clause = false;
+        /// Dissable the type section because we have done it with the temp field
+            $skip_type_clause = true;
+        /// If new field is nullable, nullability hasn't changed
+            if (!$xmldb_field->getNotnull()) {
+                $notnullchanged = false;
+            }
+        /// If new field hasn't default, default hasn't changed
+            if ($xmldb_field->getDefault() === null) {
+                $defaultchanged = false;
+            }
+        }
+
+    /// If type and precision and decimals hasn't changed, prevent the type clause
+        if (!$typechanged && !$precisionchanged && !$decimalchanged) {
+            $skip_type_clause = true;
+        }
+
+    /// If NULL/NOT NULL hasn't changed
+    /// prevent null clause to be specified
+        if (!$notnullchanged) {
+            $skip_notnull_clause = true; /// Initially, prevent the notnull clause
+        /// But, if we have used the temp field and the new field is not null, then enforce the not null clause
+            if ($from_temp_fields &&  $xmldb_field->getNotnull()) {
+                $skip_notnull_clause = false;
+            }
+        }
+    /// If default hasn't changed
+    /// prevent default clause to be specified
+        if (!$defaultchanged) {
+            $skip_default_clause = true; /// Initially, prevent the default clause
+        /// But, if we have used the temp field and the new field has default clause, then enforce the default clause
+            if ($from_temp_fields) {
+                $default_clause = $this->getDefaultClause($xmldb_field);
+                if ($default_clause) {
+                    $skip_notnull_clause = false;
+                }
+            }
+        }
+
+    /// If arriving here, something is not being skiped (type, notnull, default), calculate the standar AlterFieldSQL
+        if (!$skip_type_clause || !$skip_notnull_clause || !$skip_default_clause) {
+            $results = array_merge($results, parent::getAlterFieldSQL($xmldb_table, $xmldb_field, $skip_type_clause, $skip_default_clause, $skip_notnull_clause));
+            return $results;
+        }
+
+    /// Finally return results
+        return $results;
+    }
+
+    /**
+     * Given one xmldb_table and one xmldb_field, return the SQL statements needded to create its enum
+     * (usually invoked from getModifyEnumSQL()
+     */
+||||||||    public function getAlterFieldSQL($xmldb_table, $xmldb_field, $skip_type_clause = NULL, $skip_default_clause = NULL, $skip_notnull_clause = NULL) {
+
+        $skip_type_clause = is_null($skip_type_clause) ? $this->alter_column_skip_type : $skip_type_clause;
+        $skip_default_clause = is_null($skip_default_clause) ? $this->alter_column_skip_default : $skip_default_clause;
+        $skip_notnull_clause = is_null($skip_notnull_clause) ? $this->alter_column_skip_notnull : $skip_notnull_clause;
+
+        $results = array(); /// To store all the needed SQL commands
+
+    /// Get the quoted name of the table and field
+        $tablename = $this->getTableName($xmldb_table);
+        $fieldname = $xmldb_field->getName();
+
+    /// Take a look to field metadata
+        $meta = $this->mdb->get_columns($tablename, false);
+        $metac = $meta[$fieldname];
+        $oldmetatype = $metac->meta_type;
+
+        $oldlength = $metac->max_length;
+    /// To calculate the oldlength if the field is numeric, we need to perform one extra query
+    /// because ADOdb has one bug here. http://phplens.com/lens/lensforum/msgs.php?id=15883
+        if ($oldmetatype == 'N') {
+            $uppertablename = strtoupper($tablename);
+            $upperfieldname = strtoupper($fieldname);
+            if ($col = get_record_sql("SELECT cname, precision
+                                   FROM col
+                                   WHERE tname = '$uppertablename'
+                                     AND cname = '$upperfieldname'")) {
+                $oldlength = $col->precision;
+            }
+        }
+        $olddecimals = empty($metac->scale) ? null : $metac->scale;
+        $oldnotnull = empty($metac->not_null) ? false : $metac->not_null;
+        $olddefault = empty($metac->default_value) || strtoupper($metac->default_value) == 'NULL' ? null : $metac->default_value;
+
+        $typechanged = true;  //By default, assume that the column type has changed
+        $precisionchanged = true;  //By default, assume that the column precision has changed
+        $decimalchanged = true;  //By default, assume that the column decimal has changed
+        $defaultchanged = true;  //By default, assume that the column default has changed
+        $notnullchanged = true;  //By default, assume that the column notnull has changed
+
+        $from_temp_fields = false; //By default don't assume we are going to use temporal fields
+
+    /// Detect if we are changing the type of the column
+        if (($xmldb_field->getType() == XMLDB_TYPE_INTEGER && $oldmetatype == 'I') ||
+            ($xmldb_field->getType() == XMLDB_TYPE_NUMBER  && $oldmetatype == 'N') ||
+            ($xmldb_field->getType() == XMLDB_TYPE_FLOAT   && $oldmetatype == 'F') ||
+            ($xmldb_field->getType() == XMLDB_TYPE_CHAR    && $oldmetatype == 'C') ||
+            ($xmldb_field->getType() == XMLDB_TYPE_TEXT    && $oldmetatype == 'X') ||
+            ($xmldb_field->getType() == XMLDB_TYPE_BINARY  && $oldmetatype == 'B')) {
+            $typechanged = false;
+        }
+    /// Detect if precision has changed
+        if (($xmldb_field->getType() == XMLDB_TYPE_TEXT) ||
+            ($xmldb_field->getType() == XMLDB_TYPE_BINARY) ||
+            ($oldlength == -1) ||
+            ($xmldb_field->getLength() == $oldlength)) {
+            $precisionchanged = false;
+        }
+    /// Detect if decimal has changed
+        if (($xmldb_field->getType() == XMLDB_TYPE_INTEGER) ||
+            ($xmldb_field->getType() == XMLDB_TYPE_CHAR) ||
+            ($xmldb_field->getType() == XMLDB_TYPE_TEXT) ||
+            ($xmldb_field->getType() == XMLDB_TYPE_BINARY) ||
+            (!$xmldb_field->getDecimals()) ||
+            (!$olddecimals) ||
+            ($xmldb_field->getDecimals() == $olddecimals)) {
+            $decimalchanged = false;
+        }
+    /// Detect if we are changing the default
+        if (($xmldb_field->getDefault() === null && $olddefault === null) ||
+            ($xmldb_field->getDefault() === $olddefault) ||             //Check both equality and
+            ("'" . $xmldb_field->getDefault() . "'" === $olddefault)) {  //Equality with quotes because ADOdb returns the default with quotes
+            $defaultchanged = false;
+        }
+
+    /// Detect if we are changing the nullability
+        if (($xmldb_field->getNotnull() === $oldnotnull)) {
+            $notnullchanged = false;
+        }
+
+    /// If type has changed or precision or decimal has changed and we are in one numeric field
+    ///     - create one temp column with the new specs
+    ///     - fill the new column with the values from the old one
+    ///     - drop the old column
+    ///     - rename the temp column to the original name
+        if (($typechanged) || (($oldmetatype == 'N' || $oldmetatype == 'I')  && ($precisionchanged || $decimalchanged))) {
+            $tempcolname = $xmldb_field->getName() . '_alter_column_tmp';
+        /// Prevent temp field to have both NULL/NOT NULL and DEFAULT constraints
+            $skip_notnull_clause = true;
+            $skip_default_clause = true;
+            $xmldb_field->setName($tempcolname);
+        /// Create the temporal column
+            $results = array_merge($results, $this->getAddFieldSQL($xmldb_table, $xmldb_field, $skip_type_clause, $skip_type_clause, $skip_notnull_clause));
+        /// Copy contents from original col to the temporal one
+            $results[] = 'UPDATE ' . $tablename . ' SET ' . $tempcolname . ' = ' . $fieldname;
+        /// Drop the old column
+            $xmldb_field->setName($fieldname); //Set back the original field name
+            $results = array_merge($results, $this->getDropFieldSQL($xmldb_table, $xmldb_field));
+        /// Rename the temp column to the original one
+            $results[] = 'ALTER TABLE ' . $tablename . ' RENAME COLUMN ' . $tempcolname . ' TO ' . $fieldname;
+        /// Mark we have performed one change based in temp fields
+            $from_temp_fields = true;
+        /// Re-enable the notnull and default sections so the general AlterFieldSQL can use it
+            $skip_notnull_clause = false;
+            $skip_default_clause = false;
+        /// Dissable the type section because we have done it with the temp field
+            $skip_type_clause = true;
+        /// If new field is nullable, nullability hasn't changed
+            if (!$xmldb_field->getNotnull()) {
+                $notnullchanged = false;
+            }
+        /// If new field hasn't default, default hasn't changed
+            if ($xmldb_field->getDefault() === null) {
+                $defaultchanged = false;
+            }
+        }
+
+    /// If type and precision and decimals hasn't changed, prevent the type clause
+        if (!$typechanged && !$precisionchanged && !$decimalchanged) {
+            $skip_type_clause = true;
+        }
+
+    /// If NULL/NOT NULL hasn't changed
+    /// prevent null clause to be specified
+        if (!$notnullchanged) {
+            $skip_notnull_clause = true; /// Initially, prevent the notnull clause
+        /// But, if we have used the temp field and the new field is not null, then enforce the not null clause
+            if ($from_temp_fields &&  $xmldb_field->getNotnull()) {
+                $skip_notnull_clause = false;
+            }
+        }
+    /// If default hasn't changed
+    /// prevent default clause to be specified
+        if (!$defaultchanged) {
+            $skip_default_clause = true; /// Initially, prevent the default clause
+        /// But, if we have used the temp field and the new field has default clause, then enforce the default clause
+            if ($from_temp_fields) {
+                $default_clause = $this->getDefaultClause($xmldb_field);
+                if ($default_clause) {
+                    $skip_notnull_clause = false;
+                }
+            }
+        }
+
+    /// If arriving here, something is not being skiped (type, notnull, default), calculate the standar AlterFieldSQL
+        if (!$skip_type_clause || !$skip_notnull_clause || !$skip_default_clause) {
+            $results = array_merge($results, parent::getAlterFieldSQL($xmldb_table, $xmldb_field, $skip_type_clause, $skip_default_clause, $skip_notnull_clause));
+            return $results;
+        }
+
+    /// Finally return results
+        return $results;
+    }
+
+    /**
+     * Given one xmldb_table and one xmldb_field, return the SQL statements needded to create its enum
+     * (usually invoked from getModifyEnumSQL()
+     */
+||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPEPARAM_DEFAULTNO_PARAM_TYPEPARAM_DEFAULTNO_PARAM_TYPEPARAM_DEFAULT)
+(
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONDITIONAL
+            (AST_CALL
+                (
+                    (AST_VAR)))
+            (AST_PROP
+                (AST_VAR))
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONDITIONAL
+            (AST_CALL
+                (
+                    (AST_VAR)))
+            (AST_PROP
+                (AST_VAR))
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONDITIONAL
+            (AST_CALL
+                (
+                    (AST_VAR)))
+            (AST_PROP
+                (AST_VAR))
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_PROP
+                (AST_VAR))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_DIM
+            (AST_VAR)
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_PROP
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_PROP
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (SCALAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (AST_VAR))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (AST_VAR))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_ENCAPS_LIST
+                                        (SCALAR)
+                                        (AST_VAR)
+                                        (SCALAR)
+                                        (AST_VAR)
+                                        (SCALAR)))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_PROP
+                                    (AST_VAR)))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_CONST)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_CONST)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONDITIONAL
+            (AST_BINARY_OP
+                (AST_EMPTY
+                    (AST_PROP
+                        (AST_VAR)))
+                (AST_BINARY_OP
+                    (AST_CALL
+                        (
+                            (AST_PROP
+                                (AST_VAR))))
+                    (SCALAR)))
+            (AST_CONST)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONST))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_METHOD_CALL
+                                            (AST_VAR))
+                                        (AST_CONST))
+                                    (AST_BINARY_OP
+                                        (AST_VAR)
+                                        (SCALAR)))
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_METHOD_CALL
+                                            (AST_VAR))
+                                        (AST_CONST))
+                                    (AST_BINARY_OP
+                                        (AST_VAR)
+                                        (SCALAR))))
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_METHOD_CALL
+                                        (AST_VAR))
+                                    (AST_CONST))
+                                (AST_BINARY_OP
+                                    (AST_VAR)
+                                    (SCALAR))))
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_METHOD_CALL
+                                    (AST_VAR))
+                                (AST_CONST))
+                            (AST_BINARY_OP
+                                (AST_VAR)
+                                (SCALAR))))
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (AST_CONST))
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (SCALAR))))
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_METHOD_CALL
+                            (AST_VAR))
+                        (AST_CONST))
+                    (AST_BINARY_OP
+                        (AST_VAR)
+                        (SCALAR))))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (AST_CONST))
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (AST_CONST)))
+                    (AST_BINARY_OP
+                        (AST_VAR)
+                        (AST_UNARY_OP
+                            (SCALAR))))
+                (AST_BINARY_OP
+                    (AST_METHOD_CALL
+                        (AST_VAR))
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_METHOD_CALL
+                                            (AST_VAR))
+                                        (AST_CONST))
+                                    (AST_BINARY_OP
+                                        (AST_METHOD_CALL
+                                            (AST_VAR))
+                                        (AST_CONST)))
+                                (AST_BINARY_OP
+                                    (AST_METHOD_CALL
+                                        (AST_VAR))
+                                    (AST_CONST)))
+                            (AST_BINARY_OP
+                                (AST_METHOD_CALL
+                                    (AST_VAR))
+                                (AST_CONST)))
+                        (AST_UNARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))))
+                    (AST_UNARY_OP
+                        (AST_VAR)))
+                (AST_BINARY_OP
+                    (AST_METHOD_CALL
+                        (AST_VAR))
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (AST_CONST))
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (AST_CONST)))
+                    (AST_BINARY_OP
+                        (AST_METHOD_CALL
+                            (AST_VAR))
+                        (AST_VAR)))
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (SCALAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)))
+                        (SCALAR))
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_METHOD_CALL
+                    (AST_VAR))
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (SCALAR))
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (SCALAR)))
+                    (AST_BINARY_OP
+                        (AST_VAR)
+                        (AST_VAR))))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_BINARY_OP
+                        (AST_METHOD_CALL
+                            (AST_VAR))
+                        (SCALAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR)
+                                    (AST_VAR)
+                                    (AST_VAR)
+                                    (AST_VAR))))))
+                (AST_ASSIGN
+                    (AST_DIM
+                        (AST_VAR)
+                        (NULL))
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (SCALAR)
+                                        (AST_VAR))
+                                    (SCALAR))
+                                (AST_VAR))
+                            (SCALAR))
+                        (AST_VAR)))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))))
+                (AST_ASSIGN
+                    (AST_DIM
+                        (AST_VAR)
+                        (NULL))
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (SCALAR)
+                                        (AST_VAR))
+                                    (SCALAR))
+                                (AST_VAR))
+                            (SCALAR))
+                        (AST_VAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR)))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_CONST)))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (AST_CONST))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_CONST))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_UNARY_OP
+                        (AST_VAR))
+                    (AST_UNARY_OP
+                        (AST_VAR)))
+                (AST_UNARY_OP
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_CONST))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_VAR)
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR))))
+                            (AST_IF
+                                (AST_IF_ELEM
+                                    (AST_VAR)
+                                    (
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_CONST)))))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_UNARY_OP
+                        (AST_VAR))
+                    (AST_UNARY_OP
+                        (AST_VAR)))
+                (AST_UNARY_OP
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (AST_STATIC_CALL
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR)
+                                    (AST_VAR)
+                                    (AST_VAR)
+                                    (AST_VAR))))))
+                (AST_RETURN
+                    (AST_VAR)))))
+    (AST_RETURN
+        (AST_VAR)))||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPEPARAM_DEFAULTNO_PARAM_TYPEPARAM_DEFAULTNO_PARAM_TYPEPARAM_DEFAULT)
+(
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONDITIONAL
+            (AST_CALL
+                (
+                    (AST_VAR)))
+            (AST_PROP
+                (AST_VAR))
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONDITIONAL
+            (AST_CALL
+                (
+                    (AST_VAR)))
+            (AST_PROP
+                (AST_VAR))
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONDITIONAL
+            (AST_CALL
+                (
+                    (AST_VAR)))
+            (AST_PROP
+                (AST_VAR))
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_PROP
+                (AST_VAR))
+            (
+                (AST_VAR)
+                (AST_CONST))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_DIM
+            (AST_VAR)
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_PROP
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_PROP
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (SCALAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (AST_VAR))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (AST_VAR))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_ENCAPS_LIST
+                                        (SCALAR)
+                                        (AST_VAR)
+                                        (SCALAR)
+                                        (AST_VAR)
+                                        (SCALAR)))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_PROP
+                                    (AST_VAR)))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_CONST)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_CONST)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONDITIONAL
+            (AST_BINARY_OP
+                (AST_EMPTY
+                    (AST_PROP
+                        (AST_VAR)))
+                (AST_BINARY_OP
+                    (AST_CALL
+                        (
+                            (AST_PROP
+                                (AST_VAR))))
+                    (SCALAR)))
+            (AST_CONST)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONST))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_METHOD_CALL
+                                            (AST_VAR))
+                                        (AST_CONST))
+                                    (AST_BINARY_OP
+                                        (AST_VAR)
+                                        (SCALAR)))
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_METHOD_CALL
+                                            (AST_VAR))
+                                        (AST_CONST))
+                                    (AST_BINARY_OP
+                                        (AST_VAR)
+                                        (SCALAR))))
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_METHOD_CALL
+                                        (AST_VAR))
+                                    (AST_CONST))
+                                (AST_BINARY_OP
+                                    (AST_VAR)
+                                    (SCALAR))))
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_METHOD_CALL
+                                    (AST_VAR))
+                                (AST_CONST))
+                            (AST_BINARY_OP
+                                (AST_VAR)
+                                (SCALAR))))
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (AST_CONST))
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (SCALAR))))
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_METHOD_CALL
+                            (AST_VAR))
+                        (AST_CONST))
+                    (AST_BINARY_OP
+                        (AST_VAR)
+                        (SCALAR))))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (AST_CONST))
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (AST_CONST)))
+                    (AST_BINARY_OP
+                        (AST_VAR)
+                        (AST_UNARY_OP
+                            (SCALAR))))
+                (AST_BINARY_OP
+                    (AST_METHOD_CALL
+                        (AST_VAR))
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_METHOD_CALL
+                                            (AST_VAR))
+                                        (AST_CONST))
+                                    (AST_BINARY_OP
+                                        (AST_METHOD_CALL
+                                            (AST_VAR))
+                                        (AST_CONST)))
+                                (AST_BINARY_OP
+                                    (AST_METHOD_CALL
+                                        (AST_VAR))
+                                    (AST_CONST)))
+                            (AST_BINARY_OP
+                                (AST_METHOD_CALL
+                                    (AST_VAR))
+                                (AST_CONST)))
+                        (AST_UNARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))))
+                    (AST_UNARY_OP
+                        (AST_VAR)))
+                (AST_BINARY_OP
+                    (AST_METHOD_CALL
+                        (AST_VAR))
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (AST_CONST))
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (AST_CONST)))
+                    (AST_BINARY_OP
+                        (AST_METHOD_CALL
+                            (AST_VAR))
+                        (AST_VAR)))
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (SCALAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)))
+                        (SCALAR))
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_METHOD_CALL
+                    (AST_VAR))
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (SCALAR))
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (SCALAR)))
+                    (AST_BINARY_OP
+                        (AST_VAR)
+                        (AST_VAR))))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_BINARY_OP
+                        (AST_METHOD_CALL
+                            (AST_VAR))
+                        (SCALAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR)
+                                    (AST_VAR)
+                                    (AST_VAR)
+                                    (AST_VAR))))))
+                (AST_ASSIGN
+                    (AST_DIM
+                        (AST_VAR)
+                        (NULL))
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (SCALAR)
+                                        (AST_VAR))
+                                    (SCALAR))
+                                (AST_VAR))
+                            (SCALAR))
+                        (AST_VAR)))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))))
+                (AST_ASSIGN
+                    (AST_DIM
+                        (AST_VAR)
+                        (NULL))
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (SCALAR)
+                                        (AST_VAR))
+                                    (SCALAR))
+                                (AST_VAR))
+                            (SCALAR))
+                        (AST_VAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR)))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_CONST)))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (AST_CONST))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_CONST))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_UNARY_OP
+                        (AST_VAR))
+                    (AST_UNARY_OP
+                        (AST_VAR)))
+                (AST_UNARY_OP
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_CONST))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_VAR)
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR))))
+                            (AST_IF
+                                (AST_IF_ELEM
+                                    (AST_VAR)
+                                    (
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_CONST)))))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_UNARY_OP
+                        (AST_VAR))
+                    (AST_UNARY_OP
+                        (AST_VAR)))
+                (AST_UNARY_OP
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (AST_STATIC_CALL
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR)
+                                    (AST_VAR)
+                                    (AST_VAR)
+                                    (AST_VAR))))))
+                (AST_RETURN
+                    (AST_VAR)))))
+    (AST_RETURN
+        (AST_VAR)))

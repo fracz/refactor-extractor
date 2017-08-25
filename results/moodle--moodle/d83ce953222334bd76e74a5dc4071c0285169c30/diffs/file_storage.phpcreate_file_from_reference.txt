@@ -1,0 +1,1219 @@
+    public function create_file_from_reference($filerecord, $repositoryid, $reference, $options = array()) {
+        global $DB;
+
+        $filerecord = (array)$filerecord;  // Do not modify the submitted record, this cast unlinks objects.
+        $filerecord = (object)$filerecord; // We support arrays too.
+
+        // validate all parameters, we do not want any rubbish stored in database, right?
+        if (!is_number($filerecord->contextid) or $filerecord->contextid < 1) {
+            throw new file_exception('storedfileproblem', 'Invalid contextid');
+        }
+
+        $filerecord->component = clean_param($filerecord->component, PARAM_COMPONENT);
+        if (empty($filerecord->component)) {
+            throw new file_exception('storedfileproblem', 'Invalid component');
+        }
+
+        $filerecord->filearea = clean_param($filerecord->filearea, PARAM_AREA);
+        if (empty($filerecord->filearea)) {
+            throw new file_exception('storedfileproblem', 'Invalid filearea');
+        }
+
+        if (!is_number($filerecord->itemid) or $filerecord->itemid < 0) {
+            throw new file_exception('storedfileproblem', 'Invalid itemid');
+        }
+
+        if (!empty($filerecord->sortorder)) {
+            if (!is_number($filerecord->sortorder) or $filerecord->sortorder < 0) {
+                $filerecord->sortorder = 0;
+            }
+        } else {
+            $filerecord->sortorder = 0;
+        }
+
+        $filerecord->referencefileid   = empty($filerecord->referencefileid) ? 0 : $filerecord->referencefileid;
+        $filerecord->referencelastsync = empty($filerecord->referencelastsync) ? 0 : $filerecord->referencelastsync;
+        $filerecord->referencelifetime = empty($filerecord->referencelifetime) ? 0 : $filerecord->referencelifetime;
+        $filerecord->mimetype          = empty($filerecord->mimetype) ? $this->mimetype($filerecord->filename) : $filerecord->mimetype;
+        $filerecord->userid            = empty($filerecord->userid) ? null : $filerecord->userid;
+        $filerecord->source            = empty($filerecord->source) ? null : $filerecord->source;
+        $filerecord->author            = empty($filerecord->author) ? null : $filerecord->author;
+        $filerecord->license           = empty($filerecord->license) ? null : $filerecord->license;
+        $filerecord->filepath          = clean_param($filerecord->filepath, PARAM_PATH);
+        if (strpos($filerecord->filepath, '/') !== 0 or strrpos($filerecord->filepath, '/') !== strlen($filerecord->filepath)-1) {
+            // Path must start and end with '/'.
+            throw new file_exception('storedfileproblem', 'Invalid file path');
+        }
+
+        $filerecord->filename = clean_param($filerecord->filename, PARAM_FILE);
+        if ($filerecord->filename === '') {
+            // Path must start and end with '/'.
+            throw new file_exception('storedfileproblem', 'Invalid file name');
+        }
+
+        $now = time();
+        if (isset($filerecord->timecreated)) {
+            if (!is_number($filerecord->timecreated)) {
+                throw new file_exception('storedfileproblem', 'Invalid file timecreated');
+            }
+            if ($filerecord->timecreated < 0) {
+                // NOTE: unfortunately I make a mistake when creating the "files" table, we can not have negative numbers there, on the other hand no file should be older than 1970, right? (skodak)
+                $filerecord->timecreated = 0;
+            }
+        } else {
+            $filerecord->timecreated = $now;
+        }
+
+        if (isset($filerecord->timemodified)) {
+            if (!is_number($filerecord->timemodified)) {
+                throw new file_exception('storedfileproblem', 'Invalid file timemodified');
+            }
+            if ($filerecord->timemodified < 0) {
+                // NOTE: unfortunately I make a mistake when creating the "files" table, we can not have negative numbers there, on the other hand no file should be older than 1970, right? (skodak)
+                $filerecord->timemodified = 0;
+            }
+        } else {
+            $filerecord->timemodified = $now;
+        }
+
+        $transaction = $DB->start_delegated_transaction();
+
+        // Insert file reference record.
+        try {
+            $referencerecord = new stdClass;
+            $referencerecord->repositoryid = $repositoryid;
+            $referencerecord->reference = $reference;
+            $referencerecord->lastsync = $filerecord->referencelastsync;
+            $referencerecord->lifetime = $filerecord->referencelifetime;
+            $referencerecord->id = $DB->insert_record('files_reference', $referencerecord);
+        } catch (dml_exception $e) {
+            throw $e;
+        }
+
+        $filerecord->referencefileid = $referencerecord->id;
+
+        // External file doesn't have content in moodle.
+        // So we create an empty file for it.
+        list($filerecord->contenthash, $filerecord->filesize, $newfile) = $this->add_string_to_pool(null);
+
+        $filerecord->pathnamehash = $this->get_pathname_hash($filerecord->contextid, $filerecord->component, $filerecord->filearea, $filerecord->itemid, $filerecord->filepath, $filerecord->filename);
+
+        try {
+            $filerecord->id = $DB->insert_record('files', $filerecord);
+        } catch (dml_exception $e) {
+            if ($newfile) {
+                $this->deleted_file_cleanup($filerecord->contenthash);
+            }
+            throw new stored_file_creation_exception($filerecord->contextid, $filerecord->component, $filerecord->filearea, $filerecord->itemid,
+                                                    $filerecord->filepath, $filerecord->filename, $e->debuginfo);
+        }
+
+        $this->create_directory($filerecord->contextid, $filerecord->component, $filerecord->filearea, $filerecord->itemid, $filerecord->filepath, $filerecord->userid);
+
+        $transaction->allow_commit();
+
+        // Adding repositoryid and reference to file record to create stored_file instance
+        $filerecord->repositoryid = $repositoryid;
+        $filerecord->reference = $reference;
+        return $this->get_file_instance($filerecord);
+    }
+
+    /**
+     * Creates new image file from existing.
+     *
+     * @param stdClass|array $filerecord object or array describing new file
+     * @param int|stored_file $fid file id or stored file object
+     * @param int $newwidth in pixels
+     * @param int $newheight in pixels
+     * @param bool $keepaspectratio whether or not keep aspect ratio
+     * @param int $quality depending on image type 0-100 for jpeg, 0-9 (0 means no compression) for png
+     * @return stored_file
+     */
+||||||||    public function create_file_from_reference($filerecord, $repositoryid, $reference, $options = array()) {
+        global $DB;
+
+        $filerecord = (array)$filerecord;  // Do not modify the submitted record, this cast unlinks objects.
+        $filerecord = (object)$filerecord; // We support arrays too.
+
+        // validate all parameters, we do not want any rubbish stored in database, right?
+        if (!is_number($filerecord->contextid) or $filerecord->contextid < 1) {
+            throw new file_exception('storedfileproblem', 'Invalid contextid');
+        }
+
+        $filerecord->component = clean_param($filerecord->component, PARAM_COMPONENT);
+        if (empty($filerecord->component)) {
+            throw new file_exception('storedfileproblem', 'Invalid component');
+        }
+
+        $filerecord->filearea = clean_param($filerecord->filearea, PARAM_AREA);
+        if (empty($filerecord->filearea)) {
+            throw new file_exception('storedfileproblem', 'Invalid filearea');
+        }
+
+        if (!is_number($filerecord->itemid) or $filerecord->itemid < 0) {
+            throw new file_exception('storedfileproblem', 'Invalid itemid');
+        }
+
+        if (!empty($filerecord->sortorder)) {
+            if (!is_number($filerecord->sortorder) or $filerecord->sortorder < 0) {
+                $filerecord->sortorder = 0;
+            }
+        } else {
+            $filerecord->sortorder = 0;
+        }
+
+        $filerecord->referencefileid   = empty($filerecord->referencefileid) ? 0 : $filerecord->referencefileid;
+        $filerecord->referencelastsync = empty($filerecord->referencelastsync) ? 0 : $filerecord->referencelastsync;
+        $filerecord->referencelifetime = empty($filerecord->referencelifetime) ? 0 : $filerecord->referencelifetime;
+        $filerecord->mimetype          = empty($filerecord->mimetype) ? $this->mimetype($filerecord->filename) : $filerecord->mimetype;
+        $filerecord->userid            = empty($filerecord->userid) ? null : $filerecord->userid;
+        $filerecord->source            = empty($filerecord->source) ? null : $filerecord->source;
+        $filerecord->author            = empty($filerecord->author) ? null : $filerecord->author;
+        $filerecord->license           = empty($filerecord->license) ? null : $filerecord->license;
+        $filerecord->filepath          = clean_param($filerecord->filepath, PARAM_PATH);
+        if (strpos($filerecord->filepath, '/') !== 0 or strrpos($filerecord->filepath, '/') !== strlen($filerecord->filepath)-1) {
+            // Path must start and end with '/'.
+            throw new file_exception('storedfileproblem', 'Invalid file path');
+        }
+
+        $filerecord->filename = clean_param($filerecord->filename, PARAM_FILE);
+        if ($filerecord->filename === '') {
+            // Path must start and end with '/'.
+            throw new file_exception('storedfileproblem', 'Invalid file name');
+        }
+
+        $now = time();
+        if (isset($filerecord->timecreated)) {
+            if (!is_number($filerecord->timecreated)) {
+                throw new file_exception('storedfileproblem', 'Invalid file timecreated');
+            }
+            if ($filerecord->timecreated < 0) {
+                // NOTE: unfortunately I make a mistake when creating the "files" table, we can not have negative numbers there, on the other hand no file should be older than 1970, right? (skodak)
+                $filerecord->timecreated = 0;
+            }
+        } else {
+            $filerecord->timecreated = $now;
+        }
+
+        if (isset($filerecord->timemodified)) {
+            if (!is_number($filerecord->timemodified)) {
+                throw new file_exception('storedfileproblem', 'Invalid file timemodified');
+            }
+            if ($filerecord->timemodified < 0) {
+                // NOTE: unfortunately I make a mistake when creating the "files" table, we can not have negative numbers there, on the other hand no file should be older than 1970, right? (skodak)
+                $filerecord->timemodified = 0;
+            }
+        } else {
+            $filerecord->timemodified = $now;
+        }
+
+        $transaction = $DB->start_delegated_transaction();
+
+        try {
+            $filerecord->referencefileid = $this->get_or_create_referencefileid($repositoryid, $reference,
+                $filerecord->referencelastsync, $filerecord->referencelifetime);
+        } catch (Exception $e) {
+            throw new file_reference_exception($repositoryid, $reference, null, null, $e->getMessage());
+        }
+
+        // External file doesn't have content in moodle.
+        // So we create an empty file for it.
+        list($filerecord->contenthash, $filerecord->filesize, $newfile) = $this->add_string_to_pool(null);
+
+        $filerecord->pathnamehash = $this->get_pathname_hash($filerecord->contextid, $filerecord->component, $filerecord->filearea, $filerecord->itemid, $filerecord->filepath, $filerecord->filename);
+
+        try {
+            $filerecord->id = $DB->insert_record('files', $filerecord);
+        } catch (dml_exception $e) {
+            if ($newfile) {
+                $this->deleted_file_cleanup($filerecord->contenthash);
+            }
+            throw new stored_file_creation_exception($filerecord->contextid, $filerecord->component, $filerecord->filearea, $filerecord->itemid,
+                                                    $filerecord->filepath, $filerecord->filename, $e->debuginfo);
+        }
+
+        $this->create_directory($filerecord->contextid, $filerecord->component, $filerecord->filearea, $filerecord->itemid, $filerecord->filepath, $filerecord->userid);
+
+        $transaction->allow_commit();
+
+        // Adding repositoryid and reference to file record to create stored_file instance
+        $filerecord->repositoryid = $repositoryid;
+        $filerecord->reference = $reference;
+        return $this->get_file_instance($filerecord);
+    }
+
+    /**
+     * Creates new image file from existing.
+     *
+     * @param stdClass|array $filerecord object or array describing new file
+     * @param int|stored_file $fid file id or stored file object
+     * @param int $newwidth in pixels
+     * @param int $newheight in pixels
+     * @param bool $keepaspectratio whether or not keep aspect ratio
+     * @param int $quality depending on image type 0-100 for jpeg, 0-9 (0 means no compression) for png
+     * @return stored_file
+     */
+||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPEPARAM_DEFAULT)
+(
+    (AST_GLOBAL
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CAST
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CAST
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_UNARY_OP
+                    (AST_CALL
+                        (
+                            (AST_PROP
+                                (AST_VAR)))))
+                (AST_BINARY_OP
+                    (AST_PROP
+                        (AST_VAR))
+                    (SCALAR)))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CALL
+            (
+                (AST_PROP
+                    (AST_VAR))
+                (AST_CONST))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CALL
+            (
+                (AST_PROP
+                    (AST_VAR))
+                (AST_CONST))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_UNARY_OP
+                    (AST_CALL
+                        (
+                            (AST_PROP
+                                (AST_VAR)))))
+                (AST_BINARY_OP
+                    (AST_PROP
+                        (AST_VAR))
+                    (SCALAR)))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_EMPTY
+                    (AST_PROP
+                        (AST_VAR))))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_UNARY_OP
+                                (AST_CALL
+                                    (
+                                        (AST_PROP
+                                            (AST_VAR)))))
+                            (AST_BINARY_OP
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR)))
+                        (
+                            (AST_ASSIGN
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR)))))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_ASSIGN
+                    (AST_PROP
+                        (AST_VAR))
+                    (SCALAR)))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (SCALAR)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (SCALAR)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (SCALAR)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_METHOD_CALL
+                (AST_VAR)
+                (
+                    (AST_PROP
+                        (AST_VAR))))
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_CONST)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_CONST)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_CONST)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_CONST)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CALL
+            (
+                (AST_PROP
+                    (AST_VAR))
+                (AST_CONST))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_CALL
+                        (
+                            (AST_PROP
+                                (AST_VAR))
+                            (SCALAR)))
+                    (SCALAR))
+                (AST_BINARY_OP
+                    (AST_CALL
+                        (
+                            (AST_PROP
+                                (AST_VAR))
+                            (SCALAR)))
+                    (AST_BINARY_OP
+                        (AST_CALL
+                            (
+                                (AST_PROP
+                                    (AST_VAR))))
+                        (SCALAR))))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CALL
+            (
+                (AST_PROP
+                    (AST_VAR))
+                (AST_CONST))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_PROP
+                    (AST_VAR))
+                (SCALAR))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_ISSET
+                (AST_PROP
+                    (AST_VAR)))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_PROP
+                                        (AST_VAR)))))
+                        (
+                            (AST_THROW
+                                (AST_NEW
+                                    (
+                                        (SCALAR)
+                                        (SCALAR)))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_PROP
+                                (AST_VAR))
+                            (SCALAR))
+                        (
+                            (AST_ASSIGN
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR)))))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_ASSIGN
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_ISSET
+                (AST_PROP
+                    (AST_VAR)))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_PROP
+                                        (AST_VAR)))))
+                        (
+                            (AST_THROW
+                                (AST_NEW
+                                    (
+                                        (SCALAR)
+                                        (SCALAR)))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_PROP
+                                (AST_VAR))
+                            (SCALAR))
+                        (
+                            (AST_ASSIGN
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR)))))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_ASSIGN
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_TRY
+        (
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_NEW))
+            (AST_ASSIGN
+                (AST_PROP
+                    (AST_VAR))
+                (AST_VAR))
+            (AST_ASSIGN
+                (AST_PROP
+                    (AST_VAR))
+                (AST_VAR))
+            (AST_ASSIGN
+                (AST_PROP
+                    (AST_VAR))
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_ASSIGN
+                (AST_PROP
+                    (AST_VAR))
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_ASSIGN
+                (AST_PROP
+                    (AST_VAR))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (SCALAR)
+                        (AST_VAR)))))
+        (AST_CATCH_LIST
+            (AST_CATCH
+                (AST_NAME_LIST)
+                (AST_VAR)
+                (
+                    (AST_THROW
+                        (AST_VAR)))))
+        (NULL))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_PROP
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_ARRAY
+            (AST_ARRAY_ELEM
+                (AST_PROP
+                    (AST_VAR))
+                (NULL))
+            (AST_ARRAY_ELEM
+                (AST_PROP
+                    (AST_VAR))
+                (NULL))
+            (AST_ARRAY_ELEM
+                (AST_VAR)
+                (NULL)))
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_CONST))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_PROP
+                    (AST_VAR))
+                (AST_PROP
+                    (AST_VAR))
+                (AST_PROP
+                    (AST_VAR))
+                (AST_PROP
+                    (AST_VAR))
+                (AST_PROP
+                    (AST_VAR))
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_TRY
+        (
+            (AST_ASSIGN
+                (AST_PROP
+                    (AST_VAR))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (SCALAR)
+                        (AST_VAR)))))
+        (AST_CATCH_LIST
+            (AST_CATCH
+                (AST_NAME_LIST)
+                (AST_VAR)
+                (
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_VAR)
+                            (
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_PROP
+                                            (AST_VAR)))))))
+                    (AST_THROW
+                        (AST_NEW
+                            (
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_PROP
+                                    (AST_VAR))))))))
+        (NULL))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_PROP
+                (AST_VAR))
+            (AST_PROP
+                (AST_VAR))
+            (AST_PROP
+                (AST_VAR))
+            (AST_PROP
+                (AST_VAR))
+            (AST_PROP
+                (AST_VAR))
+            (AST_PROP
+                (AST_VAR))))
+    (AST_METHOD_CALL
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR))
+    (AST_RETURN
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR)))))||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPEPARAM_DEFAULT)
+(
+    (AST_GLOBAL
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CAST
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CAST
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_UNARY_OP
+                    (AST_CALL
+                        (
+                            (AST_PROP
+                                (AST_VAR)))))
+                (AST_BINARY_OP
+                    (AST_PROP
+                        (AST_VAR))
+                    (SCALAR)))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CALL
+            (
+                (AST_PROP
+                    (AST_VAR))
+                (AST_CONST))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CALL
+            (
+                (AST_PROP
+                    (AST_VAR))
+                (AST_CONST))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_UNARY_OP
+                    (AST_CALL
+                        (
+                            (AST_PROP
+                                (AST_VAR)))))
+                (AST_BINARY_OP
+                    (AST_PROP
+                        (AST_VAR))
+                    (SCALAR)))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_EMPTY
+                    (AST_PROP
+                        (AST_VAR))))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_UNARY_OP
+                                (AST_CALL
+                                    (
+                                        (AST_PROP
+                                            (AST_VAR)))))
+                            (AST_BINARY_OP
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR)))
+                        (
+                            (AST_ASSIGN
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR)))))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_ASSIGN
+                    (AST_PROP
+                        (AST_VAR))
+                    (SCALAR)))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (SCALAR)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (SCALAR)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (SCALAR)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_METHOD_CALL
+                (AST_VAR)
+                (
+                    (AST_PROP
+                        (AST_VAR))))
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_CONST)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_CONST)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_CONST)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CONDITIONAL
+            (AST_EMPTY
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_CONST)
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CALL
+            (
+                (AST_PROP
+                    (AST_VAR))
+                (AST_CONST))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_CALL
+                        (
+                            (AST_PROP
+                                (AST_VAR))
+                            (SCALAR)))
+                    (SCALAR))
+                (AST_BINARY_OP
+                    (AST_CALL
+                        (
+                            (AST_PROP
+                                (AST_VAR))
+                            (SCALAR)))
+                    (AST_BINARY_OP
+                        (AST_CALL
+                            (
+                                (AST_PROP
+                                    (AST_VAR))))
+                        (SCALAR))))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CALL
+            (
+                (AST_PROP
+                    (AST_VAR))
+                (AST_CONST))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_PROP
+                    (AST_VAR))
+                (SCALAR))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_ISSET
+                (AST_PROP
+                    (AST_VAR)))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_PROP
+                                        (AST_VAR)))))
+                        (
+                            (AST_THROW
+                                (AST_NEW
+                                    (
+                                        (SCALAR)
+                                        (SCALAR)))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_PROP
+                                (AST_VAR))
+                            (SCALAR))
+                        (
+                            (AST_ASSIGN
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR)))))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_ASSIGN
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_ISSET
+                (AST_PROP
+                    (AST_VAR)))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_PROP
+                                        (AST_VAR)))))
+                        (
+                            (AST_THROW
+                                (AST_NEW
+                                    (
+                                        (SCALAR)
+                                        (SCALAR)))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_PROP
+                                (AST_VAR))
+                            (SCALAR))
+                        (
+                            (AST_ASSIGN
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR)))))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_ASSIGN
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_TRY
+        (
+            (AST_ASSIGN
+                (AST_PROP
+                    (AST_VAR))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_PROP
+                            (AST_VAR))
+                        (AST_PROP
+                            (AST_VAR))))))
+        (AST_CATCH_LIST
+            (AST_CATCH
+                (AST_NAME_LIST)
+                (AST_VAR)
+                (
+                    (AST_THROW
+                        (AST_NEW
+                            (
+                                (AST_VAR)
+                                (AST_VAR)
+                                (AST_CONST)
+                                (AST_CONST)
+                                (AST_METHOD_CALL
+                                    (AST_VAR))))))))
+        (NULL))
+    (AST_ASSIGN
+        (AST_ARRAY
+            (AST_ARRAY_ELEM
+                (AST_PROP
+                    (AST_VAR))
+                (NULL))
+            (AST_ARRAY_ELEM
+                (AST_PROP
+                    (AST_VAR))
+                (NULL))
+            (AST_ARRAY_ELEM
+                (AST_VAR)
+                (NULL)))
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_CONST))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_PROP
+                    (AST_VAR))
+                (AST_PROP
+                    (AST_VAR))
+                (AST_PROP
+                    (AST_VAR))
+                (AST_PROP
+                    (AST_VAR))
+                (AST_PROP
+                    (AST_VAR))
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_TRY
+        (
+            (AST_ASSIGN
+                (AST_PROP
+                    (AST_VAR))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (SCALAR)
+                        (AST_VAR)))))
+        (AST_CATCH_LIST
+            (AST_CATCH
+                (AST_NAME_LIST)
+                (AST_VAR)
+                (
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_VAR)
+                            (
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_PROP
+                                            (AST_VAR)))))))
+                    (AST_THROW
+                        (AST_NEW
+                            (
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_PROP
+                                    (AST_VAR))))))))
+        (NULL))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_PROP
+                (AST_VAR))
+            (AST_PROP
+                (AST_VAR))
+            (AST_PROP
+                (AST_VAR))
+            (AST_PROP
+                (AST_VAR))
+            (AST_PROP
+                (AST_VAR))
+            (AST_PROP
+                (AST_VAR))))
+    (AST_METHOD_CALL
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR))
+    (AST_RETURN
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR)))))

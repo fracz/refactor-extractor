@@ -1,0 +1,2107 @@
+	private function lookForAssigns(Scope $scope, \PhpParser\Node $node): Scope
+	{
+		if ($node instanceof StaticVar) {
+			$scope = $scope->assignVariable($node->name, $node->default !== null ? $scope->getType($node->default) : null);
+		} elseif ($node instanceof Static_) {
+			foreach ($node->vars as $var) {
+				$scope = $this->lookForAssigns($scope, $var);
+			}
+		} elseif ($node instanceof If_) {
+			$scope = $this->lookForAssigns($scope, $node->cond);
+			$statements = [
+				new StatementList($scope, array_merge([$node->cond], $node->stmts)),
+				new StatementList($scope, $node->else !== null ? $node->else->stmts : ($this->defineVariablesWithoutDefaultBranch ? null : [])),
+			];
+			foreach ($node->elseifs as $elseIf) {
+				$statements[] = new StatementList($scope, array_merge([$elseIf->cond], $elseIf->stmts));
+			}
+
+			$scope = $this->lookForAssignsInBranches($scope, $statements);
+		} elseif ($node instanceof TryCatch) {
+			$statements = [
+				new StatementList($scope, $node->stmts),
+			];
+			foreach ($node->catches as $catch) {
+				if (isset($catch->types)) {
+					$catchTypes = $catch->types;
+				} elseif (isset($catch->type)) {
+					$catchTypes = [$catch->type];
+				} else {
+					throw new \PHPStan\ShouldNotHappenException();
+				}
+				$statements[] = new StatementList($scope->enterCatch(
+					$catchTypes,
+					$catch->var
+				), $catch->stmts);
+			}
+
+			$scope = $this->lookForAssignsInBranches($scope, $statements);
+		} elseif ($node instanceof MethodCall || $node instanceof FuncCall || $node instanceof Expr\StaticCall) {
+			if ($node instanceof MethodCall) {
+				$scope = $this->lookForAssigns($scope, $node->var);
+			}
+			foreach ($node->args as $argument) {
+				$scope = $this->lookForAssigns($scope, $argument);
+			}
+
+			$parametersAcceptor = $this->findParametersAcceptorInFunctionCall($node, $scope);
+
+			if ($parametersAcceptor !== null) {
+				$parameters = $parametersAcceptor->getParameters();
+				foreach ($node->args as $i => $arg) {
+					$assignByReference = false;
+					if (isset($parameters[$i])) {
+						$assignByReference = $parameters[$i]->isPassedByReference();
+					} elseif (count($parameters) > 0 && $parametersAcceptor->isVariadic()) {
+						$lastParameter = $parameters[count($parameters) - 1];
+						$assignByReference = $lastParameter->isPassedByReference();
+					}
+
+					if (!$assignByReference) {
+						continue;
+					}
+
+					$arg = $node->args[$i]->value;
+					if ($arg instanceof Variable && is_string($arg->name)) {
+						$scope = $scope->assignVariable($arg->name, new MixedType());
+					}
+				}
+			}
+			if (
+				$node instanceof FuncCall
+				&& $node->name instanceof Name
+				&& in_array((string) $node->name, [
+					'fopen',
+					'file_get_contents',
+				], true)
+			) {
+				$scope = $scope->assignVariable('http_response_header', new ArrayType(new StringType(false), false));
+			}
+		} elseif ($node instanceof BinaryOp) {
+			$scope = $this->lookForAssigns($scope, $node->left);
+			$scope = $this->lookForAssigns($scope, $node->right);
+		} elseif ($node instanceof Arg) {
+			$scope = $this->lookForAssigns($scope, $node->value);
+		} elseif ($node instanceof BooleanNot) {
+			$scope = $this->lookForAssigns($scope, $node->expr);
+		} elseif ($node instanceof Ternary) {
+			$scope = $this->lookForAssigns($scope, $node->cond);
+		} elseif ($node instanceof Array_) {
+			foreach ($node->items as $item) {
+				if ($item->key !== null) {
+					$scope = $this->lookForAssigns($scope, $item->key);
+				}
+				$scope = $this->lookForAssigns($scope, $item->value);
+			}
+		} elseif ($node instanceof New_) {
+			foreach ($node->args as $arg) {
+				$scope = $this->lookForAssigns($scope, $arg);
+			}
+		} elseif ($node instanceof Do_) {
+			foreach ($node->stmts as $statement) {
+				$scope = $this->lookForAssigns($scope, $statement);
+			}
+		} elseif ($node instanceof Switch_) {
+			$statements = [];
+			$hasDefault = false;
+			foreach ($node->cases as $case) {
+				if ($case->cond === null) {
+					$hasDefault = true;
+				}
+				$statements[] = new StatementList($scope, $case->stmts);
+			}
+
+			if (!$hasDefault) {
+				$statements[] = new StatementList($scope, []);
+			}
+
+			$scope = $this->lookForAssignsInBranches($scope, $statements, true);
+		} elseif ($node instanceof Cast) {
+			$scope = $this->lookForAssigns($scope, $node->expr);
+		} elseif ($node instanceof For_) {
+			if ($this->polluteScopeWithLoopInitialAssignments) {
+				foreach ($node->init as $initExpr) {
+					$scope = $this->lookForAssigns($scope, $initExpr);
+				}
+
+				foreach ($node->cond as $condExpr) {
+					$scope = $this->lookForAssigns($scope, $condExpr);
+				}
+			}
+
+			$statements = [
+				new StatementList($scope, $node->stmts),
+				new StatementList($scope, []), // in order not to add variables existing only inside the for loop
+			];
+			$scope = $this->lookForAssignsInBranches($scope, $statements);
+		} elseif ($node instanceof While_) {
+			if ($this->polluteScopeWithLoopInitialAssignments) {
+				$scope = $this->lookForAssigns($scope, $node->cond);
+			}
+
+			$statements = [
+				new StatementList($scope, $node->stmts),
+				new StatementList($scope, []), // in order not to add variables existing only inside the for loop
+			];
+			$scope = $this->lookForAssignsInBranches($scope, $statements);
+		} elseif ($node instanceof ErrorSuppress) {
+			$scope = $this->lookForAssigns($scope, $node->expr);
+		} elseif ($node instanceof \PhpParser\Node\Stmt\Unset_) {
+			foreach ($node->vars as $var) {
+				if ($var instanceof Variable && is_string($var->name)) {
+					$scope = $scope->unsetVariable($var->name);
+				}
+			}
+		} elseif ($node instanceof Echo_) {
+			foreach ($node->exprs as $echoedExpr) {
+				$scope = $this->lookForAssigns($scope, $echoedExpr);
+			}
+		} elseif ($node instanceof Print_) {
+			$scope = $this->lookForAssigns($scope, $node->expr);
+		} elseif ($node instanceof Foreach_) {
+			$scope = $this->lookForAssigns($scope, $node->expr);
+			$statements = [
+				new StatementList($scope, $node->stmts),
+				new StatementList($scope, []), // in order not to add variables existing only inside the for loop
+			];
+			$scope = $this->lookForAssignsInBranches($scope, $statements);
+		} elseif ($node instanceof Isset_) {
+			foreach ($node->vars as $var) {
+				$scope = $this->lookForAssigns($scope, $var);
+			}
+		} elseif ($node instanceof Expr\Empty_) {
+			$scope = $this->lookForAssigns($scope, $node->expr);
+		} elseif ($node instanceof ArrayDimFetch && $node->dim !== null) {
+			$scope = $this->lookForAssigns($scope, $node->dim);
+		} elseif ($node instanceof Expr\Closure) {
+			foreach ($node->uses as $closureUse) {
+				if (!$closureUse->byRef || $scope->hasVariableType($closureUse->var)) {
+					continue;
+				}
+
+				$scope = $scope->assignVariable($closureUse->var, new MixedType());
+			}
+		} elseif ($node instanceof Instanceof_) {
+			$scope = $this->lookForAssigns($scope, $node->expr);
+		}
+
+		$scope = $this->updateScopeForVariableAssign($scope, $node);
+
+		return $scope;
+	}
+
+||||||||	private function lookForAssigns(Scope $scope, \PhpParser\Node $node): Scope
+	{
+		if ($node instanceof StaticVar) {
+			$scope = $scope->assignVariable($node->name, $node->default !== null ? $scope->getType($node->default) : null);
+		} elseif ($node instanceof Static_) {
+			foreach ($node->vars as $var) {
+				$scope = $this->lookForAssigns($scope, $var);
+			}
+		} elseif ($node instanceof If_) {
+			$scope = $this->lookForAssigns($scope, $node->cond);
+			$ifStatement = new StatementList(
+				$scope->lookForTypeSpecifications($node->cond),
+				array_merge([$node->cond], $node->stmts)
+			);
+
+			$elseIfScope = $scope->lookForTypeSpecificationsInEarlyTermination($node->cond);
+			$elseIfStatements = [];
+			foreach ($node->elseifs as $elseIf) {
+				$elseIfStatements[] = new StatementList($elseIfScope, array_merge([$elseIf->cond], $elseIf->stmts));
+				$elseIfScope = $elseIfScope->lookForTypeSpecificationsInEarlyTermination($elseIf->cond);
+			}
+
+			$statements = [
+				$ifStatement,
+				new StatementList($elseIfScope, $node->else !== null ? $node->else->stmts : ($this->defineVariablesWithoutDefaultBranch ? null : [])),
+			];
+			$statements = array_merge($statements, $elseIfStatements);
+
+			$scope = $this->lookForAssignsInBranches($scope, $statements);
+		} elseif ($node instanceof TryCatch) {
+			$statements = [
+				new StatementList($scope, $node->stmts),
+			];
+			foreach ($node->catches as $catch) {
+				if (isset($catch->types)) {
+					$catchTypes = $catch->types;
+				} elseif (isset($catch->type)) {
+					$catchTypes = [$catch->type];
+				} else {
+					throw new \PHPStan\ShouldNotHappenException();
+				}
+				$statements[] = new StatementList($scope->enterCatch(
+					$catchTypes,
+					$catch->var
+				), $catch->stmts);
+			}
+
+			$scope = $this->lookForAssignsInBranches($scope, $statements);
+		} elseif ($node instanceof MethodCall || $node instanceof FuncCall || $node instanceof Expr\StaticCall) {
+			if ($node instanceof MethodCall) {
+				$scope = $this->lookForAssigns($scope, $node->var);
+			}
+			foreach ($node->args as $argument) {
+				$scope = $this->lookForAssigns($scope, $argument);
+			}
+
+			$parametersAcceptor = $this->findParametersAcceptorInFunctionCall($node, $scope);
+
+			if ($parametersAcceptor !== null) {
+				$parameters = $parametersAcceptor->getParameters();
+				foreach ($node->args as $i => $arg) {
+					$assignByReference = false;
+					if (isset($parameters[$i])) {
+						$assignByReference = $parameters[$i]->isPassedByReference();
+					} elseif (count($parameters) > 0 && $parametersAcceptor->isVariadic()) {
+						$lastParameter = $parameters[count($parameters) - 1];
+						$assignByReference = $lastParameter->isPassedByReference();
+					}
+
+					if (!$assignByReference) {
+						continue;
+					}
+
+					$arg = $node->args[$i]->value;
+					if ($arg instanceof Variable && is_string($arg->name)) {
+						$scope = $scope->assignVariable($arg->name, new MixedType());
+					}
+				}
+			}
+			if (
+				$node instanceof FuncCall
+				&& $node->name instanceof Name
+				&& in_array((string) $node->name, [
+					'fopen',
+					'file_get_contents',
+				], true)
+			) {
+				$scope = $scope->assignVariable('http_response_header', new ArrayType(new StringType(), false));
+			}
+		} elseif ($node instanceof BinaryOp) {
+			$scope = $this->lookForAssigns($scope, $node->left);
+			$scope = $this->lookForAssigns($scope, $node->right);
+		} elseif ($node instanceof Arg) {
+			$scope = $this->lookForAssigns($scope, $node->value);
+		} elseif ($node instanceof BooleanNot) {
+			$scope = $this->lookForAssigns($scope, $node->expr);
+		} elseif ($node instanceof Ternary) {
+			$scope = $this->lookForAssigns($scope, $node->cond);
+		} elseif ($node instanceof Array_) {
+			foreach ($node->items as $item) {
+				if ($item->key !== null) {
+					$scope = $this->lookForAssigns($scope, $item->key);
+				}
+				$scope = $this->lookForAssigns($scope, $item->value);
+			}
+		} elseif ($node instanceof New_) {
+			foreach ($node->args as $arg) {
+				$scope = $this->lookForAssigns($scope, $arg);
+			}
+		} elseif ($node instanceof Do_) {
+			foreach ($node->stmts as $statement) {
+				$scope = $this->lookForAssigns($scope, $statement);
+			}
+		} elseif ($node instanceof Switch_) {
+			$statements = [];
+			$hasDefault = false;
+			foreach ($node->cases as $case) {
+				if ($case->cond === null) {
+					$hasDefault = true;
+				}
+				$statements[] = new StatementList($scope, $case->stmts);
+			}
+
+			if (!$hasDefault) {
+				$statements[] = new StatementList($scope, []);
+			}
+
+			$scope = $this->lookForAssignsInBranches($scope, $statements, true);
+		} elseif ($node instanceof Cast) {
+			$scope = $this->lookForAssigns($scope, $node->expr);
+		} elseif ($node instanceof For_) {
+			if ($this->polluteScopeWithLoopInitialAssignments) {
+				foreach ($node->init as $initExpr) {
+					$scope = $this->lookForAssigns($scope, $initExpr);
+				}
+
+				foreach ($node->cond as $condExpr) {
+					$scope = $this->lookForAssigns($scope, $condExpr);
+				}
+			}
+
+			$statements = [
+				new StatementList($scope, $node->stmts),
+				new StatementList($scope, []), // in order not to add variables existing only inside the for loop
+			];
+			$scope = $this->lookForAssignsInBranches($scope, $statements);
+		} elseif ($node instanceof While_) {
+			if ($this->polluteScopeWithLoopInitialAssignments) {
+				$scope = $this->lookForAssigns($scope, $node->cond);
+			}
+
+			$statements = [
+				new StatementList($scope, $node->stmts),
+				new StatementList($scope, []), // in order not to add variables existing only inside the for loop
+			];
+			$scope = $this->lookForAssignsInBranches($scope, $statements);
+		} elseif ($node instanceof ErrorSuppress) {
+			$scope = $this->lookForAssigns($scope, $node->expr);
+		} elseif ($node instanceof \PhpParser\Node\Stmt\Unset_) {
+			foreach ($node->vars as $var) {
+				if ($var instanceof Variable && is_string($var->name)) {
+					$scope = $scope->unsetVariable($var->name);
+				}
+			}
+		} elseif ($node instanceof Echo_) {
+			foreach ($node->exprs as $echoedExpr) {
+				$scope = $this->lookForAssigns($scope, $echoedExpr);
+			}
+		} elseif ($node instanceof Print_) {
+			$scope = $this->lookForAssigns($scope, $node->expr);
+		} elseif ($node instanceof Foreach_) {
+			$scope = $this->lookForAssigns($scope, $node->expr);
+			$statements = [
+				new StatementList($scope, $node->stmts),
+				new StatementList($scope, []), // in order not to add variables existing only inside the for loop
+			];
+			$scope = $this->lookForAssignsInBranches($scope, $statements);
+		} elseif ($node instanceof Isset_) {
+			foreach ($node->vars as $var) {
+				$scope = $this->lookForAssigns($scope, $var);
+			}
+		} elseif ($node instanceof Expr\Empty_) {
+			$scope = $this->lookForAssigns($scope, $node->expr);
+		} elseif ($node instanceof ArrayDimFetch && $node->dim !== null) {
+			$scope = $this->lookForAssigns($scope, $node->dim);
+		} elseif ($node instanceof Expr\Closure) {
+			foreach ($node->uses as $closureUse) {
+				if (!$closureUse->byRef || $scope->hasVariableType($closureUse->var)) {
+					continue;
+				}
+
+				$scope = $scope->assignVariable($closureUse->var, new MixedType());
+			}
+		} elseif ($node instanceof Instanceof_) {
+			$scope = $this->lookForAssigns($scope, $node->expr);
+		}
+
+		$scope = $this->updateScopeForVariableAssign($scope, $node);
+
+		return $scope;
+	}
+
+||||||||NO_DOC_COMMENTHAS_RETURN_TYPE
+(PARAM_TYPENO_PARAM_DEFAULTPARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_PROP
+                                (AST_VAR))
+                            (AST_CONDITIONAL
+                                (AST_BINARY_OP
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (AST_CONST))
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_PROP
+                                            (AST_VAR))))
+                                (AST_CONST)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_CALL
+                                        (
+                                            (AST_ARRAY
+                                                (AST_ARRAY_ELEM
+                                                    (AST_PROP
+                                                        (AST_VAR))
+                                                    (NULL)))
+                                            (AST_PROP
+                                                (AST_VAR))))))
+                            (NULL))
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_CONDITIONAL
+                                        (AST_BINARY_OP
+                                            (AST_PROP
+                                                (AST_VAR))
+                                            (AST_CONST))
+                                        (AST_PROP
+                                            (AST_PROP
+                                                (AST_VAR)))
+                                        (AST_CONDITIONAL
+                                            (AST_PROP
+                                                (AST_VAR))
+                                            (AST_CONST)
+                                            (AST_ARRAY)))))
+                            (NULL))))
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (NULL))
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_CALL
+                                        (
+                                            (AST_ARRAY
+                                                (AST_ARRAY_ELEM
+                                                    (AST_PROP
+                                                        (AST_VAR))
+                                                    (NULL)))
+                                            (AST_PROP
+                                                (AST_VAR)))))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (NULL))))
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_ISSET
+                                    (AST_PROP
+                                        (AST_VAR)))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_PROP
+                                            (AST_VAR)))))
+                            (AST_IF_ELEM
+                                (AST_ISSET
+                                    (AST_PROP
+                                        (AST_VAR)))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (AST_PROP
+                                                    (AST_VAR))
+                                                (NULL))))))
+                            (AST_IF_ELEM
+                                (NULL)
+                                (
+                                    (AST_THROW
+                                        (AST_NEW)))))
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (NULL))
+                            (AST_NEW
+                                (
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR)
+                                            (AST_PROP
+                                                (AST_VAR))))
+                                    (AST_PROP
+                                        (AST_VAR)))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR))))))
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_INSTANCEOF
+                        (AST_VAR))
+                    (AST_INSTANCEOF
+                        (AST_VAR)))
+                (AST_INSTANCEOF
+                    (AST_VAR)))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_INSTANCEOF
+                            (AST_VAR))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR)
+                                        (AST_PROP
+                                            (AST_VAR))))))))
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (AST_CONST))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)))
+                            (AST_FOREACH
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_VAR)
+                                (AST_VAR)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_CONST))
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_ISSET
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (AST_VAR)))
+                                            (
+                                                (AST_ASSIGN
+                                                    (AST_VAR)
+                                                    (AST_METHOD_CALL
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (AST_VAR))))))
+                                        (AST_IF_ELEM
+                                            (AST_BINARY_OP
+                                                (AST_BINARY_OP
+                                                    (AST_CALL
+                                                        (
+                                                            (AST_VAR)))
+                                                    (SCALAR))
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR)))
+                                            (
+                                                (AST_ASSIGN
+                                                    (AST_VAR)
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (AST_BINARY_OP
+                                                            (AST_CALL
+                                                                (
+                                                                    (AST_VAR)))
+                                                            (SCALAR))))
+                                                (AST_ASSIGN
+                                                    (AST_VAR)
+                                                    (AST_METHOD_CALL
+                                                        (AST_VAR))))))
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_UNARY_OP
+                                                (AST_VAR))
+                                            (
+                                                (AST_CONTINUE
+                                                    (NULL)))))
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_PROP
+                                            (AST_DIM
+                                                (AST_PROP
+                                                    (AST_VAR))
+                                                (AST_VAR))))
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_BINARY_OP
+                                                (AST_INSTANCEOF
+                                                    (AST_VAR))
+                                                (AST_CALL
+                                                    (
+                                                        (AST_PROP
+                                                            (AST_VAR)))))
+                                            (
+                                                (AST_ASSIGN
+                                                    (AST_VAR)
+                                                    (AST_METHOD_CALL
+                                                        (AST_VAR)
+                                                        (
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (AST_NEW))))))))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_INSTANCEOF
+                                    (AST_VAR))
+                                (AST_INSTANCEOF
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (AST_CALL
+                                (
+                                    (AST_CAST
+                                        (AST_PROP
+                                            (AST_VAR)))
+                                    (AST_ARRAY
+                                        (AST_ARRAY_ELEM
+                                            (SCALAR)
+                                            (NULL))
+                                        (AST_ARRAY_ELEM
+                                            (SCALAR)
+                                            (NULL)))
+                                    (AST_CONST))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (SCALAR)
+                                        (AST_NEW
+                                            (
+                                                (AST_NEW
+                                                    (
+                                                        (AST_CONST)))
+                                                (AST_CONST)))))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_BINARY_OP
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (AST_CONST))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR)
+                                                (AST_PROP
+                                                    (AST_VAR))))))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_PROP
+                                        (AST_VAR)))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ARRAY))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_BINARY_OP
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (AST_CONST))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_CONST)))))
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (NULL))
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_PROP
+                                        (AST_VAR)))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_VAR))
+                        (
+                            (AST_ASSIGN
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (NULL))
+                                (AST_NEW
+                                    (
+                                        (AST_VAR)
+                                        (AST_ARRAY)))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR)
+                            (AST_CONST))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_PROP
+                            (AST_VAR))
+                        (
+                            (AST_FOREACH
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_VAR)
+                                (NULL)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR)
+                                                (AST_VAR))))))
+                            (AST_FOREACH
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_VAR)
+                                (NULL)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR)
+                                                (AST_VAR)))))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (NULL))
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_ARRAY)))
+                            (NULL))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_PROP
+                            (AST_VAR))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR)
+                                        (AST_PROP
+                                            (AST_VAR))))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (NULL))
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_ARRAY)))
+                            (NULL))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_BINARY_OP
+                                    (AST_INSTANCEOF
+                                        (AST_VAR))
+                                    (AST_CALL
+                                        (
+                                            (AST_PROP
+                                                (AST_VAR)))))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_PROP
+                                                    (AST_VAR))))))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (NULL))
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_ARRAY)))
+                            (NULL))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_INSTANCEOF
+                    (AST_VAR))
+                (AST_BINARY_OP
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_CONST)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_BINARY_OP
+                                    (AST_UNARY_OP
+                                        (AST_PROP
+                                            (AST_VAR)))
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_PROP
+                                                (AST_VAR)))))
+                                (
+                                    (AST_CONTINUE
+                                        (NULL)))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (AST_NEW))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_RETURN
+        (AST_VAR)))||||||||NO_DOC_COMMENTHAS_RETURN_TYPE
+(PARAM_TYPENO_PARAM_DEFAULTPARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_PROP
+                                (AST_VAR))
+                            (AST_CONDITIONAL
+                                (AST_BINARY_OP
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (AST_CONST))
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_PROP
+                                            (AST_VAR))))
+                                (AST_CONST)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_NEW
+                        (
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (AST_CALL
+                                (
+                                    (AST_ARRAY
+                                        (AST_ARRAY_ELEM
+                                            (AST_PROP
+                                                (AST_VAR))
+                                            (NULL)))
+                                    (AST_PROP
+                                        (AST_VAR)))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_PROP
+                                (AST_VAR)))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ARRAY))
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (NULL))
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_CALL
+                                        (
+                                            (AST_ARRAY
+                                                (AST_ARRAY_ELEM
+                                                    (AST_PROP
+                                                        (AST_VAR))
+                                                    (NULL)))
+                                            (AST_PROP
+                                                (AST_VAR)))))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_PROP
+                                        (AST_VAR)))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (AST_VAR)
+                            (NULL))
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_CONDITIONAL
+                                        (AST_BINARY_OP
+                                            (AST_PROP
+                                                (AST_VAR))
+                                            (AST_CONST))
+                                        (AST_PROP
+                                            (AST_PROP
+                                                (AST_VAR)))
+                                        (AST_CONDITIONAL
+                                            (AST_PROP
+                                                (AST_VAR))
+                                            (AST_CONST)
+                                            (AST_ARRAY)))))
+                            (NULL))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (AST_VAR))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (NULL))))
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_ISSET
+                                    (AST_PROP
+                                        (AST_VAR)))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_PROP
+                                            (AST_VAR)))))
+                            (AST_IF_ELEM
+                                (AST_ISSET
+                                    (AST_PROP
+                                        (AST_VAR)))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (AST_PROP
+                                                    (AST_VAR))
+                                                (NULL))))))
+                            (AST_IF_ELEM
+                                (NULL)
+                                (
+                                    (AST_THROW
+                                        (AST_NEW)))))
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (NULL))
+                            (AST_NEW
+                                (
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR)
+                                            (AST_PROP
+                                                (AST_VAR))))
+                                    (AST_PROP
+                                        (AST_VAR)))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR))))))
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_INSTANCEOF
+                        (AST_VAR))
+                    (AST_INSTANCEOF
+                        (AST_VAR)))
+                (AST_INSTANCEOF
+                    (AST_VAR)))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_INSTANCEOF
+                            (AST_VAR))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR)
+                                        (AST_PROP
+                                            (AST_VAR))))))))
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (AST_CONST))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)))
+                            (AST_FOREACH
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_VAR)
+                                (AST_VAR)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_CONST))
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_ISSET
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (AST_VAR)))
+                                            (
+                                                (AST_ASSIGN
+                                                    (AST_VAR)
+                                                    (AST_METHOD_CALL
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (AST_VAR))))))
+                                        (AST_IF_ELEM
+                                            (AST_BINARY_OP
+                                                (AST_BINARY_OP
+                                                    (AST_CALL
+                                                        (
+                                                            (AST_VAR)))
+                                                    (SCALAR))
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR)))
+                                            (
+                                                (AST_ASSIGN
+                                                    (AST_VAR)
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (AST_BINARY_OP
+                                                            (AST_CALL
+                                                                (
+                                                                    (AST_VAR)))
+                                                            (SCALAR))))
+                                                (AST_ASSIGN
+                                                    (AST_VAR)
+                                                    (AST_METHOD_CALL
+                                                        (AST_VAR))))))
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_UNARY_OP
+                                                (AST_VAR))
+                                            (
+                                                (AST_CONTINUE
+                                                    (NULL)))))
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_PROP
+                                            (AST_DIM
+                                                (AST_PROP
+                                                    (AST_VAR))
+                                                (AST_VAR))))
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_BINARY_OP
+                                                (AST_INSTANCEOF
+                                                    (AST_VAR))
+                                                (AST_CALL
+                                                    (
+                                                        (AST_PROP
+                                                            (AST_VAR)))))
+                                            (
+                                                (AST_ASSIGN
+                                                    (AST_VAR)
+                                                    (AST_METHOD_CALL
+                                                        (AST_VAR)
+                                                        (
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (AST_NEW))))))))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_INSTANCEOF
+                                    (AST_VAR))
+                                (AST_INSTANCEOF
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (AST_CALL
+                                (
+                                    (AST_CAST
+                                        (AST_PROP
+                                            (AST_VAR)))
+                                    (AST_ARRAY
+                                        (AST_ARRAY_ELEM
+                                            (SCALAR)
+                                            (NULL))
+                                        (AST_ARRAY_ELEM
+                                            (SCALAR)
+                                            (NULL)))
+                                    (AST_CONST))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (SCALAR)
+                                        (AST_NEW
+                                            (
+                                                (AST_NEW)
+                                                (AST_CONST)))))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_BINARY_OP
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (AST_CONST))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR)
+                                                (AST_PROP
+                                                    (AST_VAR))))))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_PROP
+                                        (AST_VAR)))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ARRAY))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST))
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_BINARY_OP
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (AST_CONST))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_CONST)))))
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (NULL))
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_PROP
+                                        (AST_VAR)))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_VAR))
+                        (
+                            (AST_ASSIGN
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (NULL))
+                                (AST_NEW
+                                    (
+                                        (AST_VAR)
+                                        (AST_ARRAY)))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR)
+                            (AST_CONST))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_PROP
+                            (AST_VAR))
+                        (
+                            (AST_FOREACH
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_VAR)
+                                (NULL)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR)
+                                                (AST_VAR))))))
+                            (AST_FOREACH
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_VAR)
+                                (NULL)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR)
+                                                (AST_VAR)))))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (NULL))
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_ARRAY)))
+                            (NULL))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_PROP
+                            (AST_VAR))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR)
+                                        (AST_PROP
+                                            (AST_VAR))))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (NULL))
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_ARRAY)))
+                            (NULL))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_BINARY_OP
+                                    (AST_INSTANCEOF
+                                        (AST_VAR))
+                                    (AST_CALL
+                                        (
+                                            (AST_PROP
+                                                (AST_VAR)))))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_PROP
+                                                    (AST_VAR))))))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (NULL))
+                        (AST_ARRAY_ELEM
+                            (AST_NEW
+                                (
+                                    (AST_VAR)
+                                    (AST_ARRAY)))
+                            (NULL))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)
+                                    (AST_VAR))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_INSTANCEOF
+                    (AST_VAR))
+                (AST_BINARY_OP
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_CONST)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_BINARY_OP
+                                    (AST_UNARY_OP
+                                        (AST_PROP
+                                            (AST_VAR)))
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_PROP
+                                                (AST_VAR)))))
+                                (
+                                    (AST_CONTINUE
+                                        (NULL)))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (AST_NEW))))))))
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_RETURN
+        (AST_VAR)))

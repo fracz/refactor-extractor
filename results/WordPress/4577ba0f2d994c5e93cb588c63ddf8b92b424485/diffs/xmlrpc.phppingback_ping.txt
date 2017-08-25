@@ -1,0 +1,1449 @@
+	function pingback_ping($args) {
+		global $wpdb, $wp_version;
+
+		$this->escape($args);
+
+		$pagelinkedfrom = $args[0];
+		$pagelinkedto   = $args[1];
+
+		$title = '';
+
+		$pagelinkedfrom = str_replace('&amp;', '&', $pagelinkedfrom);
+		$pagelinkedto   = preg_replace('#&([^amp\;])#is', '&amp;$1', $pagelinkedto);
+
+		$error_code = -1;
+
+		// Check if the page linked to is in our site
+		$pos1 = strpos($pagelinkedto, str_replace(array('http://www.','http://','https://www.','https://'), '', get_option('home')));
+		if( !$pos1 )
+				return new IXR_Error(0, 'Is there no link to us?');
+
+		// let's find which post is linked to
+		// FIXME: does url_to_postid() cover all these cases already?
+		//        if so, then let's use it and drop the old code.
+		$urltest = parse_url($pagelinkedto);
+		if ($post_ID = url_to_postid($pagelinkedto)) {
+			$way = 'url_to_postid()';
+		} elseif (preg_match('#p/[0-9]{1,}#', $urltest['path'], $match)) {
+			// the path defines the post_ID (archives/p/XXXX)
+			$blah = explode('/', $match[0]);
+			$post_ID = $blah[1];
+			$way = 'from the path';
+		} elseif (preg_match('#p=[0-9]{1,}#', $urltest['query'], $match)) {
+			// the querystring defines the post_ID (?p=XXXX)
+			$blah = explode('=', $match[0]);
+			$post_ID = $blah[1];
+			$way = 'from the querystring';
+		} elseif (isset($urltest['fragment'])) {
+			// an #anchor is there, it's either...
+			if (intval($urltest['fragment'])) {
+				// ...an integer #XXXX (simpliest case)
+				$post_ID = $urltest['fragment'];
+				$way = 'from the fragment (numeric)';
+			} elseif (preg_match('/post-[0-9]+/',$urltest['fragment'])) {
+				// ...a post id in the form 'post-###'
+				$post_ID = preg_replace('/[^0-9]+/', '', $urltest['fragment']);
+				$way = 'from the fragment (post-###)';
+			} elseif (is_string($urltest['fragment'])) {
+				// ...or a string #title, a little more complicated
+				$title = preg_replace('/[^a-z0-9]/i', '.', $urltest['fragment']);
+				$sql = "SELECT ID FROM $wpdb->posts WHERE post_title RLIKE '$title'";
+				if (! ($post_ID = $wpdb->get_var($sql)) ) {
+					// returning unknown error '0' is better than die()ing
+			  		return new IXR_Error(0, '');
+				}
+				$way = 'from the fragment (title)';
+			}
+		} else {
+			// TODO: Attempt to extract a post ID from the given URL
+	  		return new IXR_Error(33, 'The specified target URL cannot be used as a target. It either doesn\'t exist, or it is not a pingback-enabled resource.');
+		}
+		$post_ID = (int) $post_ID;
+
+
+		logIO("O","(PB) URL='$pagelinkedto' ID='$post_ID' Found='$way'");
+
+		$post = get_post($post_ID);
+
+		if ( !$post ) // Post_ID not found
+	  		return new IXR_Error(33, 'The specified target URL cannot be used as a target. It either doesn\'t exist, or it is not a pingback-enabled resource.');
+
+		if ( $post_ID == url_to_postid($pagelinkedfrom) )
+			return new IXR_Error(0, 'The source URL and the target URL cannot both point to the same resource.');
+
+		// Check if pings are on
+		if ( 'closed' == $post->ping_status )
+	  		return new IXR_Error(33, 'The specified target URL cannot be used as a target. It either doesn\'t exist, or it is not a pingback-enabled resource.');
+
+		// Let's check that the remote site didn't already pingback this entry
+		$result = $wpdb->get_results("SELECT * FROM $wpdb->comments WHERE comment_post_ID = '$post_ID' AND comment_author_url = '$pagelinkedfrom'");
+
+		if ( $wpdb->num_rows ) // We already have a Pingback from this URL
+	  		return new IXR_Error(48, 'The pingback has already been registered.');
+
+		// very stupid, but gives time to the 'from' server to publish !
+		sleep(1);
+
+		// Let's check the remote site
+		$linea = wp_remote_fopen( $pagelinkedfrom );
+		if ( !$linea )
+	  		return new IXR_Error(16, 'The source URL does not exist.');
+
+		// Work around bug in strip_tags():
+		$linea = str_replace('<!DOC', '<DOC', $linea);
+		$linea = preg_replace( '/[\s\r\n\t]+/', ' ', $linea ); // normalize spaces
+		$linea = preg_replace( "/ <(h1|h2|h3|h4|h5|h6|p|th|td|li|dt|dd|pre|caption|input|textarea|button|body)[^>]*>/", "\n\n", $linea );
+
+		preg_match('|<title>([^<]*?)</title>|is', $linea, $matchtitle);
+		$title = $matchtitle[1];
+		if ( empty( $title ) )
+			return new IXR_Error(32, 'We cannot find a title on that page.');
+
+		$linea = strip_tags( $linea, '<a>' ); // just keep the tag we need
+
+		$p = explode( "\n\n", $linea );
+
+		$sem_regexp_pb = "/(\\/|\\\|\*|\?|\+|\.|\^|\\$|\(|\)|\[|\]|\||\{|\})/";
+		$sem_regexp_fix = "\\\\$1";
+		$link = preg_replace( $sem_regexp_pb, $sem_regexp_fix, $pagelinkedfrom );
+
+		$finished = false;
+		foreach ( $p as $para ) {
+			if ( $finished )
+				continue;
+			if ( strstr( $para, $pagelinkedto ) ) {
+				$context = preg_replace( "/.*<a[^>]+".$link."[^>]*>([^>]+)<\/a>.*/", "$1", $para );
+				$excerpt = strip_tags( $para );
+				$excerpt = trim( $excerpt );
+				$use     = preg_quote( $context );
+				$excerpt = preg_replace("|.*?\s(.{0,100}$use.{0,100})\s|s", "$1", $excerpt);
+				$finished = true;
+			}
+		}
+
+		if ( empty($context) ) // URL pattern not found
+			return new IXR_Error(17, 'The source URL does not contain a link to the target URL, and so cannot be used as a source.');
+
+		$pagelinkedfrom = preg_replace('#&([^amp\;])#is', '&amp;$1', $pagelinkedfrom);
+
+		$context = '[...] ' . wp_specialchars( $excerpt ) . ' [...]';
+		$original_pagelinkedfrom = $pagelinkedfrom;
+		$pagelinkedfrom = $wpdb->escape( $pagelinkedfrom );
+		$original_title = $title;
+
+		$comment_post_ID = (int) $post_ID;
+		$comment_author = $title;
+		$this->escape($comment_author);
+		$comment_author_url = $pagelinkedfrom;
+		$comment_content = $context;
+		$this->escape($comment_content);
+		$comment_type = 'pingback';
+
+		$commentdata = compact('comment_post_ID', 'comment_author', 'comment_author_url', 'comment_content', 'comment_type');
+
+		$comment_ID = wp_new_comment($commentdata);
+		do_action('pingback_post', $comment_ID);
+
+		return "Pingback from $pagelinkedfrom to $pagelinkedto registered. Keep the web talking! :-)";
+	}
+
+
+	/* pingback.extensions.getPingbacks returns an array of URLs
+	that pingbacked the given URL
+	specs on http://www.aquarionics.com/misc/archives/blogite/0198.html */
+||||||||	function pingback_ping($args) {
+		global $wpdb, $wp_version;
+
+		$this->escape($args);
+
+		$pagelinkedfrom = $args[0];
+		$pagelinkedto   = $args[1];
+
+		$title = '';
+
+		$pagelinkedfrom = str_replace('&amp;', '&', $pagelinkedfrom);
+		$pagelinkedto   = preg_replace('#&([^amp\;])#is', '&amp;$1', $pagelinkedto);
+
+		$error_code = -1;
+
+		// Check if the page linked to is in our site
+		$pos1 = strpos($pagelinkedto, str_replace(array('http://www.','http://','https://www.','https://'), '', get_option('home')));
+		if( !$pos1 )
+				return new IXR_Error(0, 'Is there no link to us?');
+
+		// let's find which post is linked to
+		// FIXME: does url_to_postid() cover all these cases already?
+		//        if so, then let's use it and drop the old code.
+		$urltest = parse_url($pagelinkedto);
+		if ($post_ID = url_to_postid($pagelinkedto)) {
+			$way = 'url_to_postid()';
+		} elseif (preg_match('#p/[0-9]{1,}#', $urltest['path'], $match)) {
+			// the path defines the post_ID (archives/p/XXXX)
+			$blah = explode('/', $match[0]);
+			$post_ID = $blah[1];
+			$way = 'from the path';
+		} elseif (preg_match('#p=[0-9]{1,}#', $urltest['query'], $match)) {
+			// the querystring defines the post_ID (?p=XXXX)
+			$blah = explode('=', $match[0]);
+			$post_ID = $blah[1];
+			$way = 'from the querystring';
+		} elseif (isset($urltest['fragment'])) {
+			// an #anchor is there, it's either...
+			if (intval($urltest['fragment'])) {
+				// ...an integer #XXXX (simpliest case)
+				$post_ID = $urltest['fragment'];
+				$way = 'from the fragment (numeric)';
+			} elseif (preg_match('/post-[0-9]+/',$urltest['fragment'])) {
+				// ...a post id in the form 'post-###'
+				$post_ID = preg_replace('/[^0-9]+/', '', $urltest['fragment']);
+				$way = 'from the fragment (post-###)';
+			} elseif (is_string($urltest['fragment'])) {
+				// ...or a string #title, a little more complicated
+				$title = preg_replace('/[^a-z0-9]/i', '.', $urltest['fragment']);
+				$sql = "SELECT ID FROM $wpdb->posts WHERE post_title RLIKE '$title'";
+				if (! ($post_ID = $wpdb->get_var($sql)) ) {
+					// returning unknown error '0' is better than die()ing
+			  		return new IXR_Error(0, '');
+				}
+				$way = 'from the fragment (title)';
+			}
+		} else {
+			// TODO: Attempt to extract a post ID from the given URL
+	  		return new IXR_Error(33, 'The specified target URL cannot be used as a target. It either doesn\'t exist, or it is not a pingback-enabled resource.');
+		}
+		$post_ID = (int) $post_ID;
+
+
+		logIO("O","(PB) URL='$pagelinkedto' ID='$post_ID' Found='$way'");
+
+		$post = get_post($post_ID);
+
+		if ( !$post ) // Post_ID not found
+	  		return new IXR_Error(33, 'The specified target URL cannot be used as a target. It either doesn\'t exist, or it is not a pingback-enabled resource.');
+
+		if ( $post_ID == url_to_postid($pagelinkedfrom) )
+			return new IXR_Error(0, 'The source URL and the target URL cannot both point to the same resource.');
+
+		// Check if pings are on
+		if ( 'closed' == $post->ping_status )
+	  		return new IXR_Error(33, 'The specified target URL cannot be used as a target. It either doesn\'t exist, or it is not a pingback-enabled resource.');
+
+		// Let's check that the remote site didn't already pingback this entry
+		$result = $wpdb->get_results("SELECT * FROM $wpdb->comments WHERE comment_post_ID = '$post_ID' AND comment_author_url = '$pagelinkedfrom'");
+
+		if ( $wpdb->num_rows ) // We already have a Pingback from this URL
+	  		return new IXR_Error(48, 'The pingback has already been registered.');
+
+		// very stupid, but gives time to the 'from' server to publish !
+		sleep(1);
+
+		// Let's check the remote site
+		$linea = wp_remote_fopen( $pagelinkedfrom );
+		if ( !$linea )
+	  		return new IXR_Error(16, 'The source URL does not exist.');
+
+		// Work around bug in strip_tags():
+		$linea = str_replace('<!DOC', '<DOC', $linea);
+		$linea = preg_replace( '/[\s\r\n\t]+/', ' ', $linea ); // normalize spaces
+		$linea = preg_replace( "/ <(h1|h2|h3|h4|h5|h6|p|th|td|li|dt|dd|pre|caption|input|textarea|button|body)[^>]*>/", "\n\n", $linea );
+
+		preg_match('|<title>([^<]*?)</title>|is', $linea, $matchtitle);
+		$title = $matchtitle[1];
+		if ( empty( $title ) )
+			return new IXR_Error(32, 'We cannot find a title on that page.');
+
+		$linea = strip_tags( $linea, '<a>' ); // just keep the tag we need
+
+		$p = explode( "\n\n", $linea );
+
+		$preg_target = preg_quote($pagelinkedto);
+
+		foreach ( $p as $para ) {
+			if ( strpos($para, $pagelinkedto) !== false ) { // it exists, but is it a link?
+				preg_match("|<a[^>]+?".$preg_target."[^>]*>([^>]+?)</a>|", $para, $context);
+
+				// If the URL isn't in a link context, keep looking
+				if ( empty($context) )
+					continue;
+
+				// We're going to use this fake tag to mark the context in a bit
+				// the marker is needed in case the link text appears more than once in the paragraph
+				$excerpt = preg_replace('|\</?wpcontext\>|', '', $para);
+
+				// prevent really long link text
+				if ( strlen($context[1]) > 100 )
+					$context[1] = substr($context[1], 0, 100) . '...';
+
+				$marker = '<wpcontext>'.$context[1].'</wpcontext>';    // set up our marker
+				$excerpt= str_replace($context[0], $marker, $excerpt); // swap out the link for our marker
+				$excerpt = strip_tags($excerpt, '<wpcontext>');        // strip all tags but our context marker
+				$excerpt = trim($excerpt);
+				$preg_marker = preg_quote($marker);
+				$excerpt = preg_replace("|.*?\s(.{0,100}$preg_marker.{0,100})\s.*|s", '$1', $excerpt);
+				$excerpt = strip_tags($excerpt); // YES, again, to remove the marker wrapper
+				break;
+			}
+		}
+
+		if ( empty($context) ) // Link to target not found
+			return new IXR_Error(17, 'The source URL does not contain a link to the target URL, and so cannot be used as a source.');
+
+		$pagelinkedfrom = preg_replace('#&([^amp\;])#is', '&amp;$1', $pagelinkedfrom);
+
+		$context = '[...] ' . wp_specialchars( $excerpt ) . ' [...]';
+		$original_pagelinkedfrom = $pagelinkedfrom;
+		$pagelinkedfrom = $wpdb->escape( $pagelinkedfrom );
+		$original_title = $title;
+
+		$comment_post_ID = (int) $post_ID;
+		$comment_author = $title;
+		$this->escape($comment_author);
+		$comment_author_url = $pagelinkedfrom;
+		$comment_content = $context;
+		$this->escape($comment_content);
+		$comment_type = 'pingback';
+
+		$commentdata = compact('comment_post_ID', 'comment_author', 'comment_author_url', 'comment_content', 'comment_type');
+
+		$comment_ID = wp_new_comment($commentdata);
+		do_action('pingback_post', $comment_ID);
+
+		return "Pingback from $pagelinkedfrom to $pagelinkedto registered. Keep the web talking! :-)";
+	}
+
+
+	/* pingback.extensions.getPingbacks returns an array of URLs
+	that pingbacked the given URL
+	specs on http://www.aquarionics.com/misc/archives/blogite/0198.html */
+||||||||NO_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_GLOBAL
+        (AST_VAR))
+    (AST_GLOBAL
+        (AST_VAR))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_DIM
+            (AST_VAR)
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_DIM
+            (AST_VAR)
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (SCALAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (SCALAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (SCALAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_UNARY_OP
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL)))
+                        (SCALAR)
+                        (AST_CALL
+                            (
+                                (SCALAR))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_VAR))))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (SCALAR))))
+        (AST_IF_ELEM
+            (AST_CALL
+                (
+                    (SCALAR)
+                    (AST_DIM
+                        (AST_VAR)
+                        (SCALAR))
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (SCALAR)
+                            (AST_DIM
+                                (AST_VAR)
+                                (SCALAR)))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_DIM
+                        (AST_VAR)
+                        (SCALAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (SCALAR))))
+        (AST_IF_ELEM
+            (AST_CALL
+                (
+                    (SCALAR)
+                    (AST_DIM
+                        (AST_VAR)
+                        (SCALAR))
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (SCALAR)
+                            (AST_DIM
+                                (AST_VAR)
+                                (SCALAR)))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_DIM
+                        (AST_VAR)
+                        (SCALAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (SCALAR))))
+        (AST_IF_ELEM
+            (AST_ISSET
+                (AST_DIM
+                    (AST_VAR)
+                    (SCALAR)))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_CALL
+                            (
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (SCALAR))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (SCALAR)))
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (SCALAR))))
+                    (AST_IF_ELEM
+                        (AST_CALL
+                            (
+                                (SCALAR)
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (SCALAR))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_CALL
+                                    (
+                                        (SCALAR)
+                                        (SCALAR)
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (SCALAR)))))
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (SCALAR))))
+                    (AST_IF_ELEM
+                        (AST_CALL
+                            (
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (SCALAR))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_CALL
+                                    (
+                                        (SCALAR)
+                                        (SCALAR)
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (SCALAR)))))
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_ENCAPS_LIST
+                                    (SCALAR)
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (SCALAR)
+                                    (AST_VAR)
+                                    (SCALAR)))
+                            (AST_IF
+                                (AST_IF_ELEM
+                                    (AST_UNARY_OP
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_METHOD_CALL
+                                                (AST_VAR)
+                                                (
+                                                    (AST_VAR)))))
+                                    (
+                                        (AST_RETURN
+                                            (AST_NEW
+                                                (
+                                                    (SCALAR)
+                                                    (SCALAR)))))))
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (SCALAR)))))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CAST
+            (AST_VAR)))
+    (AST_CALL
+        (
+            (SCALAR)
+            (AST_ENCAPS_LIST
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_VAR))))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (SCALAR)
+                (AST_PROP
+                    (AST_VAR)))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_ENCAPS_LIST
+                    (SCALAR)
+                    (AST_PROP
+                        (AST_VAR))
+                    (SCALAR)
+                    (AST_VAR)
+                    (SCALAR)
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_PROP
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_CALL
+        (
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (SCALAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (SCALAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (SCALAR)
+                (AST_VAR))))
+    (AST_CALL
+        (
+            (SCALAR)
+            (AST_VAR)
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_DIM
+            (AST_VAR)
+            (SCALAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_EMPTY
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR)
+                (SCALAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (SCALAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (SCALAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONST))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_VAR)
+                    (
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (AST_VAR)))
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_BINARY_OP
+                                        (AST_BINARY_OP
+                                            (SCALAR)
+                                            (AST_VAR))
+                                        (SCALAR))
+                                    (SCALAR)
+                                    (AST_VAR))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_VAR))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_VAR))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_VAR))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_ENCAPS_LIST
+                                        (SCALAR)
+                                        (AST_VAR)
+                                        (SCALAR))
+                                    (SCALAR)
+                                    (AST_VAR))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CONST)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_EMPTY
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (SCALAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_BINARY_OP
+            (AST_BINARY_OP
+                (SCALAR)
+                (AST_CALL
+                    (
+                        (AST_VAR))))
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CAST
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (SCALAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (SCALAR)
+                (SCALAR)
+                (SCALAR)
+                (SCALAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR))))
+    (AST_CALL
+        (
+            (SCALAR)
+            (AST_VAR)))
+    (AST_RETURN
+        (AST_ENCAPS_LIST
+            (SCALAR)
+            (AST_VAR)
+            (SCALAR)
+            (AST_VAR)
+            (SCALAR))))||||||||NO_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_GLOBAL
+        (AST_VAR))
+    (AST_GLOBAL
+        (AST_VAR))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_DIM
+            (AST_VAR)
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_DIM
+            (AST_VAR)
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (SCALAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (SCALAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (SCALAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_UNARY_OP
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL)))
+                        (SCALAR)
+                        (AST_CALL
+                            (
+                                (SCALAR))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_VAR))))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (SCALAR))))
+        (AST_IF_ELEM
+            (AST_CALL
+                (
+                    (SCALAR)
+                    (AST_DIM
+                        (AST_VAR)
+                        (SCALAR))
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (SCALAR)
+                            (AST_DIM
+                                (AST_VAR)
+                                (SCALAR)))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_DIM
+                        (AST_VAR)
+                        (SCALAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (SCALAR))))
+        (AST_IF_ELEM
+            (AST_CALL
+                (
+                    (SCALAR)
+                    (AST_DIM
+                        (AST_VAR)
+                        (SCALAR))
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (SCALAR)
+                            (AST_DIM
+                                (AST_VAR)
+                                (SCALAR)))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_DIM
+                        (AST_VAR)
+                        (SCALAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (SCALAR))))
+        (AST_IF_ELEM
+            (AST_ISSET
+                (AST_DIM
+                    (AST_VAR)
+                    (SCALAR)))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_CALL
+                            (
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (SCALAR))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (SCALAR)))
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (SCALAR))))
+                    (AST_IF_ELEM
+                        (AST_CALL
+                            (
+                                (SCALAR)
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (SCALAR))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_CALL
+                                    (
+                                        (SCALAR)
+                                        (SCALAR)
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (SCALAR)))))
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (SCALAR))))
+                    (AST_IF_ELEM
+                        (AST_CALL
+                            (
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (SCALAR))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_CALL
+                                    (
+                                        (SCALAR)
+                                        (SCALAR)
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (SCALAR)))))
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_ENCAPS_LIST
+                                    (SCALAR)
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (SCALAR)
+                                    (AST_VAR)
+                                    (SCALAR)))
+                            (AST_IF
+                                (AST_IF_ELEM
+                                    (AST_UNARY_OP
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_METHOD_CALL
+                                                (AST_VAR)
+                                                (
+                                                    (AST_VAR)))))
+                                    (
+                                        (AST_RETURN
+                                            (AST_NEW
+                                                (
+                                                    (SCALAR)
+                                                    (SCALAR)))))))
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (SCALAR)))))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CAST
+            (AST_VAR)))
+    (AST_CALL
+        (
+            (SCALAR)
+            (AST_ENCAPS_LIST
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_VAR))))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (SCALAR)
+                (AST_PROP
+                    (AST_VAR)))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_ENCAPS_LIST
+                    (SCALAR)
+                    (AST_PROP
+                        (AST_VAR))
+                    (SCALAR)
+                    (AST_VAR)
+                    (SCALAR)
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_PROP
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_CALL
+        (
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (SCALAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (SCALAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (SCALAR)
+                (AST_VAR))))
+    (AST_CALL
+        (
+            (SCALAR)
+            (AST_VAR)
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_DIM
+            (AST_VAR)
+            (SCALAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_EMPTY
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR)
+                (SCALAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_CALL
+                            (
+                                (AST_VAR)
+                                (AST_VAR)))
+                        (AST_CONST))
+                    (
+                        (AST_CALL
+                            (
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (SCALAR)
+                                        (AST_VAR))
+                                    (SCALAR))
+                                (AST_VAR)
+                                (AST_VAR)))
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_EMPTY
+                                    (AST_VAR))
+                                (
+                                    (AST_CONTINUE
+                                        (NULL)))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (SCALAR)
+                                    (SCALAR)
+                                    (AST_VAR))))
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_BINARY_OP
+                                    (AST_CALL
+                                        (
+                                            (AST_DIM
+                                                (AST_VAR)
+                                                (SCALAR))))
+                                    (SCALAR))
+                                (
+                                    (AST_ASSIGN
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (SCALAR))
+                                        (AST_BINARY_OP
+                                            (AST_CALL
+                                                (
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR))
+                                                    (SCALAR)
+                                                    (SCALAR)))
+                                            (SCALAR))))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (SCALAR)
+                                    (AST_DIM
+                                        (AST_VAR)
+                                        (SCALAR)))
+                                (SCALAR)))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_DIM
+                                        (AST_VAR)
+                                        (SCALAR))
+                                    (AST_VAR)
+                                    (AST_VAR))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_VAR)
+                                    (SCALAR))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_VAR))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_VAR))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_ENCAPS_LIST
+                                        (SCALAR)
+                                        (AST_VAR)
+                                        (SCALAR))
+                                    (SCALAR)
+                                    (AST_VAR))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_VAR))))
+                        (AST_BREAK
+                            (NULL)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_EMPTY
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (SCALAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_BINARY_OP
+            (AST_BINARY_OP
+                (SCALAR)
+                (AST_CALL
+                    (
+                        (AST_VAR))))
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CAST
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (SCALAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (SCALAR)
+                (SCALAR)
+                (SCALAR)
+                (SCALAR)
+                (SCALAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_VAR))))
+    (AST_CALL
+        (
+            (SCALAR)
+            (AST_VAR)))
+    (AST_RETURN
+        (AST_ENCAPS_LIST
+            (SCALAR)
+            (AST_VAR)
+            (SCALAR)
+            (AST_VAR)
+            (SCALAR))))
