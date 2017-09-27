@@ -17,7 +17,7 @@ foreach ($asts as $ast) {
 
     shuffle($notTooLongRows);
 
-    file_put_contents($astDir . $ast . '-max-' . $maxLength . '.txt', $notTooLongRows);
+    file_put_contents($astDir . $ast . '-max-' . $maxLength . '.txt', implode(PHP_EOL, $notTooLongRows));
 
     unset($rows);
     unset($notTooLongRows);
