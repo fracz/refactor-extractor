@@ -8,6 +8,9 @@ from random import shuffle
 INPUTS_PATH = '../input/ast/'
 input_file = 'deleted.txt'
 
+# histogram dlugosci, odciac graniczne
+
+
 # czytamy pliki wejsciowe zapamietujac czy kod jest dobry. tworza sie listy:
 # [ [[TOKENY],[DOBRY_KOD]], [[TOKENY],[DOBRY_KOD]], [[TOKENY],[ZLY_KOD]] ]
 with open(INPUTS_PATH + 'changed-before.txt', 'r') as f:
@@ -35,26 +38,20 @@ embedding_size = 100 # rozmiar wektora wejsciowego (arbitralny chyba?)
 num_hidden = 128
 num_classes = 2
 
-learning_rate = 0.001
 training_steps = 10000
-batch_size = 10 #128
+batch_size = 16 #128
 display_step = 1#200
 
-# https://www.tensorflow.org/tutorials/word2vec#building_the_graph
-embeddings = tf.Variable(tf.random_uniform([vocabulary_size, embedding_size], -1.0, 1.0))
-#nce_weights = tf.Variable(tf.truncated_normal([vocabulary_size, embedding_size], stddev=1.0 / math.sqrt(embedding_size)))
-#nce_biases = tf.Variable(tf.zeros([vocabulary_size]))
+train_inputs = tf.placeholder(tf.int32, shape=[None, longest_row_length])
+train_outputs = tf.placeholder(tf.float32, shape=[None, num_classes])
 
-train_inputs = tf.placeholder(tf.int32, shape=[longest_row_length])
-
-# https://github.com/aymericdamien/TensorFlow-Examples/blob/master/examples/3_NeuralNetworks/bidirectional_rnn.py
-X = tf.placeholder(tf.float32, [None, longest_row_length, num_input])
-Y = tf.placeholder(tf.float32, [None, num_classes])
 # https://github.com/aymericdamien/TensorFlow-Examples/blob/master/examples/3_NeuralNetworks/dynamic_rnn.py
 seqlen = tf.placeholder(tf.int32, [None])
 
-embed = tf.nn.embedding_lookup(embeddings, train_inputs)
+# https://www.tensorflow.org/tutorials/word2vec#building_the_graph
+embeddings = tf.Variable(tf.random_uniform([vocabulary_size, embedding_size], -1.0, 1.0))
 
+embed = tf.nn.embedding_lookup(embeddings, train_inputs)
 
 weights = {
     # Hidden layer weights => 2*n_hidden because of forward + backward cells
@@ -65,42 +62,48 @@ biases = {
 }
 
 def BiRNN(x, seqlen, weights, biases):
-    exit()
-    inputs = tf.unstack(x, longest_row_length, 1)
+    inputs = tf.unstack(x, num=longest_row_length, axis=1)
     lstm_fw_cell = rnn.BasicLSTMCell(num_hidden, forget_bias=1.0)
     lstm_bw_cell = rnn.BasicLSTMCell(num_hidden, forget_bias=1.0)
-    outputs, _, _ = rnn.static_bidirectional_rnn(lstm_fw_cell, lstm_bw_cell, x, dtype=tf.float32, sequence_length=seqlen)
+    outputs, _, _ = rnn.static_bidirectional_rnn(lstm_fw_cell, lstm_bw_cell, inputs, dtype=tf.float32, sequence_length=seqlen)
     return tf.matmul(outputs[-1], weights['out']) + biases['out']
 
-logits = BiRNN(X, seqlen, weights, biases)
+logits = BiRNN(embed, seqlen, weights, biases)
 prediction = tf.nn.softmax(logits)
 
-loss_op = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=logits, labels=INPUT_EXPECTED))
-optimizer = tf.train.GradientDescentOptimizer(learning_rate=learning_rate)
+loss_op = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=logits, labels=train_outputs))
+#optimizer = tf.train.GradientDescentOptimizer(learning_rate=learning_rate)
+optimizer = tf.train.AdamOptimizer(learning_rate=1e-4)
 train_op = optimizer.minimize(loss_op)
 
-correct_pred = tf.equal(tf.argmax(prediction, 1), tf.argmax(Y, 1))
+correct_pred = tf.equal(tf.argmax(prediction, 1), tf.argmax(train_outputs, 1))
 accuracy = tf.reduce_mean(tf.cast(correct_pred, tf.float32))
 init = tf.global_variables_initializer()
 
 with tf.Session() as sess:
+    print('pre init')
     sess.run(init)
-
+    print('go')
     for step in range(1, training_steps+1):
+        print('stepp go')
         startIndex = step * batch_size % num_input
         if startIndex + batch_size >= num_input:
             startIndex = 0
-        batch_x = input_rows[startIndex:startIndex+batch_size]
-        batch_y = expected_result[startIndex:startIndex+batch_size]
-        batch_seqlen = input_rows_lengths[startIndex:startIndex+batch_size]
-        # Reshape data to get 28 seq of 28 elements
-        batch_INPUT = batch_INPUT.reshape((batch_size, longest_row_length, num_input))
+        #batch_x = input_rows[startIndex:startIndex+batch_size])
+        #batch_y = expected_result[startIndex:startIndex+batch_size]
+        #batch_seqlen = input_rows_lengths[startIndex:startIndex+batch_size]
+        batch_x = np.zeros([batch_size, longest_row_length], dtype=np.uint32)
+        batch_y = np.zeros([batch_size, 2], dtype=np.float32)
+        batch_y[:, 1] = 1
+        batch_seqlen = np.zeros([batch_size], dtype=np.uint32) + 30
+
         # Run optimization op (backprop)
-        sess.run(train_op, feed_dict={X: batch_x, Y: batch_y, seqlen: batch_seqlen})
+        sess.run(train_op, feed_dict={train_inputs: batch_x, train_outputs: batch_y, seqlen: batch_seqlen})
         if step % display_step == 0 or step == 1:
             # Calculate batch loss and accuracy
-            loss, acc = sess.run([loss_op, accuracy], feed_dict={X: batch_INPUT,
-                                                                 Y: batch_EXPECTED})
+            loss, acc = sess.run([loss_op, accuracy], feed_dict={train_inputs: batch_x,
+                                                                 train_outputs: batch_y,
+                                                                 seqlen: batch_seqlen})
             print("Step " + str(step) + ", Minibatch Loss= " + \
                   "{:.4f}".format(loss) + ", Training Accuracy= " + \
                   "{:.3f}".format(acc))
@@ -108,8 +111,8 @@ with tf.Session() as sess:
     print("Optimization Finished!")
 
     # Calculate accuracy for 128 mnist test images
-    test_len = 128
-    test_data = mnist.test.images[:test_len].reshape((-1, timesteps, num_input))
-    test_label = mnist.test.labels[:test_len]
-    print("Testing Accuracy:", \
-        sess.run(accuracy, feed_dict={X: test_data, Y: test_label}))
+    #test_len = 128
+    #test_data = mnist.test.images[:test_len].reshape((-1, timesteps, num_input))
+    #test_label = mnist.test.labels[:test_len]
+    #print("Testing Accuracy:", \
+    #    sess.run(accuracy, feed_dict={X: test_data, Y: test_label}))
