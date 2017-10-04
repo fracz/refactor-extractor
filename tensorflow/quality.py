@@ -10,9 +10,10 @@ vocabulary_size = 129 # liczba tokenow w kodzie
 embedding_size = 100 # rozmiar wektora wejsciowego (arbitralny chyba?)
 num_hidden = 128
 num_classes = 2
-training_steps = 3000
+training_steps = 30
 batch_size = 32 #128
 display_step = 10#200
+restore = True
 
 
 ################# DATA INPUT
@@ -84,26 +85,38 @@ correct_pred = tf.equal(tf.argmax(prediction, 1), tf.argmax(train_outputs, 1))
 accuracy = tf.reduce_mean(tf.cast(correct_pred, tf.float32))
 init = tf.global_variables_initializer()
 
+saver = tf.train.Saver()
+
 with tf.Session() as sess:
-    sess.run(init)
+    if restore:
+        new_saver = tf.train.import_meta_graph('./trained/model.meta')
+        new_saver.restore(sess, tf.train.latest_checkpoint('./trained'))
+        all_vars = tf.get_collection('vars')
+        for v in all_vars:
+            v_ = sess.run(v)
+            print(v_)
+    else:
+        sess.run(init)
 
-    validate_x, validate_y, validate_seqlen = dataset.validation(batch_size)
+        validate_x, validate_y, validate_seqlen = dataset.validation(batch_size)
 
-    for step in range(1, training_steps+1):
-        batch_x, batch_y, batch_seqlen = dataset.next(batch_size)
+        for step in range(1, training_steps+1):
+            batch_x, batch_y, batch_seqlen = dataset.next(batch_size)
 
-        # Run optimization op (backprop)
-        sess.run(train_op, feed_dict={train_inputs: batch_x, train_outputs: batch_y, seqlen: batch_seqlen})
-        if step % display_step == 0 or step == 1:
-            # Calculate batch loss and accuracy
-            loss, acc = sess.run([loss_op, accuracy], feed_dict={train_inputs: validate_x,
-                                                                 train_outputs: validate_y,
-                                                                 seqlen: validate_seqlen})
-            print("Step " + str(step) + ", Minibatch Loss= " + \
-                  "{:.4f}".format(loss) + ", Training Accuracy= " + \
-                  "{:.3f}".format(acc))
+            # Run optimization op (backprop)
+            sess.run(train_op, feed_dict={train_inputs: batch_x, train_outputs: batch_y, seqlen: batch_seqlen})
+            if step % display_step == 0 or step == 1:
+                # Calculate batch loss and accuracy
+                loss, acc = sess.run([loss_op, accuracy], feed_dict={train_inputs: validate_x,
+                                                                     train_outputs: validate_y,
+                                                                     seqlen: validate_seqlen})
+                print("Step " + str(step) + ", Minibatch Loss= " + \
+                      "{:.4f}".format(loss) + ", Training Accuracy= " + \
+                      "{:.3f}".format(acc))
 
-    print("Optimization Finished!")
+        print("Optimization Finished!")
+
+        saver.save(sess, './trained/model')
 
     test_x, test_y, test_seqlen = dataset.test()
 
