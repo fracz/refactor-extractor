@@ -92,7 +92,7 @@ with tf.device("/" + device_name):
     init = tf.global_variables_initializer()
 
     saver = tf.train.Saver()
-    
+
 config = tf.ConfigProto(
     device_count = {'GPU': 1}
 #    , log_device_placement=True
@@ -121,9 +121,7 @@ with tf.Session(config=config) as sess:
                 loss, acc = sess.run([loss_op, accuracy], feed_dict={train_inputs: validate_x,
                                                                      train_outputs: validate_y,
                                                                      seqlen: validate_seqlen})
-                print("Step " + str(step) + ", Minibatch Loss= " + \
-                      "{:.4f}".format(loss) + ", Training Accuracy= " + \
-                      "{:.3f}".format(acc))
+                print(str(step) + "\t" + "{:.4f}".format(loss) + "\t" + "{:.3f}".format(acc))
 
         print("Optimization Finished!")
 
