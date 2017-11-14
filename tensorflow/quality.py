@@ -122,6 +122,7 @@ with tf.Session(config=config) as sess:
                                                                      train_outputs: validate_y,
                                                                      seqlen: validate_seqlen})
                 print(str(step) + "\t" + "{:.4f}".format(loss) + "\t" + "{:.3f}".format(acc))
+                sys.stdout.flush()
 
         print("Optimization Finished!")
 
