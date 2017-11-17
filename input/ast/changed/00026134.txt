@@ -1,0 +1,1240 @@
+  public function willBeginExecution() {
+    $request = $this->getRequest();
+
+    if ($request->getUser()) {
+      // NOTE: Unit tests can set a user explicitly. Normal requests are not
+      // permitted to do this.
+      PhabricatorTestCase::assertExecutingUnitTests();
+      $user = $request->getUser();
+    } else {
+      $user = new PhabricatorUser();
+      $session_engine = new PhabricatorAuthSessionEngine();
+
+      $phsid = $request->getCookie(PhabricatorCookies::COOKIE_SESSION);
+      if (strlen($phsid)) {
+        $session_user = $session_engine->loadUserForSession(
+          PhabricatorAuthSession::TYPE_WEB,
+          $phsid);
+        if ($session_user) {
+          $user = $session_user;
+        }
+      } else {
+        // If the client doesn't have a session token, generate an anonymous
+        // session. This is used to provide CSRF protection to logged-out users.
+        $phsid = $session_engine->establishSession(
+          PhabricatorAuthSession::TYPE_WEB,
+          null,
+          $partial = false);
+
+        // This may be a resource request, in which case we just don't set
+        // the cookie.
+        if ($request->canSetCookies()) {
+          $request->setCookie(PhabricatorCookies::COOKIE_SESSION, $phsid);
+        }
+      }
+
+
+      if (!$user->isLoggedIn()) {
+        $user->attachAlternateCSRFString(PhabricatorHash::digest($phsid));
+      }
+
+      $request->setUser($user);
+    }
+
+    $translation = $user->getTranslation();
+    if ($translation &&
+        $translation != PhabricatorEnv::getEnvConfig('translation.provider')) {
+      $translation = newv($translation, array());
+      PhutilTranslator::getInstance()
+        ->setLanguage($translation->getLanguage())
+        ->addTranslations($translation->getTranslations());
+    }
+
+    $preferences = $user->loadPreferences();
+    if (PhabricatorEnv::getEnvConfig('darkconsole.enabled')) {
+      $dark_console = PhabricatorUserPreferences::PREFERENCE_DARK_CONSOLE;
+      if ($preferences->getPreference($dark_console) ||
+         PhabricatorEnv::getEnvConfig('darkconsole.always-on')) {
+        $console = new DarkConsoleCore();
+        $request->getApplicationConfiguration()->setConsole($console);
+      }
+    }
+
+    // NOTE: We want to set up the user first so we can render a real page
+    // here, but fire this before any real logic.
+    $restricted = array(
+      'code',
+    );
+    foreach ($restricted as $parameter) {
+      if ($request->getExists($parameter)) {
+        if (!$this->shouldAllowRestrictedParameter($parameter)) {
+          throw new Exception(
+            pht(
+              'Request includes restricted parameter "%s", but this '.
+              'controller ("%s") does not whitelist it. Refusing to '.
+              'serve this request because it might be part of a redirection '.
+              'attack.',
+              $parameter,
+              get_class($this)));
+        }
+      }
+    }
+
+    if ($this->shouldRequireEnabledUser()) {
+      if ($user->isLoggedIn() && !$user->getIsApproved()) {
+        $controller = new PhabricatorAuthNeedsApprovalController($request);
+        return $this->delegateToController($controller);
+      }
+      if ($user->getIsDisabled()) {
+        $controller = new PhabricatorDisabledUserController($request);
+        return $this->delegateToController($controller);
+      }
+    }
+
+    $event = new PhabricatorEvent(
+      PhabricatorEventType::TYPE_CONTROLLER_CHECKREQUEST,
+      array(
+        'request' => $request,
+        'controller' => $this,
+      ));
+    $event->setUser($user);
+    PhutilEventEngine::dispatchEvent($event);
+    $checker_controller = $event->getValue('controller');
+    if ($checker_controller != $this) {
+      return $this->delegateToController($checker_controller);
+    }
+
+    $auth_class = 'PhabricatorAuthApplication';
+    $auth_application = PhabricatorApplication::getByClass($auth_class);
+
+    // Require partial sessions to finish login before doing anything.
+    if (!$this->shouldAllowPartialSessions()) {
+      if ($user->hasSession() &&
+          $user->getSession()->getIsPartial()) {
+        $login_controller = new PhabricatorAuthFinishController($request);
+        $this->setCurrentApplication($auth_application);
+        return $this->delegateToController($login_controller);
+      }
+    }
+
+    // Check if the user needs to configure MFA.
+    $need_mfa = $this->shouldRequireMultiFactorEnrollment();
+    $have_mfa = $user->getIsEnrolledInMultiFactor();
+    if ($need_mfa && !$have_mfa) {
+      // Check if the cache is just out of date. Otherwise, roadblock the user
+      // and require MFA enrollment.
+      $user->updateMultiFactorEnrollment();
+      if (!$user->getIsEnrolledInMultiFactor()) {
+        $mfa_controller = new PhabricatorAuthNeedsMultiFactorController(
+          $request);
+        $this->setCurrentApplication($auth_application);
+        return $this->delegateToController($mfa_controller);
+      }
+    }
+
+    if ($this->shouldRequireLogin()) {
+      // This actually means we need either:
+      //   - a valid user, or a public controller; and
+      //   - permission to see the application.
+
+      $allow_public = $this->shouldAllowPublic() &&
+                      PhabricatorEnv::getEnvConfig('policy.allow-public');
+
+      // If this controller isn't public, and the user isn't logged in, require
+      // login.
+      if (!$allow_public && !$user->isLoggedIn()) {
+        $login_controller = new PhabricatorAuthStartController($request);
+        $this->setCurrentApplication($auth_application);
+        return $this->delegateToController($login_controller);
+      }
+
+      if ($user->isLoggedIn()) {
+        if ($this->shouldRequireEmailVerification()) {
+          if (!$user->getIsEmailVerified()) {
+            $controller = new PhabricatorMustVerifyEmailController($request);
+            $this->setCurrentApplication($auth_application);
+            return $this->delegateToController($controller);
+          }
+        }
+      }
+
+      // If the user doesn't have access to the application, don't let them use
+      // any of its controllers. We query the application in order to generate
+      // a policy exception if the viewer doesn't have permission.
+
+      $application = $this->getCurrentApplication();
+      if ($application) {
+        id(new PhabricatorApplicationQuery())
+          ->setViewer($user)
+          ->withPHIDs(array($application->getPHID()))
+          ->executeOne();
+      }
+    }
+
+    // NOTE: We do this last so that users get a login page instead of a 403
+    // if they need to login.
+    if ($this->shouldRequireAdmin() && !$user->getIsAdmin()) {
+      return new Aphront403Response();
+    }
+  }
+
+||||||||  public function willBeginExecution() {
+    $request = $this->getRequest();
+
+    if ($request->getUser()) {
+      // NOTE: Unit tests can set a user explicitly. Normal requests are not
+      // permitted to do this.
+      PhabricatorTestCase::assertExecutingUnitTests();
+      $user = $request->getUser();
+    } else {
+      $user = new PhabricatorUser();
+      $session_engine = new PhabricatorAuthSessionEngine();
+
+      $phsid = $request->getCookie(PhabricatorCookies::COOKIE_SESSION);
+      if (strlen($phsid)) {
+        $session_user = $session_engine->loadUserForSession(
+          PhabricatorAuthSession::TYPE_WEB,
+          $phsid);
+        if ($session_user) {
+          $user = $session_user;
+        }
+      } else {
+        // If the client doesn't have a session token, generate an anonymous
+        // session. This is used to provide CSRF protection to logged-out users.
+        $phsid = $session_engine->establishSession(
+          PhabricatorAuthSession::TYPE_WEB,
+          null,
+          $partial = false);
+
+        // This may be a resource request, in which case we just don't set
+        // the cookie.
+        if ($request->canSetCookies()) {
+          $request->setCookie(PhabricatorCookies::COOKIE_SESSION, $phsid);
+        }
+      }
+
+
+      if (!$user->isLoggedIn()) {
+        $user->attachAlternateCSRFString(PhabricatorHash::digest($phsid));
+      }
+
+      $request->setUser($user);
+    }
+
+    $translation = $user->getTranslation();
+    if ($translation &&
+        $translation != PhabricatorEnv::getEnvConfig('translation.provider')) {
+      $translation = newv($translation, array());
+      PhutilTranslator::getInstance()
+        ->setLanguage($translation->getLanguage())
+        ->addTranslations($translation->getTranslations());
+    }
+
+    $preferences = $user->loadPreferences();
+    if (PhabricatorEnv::getEnvConfig('darkconsole.enabled')) {
+      $dark_console = PhabricatorUserPreferences::PREFERENCE_DARK_CONSOLE;
+      if ($preferences->getPreference($dark_console) ||
+         PhabricatorEnv::getEnvConfig('darkconsole.always-on')) {
+        $console = new DarkConsoleCore();
+        $request->getApplicationConfiguration()->setConsole($console);
+      }
+    }
+
+    // NOTE: We want to set up the user first so we can render a real page
+    // here, but fire this before any real logic.
+    $restricted = array(
+      'code',
+    );
+    foreach ($restricted as $parameter) {
+      if ($request->getExists($parameter)) {
+        if (!$this->shouldAllowRestrictedParameter($parameter)) {
+          throw new Exception(
+            pht(
+              'Request includes restricted parameter "%s", but this '.
+              'controller ("%s") does not whitelist it. Refusing to '.
+              'serve this request because it might be part of a redirection '.
+              'attack.',
+              $parameter,
+              get_class($this)));
+        }
+      }
+    }
+
+    if ($this->shouldRequireEnabledUser()) {
+      if ($user->isLoggedIn() && !$user->getIsApproved()) {
+        $controller = new PhabricatorAuthNeedsApprovalController();
+        return $this->delegateToController($controller);
+      }
+      if ($user->getIsDisabled()) {
+        $controller = new PhabricatorDisabledUserController();
+        return $this->delegateToController($controller);
+      }
+    }
+
+    $event = new PhabricatorEvent(
+      PhabricatorEventType::TYPE_CONTROLLER_CHECKREQUEST,
+      array(
+        'request' => $request,
+        'controller' => $this,
+      ));
+    $event->setUser($user);
+    PhutilEventEngine::dispatchEvent($event);
+    $checker_controller = $event->getValue('controller');
+    if ($checker_controller != $this) {
+      return $this->delegateToController($checker_controller);
+    }
+
+    $auth_class = 'PhabricatorAuthApplication';
+    $auth_application = PhabricatorApplication::getByClass($auth_class);
+
+    // Require partial sessions to finish login before doing anything.
+    if (!$this->shouldAllowPartialSessions()) {
+      if ($user->hasSession() &&
+          $user->getSession()->getIsPartial()) {
+        $login_controller = new PhabricatorAuthFinishController();
+        $this->setCurrentApplication($auth_application);
+        return $this->delegateToController($login_controller);
+      }
+    }
+
+    // Check if the user needs to configure MFA.
+    $need_mfa = $this->shouldRequireMultiFactorEnrollment();
+    $have_mfa = $user->getIsEnrolledInMultiFactor();
+    if ($need_mfa && !$have_mfa) {
+      // Check if the cache is just out of date. Otherwise, roadblock the user
+      // and require MFA enrollment.
+      $user->updateMultiFactorEnrollment();
+      if (!$user->getIsEnrolledInMultiFactor()) {
+        $mfa_controller = new PhabricatorAuthNeedsMultiFactorController();
+        $this->setCurrentApplication($auth_application);
+        return $this->delegateToController($mfa_controller);
+      }
+    }
+
+    if ($this->shouldRequireLogin()) {
+      // This actually means we need either:
+      //   - a valid user, or a public controller; and
+      //   - permission to see the application.
+
+      $allow_public = $this->shouldAllowPublic() &&
+                      PhabricatorEnv::getEnvConfig('policy.allow-public');
+
+      // If this controller isn't public, and the user isn't logged in, require
+      // login.
+      if (!$allow_public && !$user->isLoggedIn()) {
+        $login_controller = new PhabricatorAuthStartController();
+        $this->setCurrentApplication($auth_application);
+        return $this->delegateToController($login_controller);
+      }
+
+      if ($user->isLoggedIn()) {
+        if ($this->shouldRequireEmailVerification()) {
+          if (!$user->getIsEmailVerified()) {
+            $controller = new PhabricatorMustVerifyEmailController();
+            $this->setCurrentApplication($auth_application);
+            return $this->delegateToController($controller);
+          }
+        }
+      }
+
+      // If the user doesn't have access to the application, don't let them use
+      // any of its controllers. We query the application in order to generate
+      // a policy exception if the viewer doesn't have permission.
+
+      $application = $this->getCurrentApplication();
+      if ($application) {
+        id(new PhabricatorApplicationQuery())
+          ->setViewer($user)
+          ->withPHIDs(array($application->getPHID()))
+          ->executeOne();
+      }
+    }
+
+    // NOTE: We do this last so that users get a login page instead of a 403
+    // if they need to login.
+    if ($this->shouldRequireAdmin() && !$user->getIsAdmin()) {
+      return new Aphront403Response();
+    }
+  }
+
+||||||||NO_DOC_COMMENTNO_RETURN_TYPE
+(
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_METHOD_CALL
+                (AST_VAR))
+            (
+                (AST_STATIC_CALL)
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_NEW))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_NEW))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_CLASS_CONST
+                                (SCALAR)))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_CALL
+                            (
+                                (AST_VAR)))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_CLASS_CONST
+                                            (SCALAR))
+                                        (AST_VAR))))
+                            (AST_IF
+                                (AST_IF_ELEM
+                                    (AST_VAR)
+                                    (
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_VAR)))))))
+                    (AST_IF_ELEM
+                        (NULL)
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_CLASS_CONST
+                                            (SCALAR))
+                                        (AST_CONST)
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_CONST)))))
+                            (AST_IF
+                                (AST_IF_ELEM
+                                    (AST_METHOD_CALL
+                                        (AST_VAR))
+                                    (
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_CLASS_CONST
+                                                    (SCALAR))
+                                                (AST_VAR)))))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR)))
+                        (
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_STATIC_CALL
+                                        (
+                                            (AST_VAR))))))))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_BINARY_OP
+                    (AST_VAR)
+                    (AST_STATIC_CALL
+                        (
+                            (SCALAR)))))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (AST_ARRAY))))
+                (AST_METHOD_CALL
+                    (AST_METHOD_CALL
+                        (AST_STATIC_CALL)
+                        (
+                            (AST_METHOD_CALL
+                                (AST_VAR))))
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_STATIC_CALL
+                (
+                    (SCALAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CLASS_CONST
+                        (SCALAR)))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)))
+                            (AST_STATIC_CALL
+                                (
+                                    (SCALAR))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_NEW))
+                            (AST_METHOD_CALL
+                                (AST_METHOD_CALL
+                                    (AST_VAR))
+                                (
+                                    (AST_VAR)))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY
+            (AST_ARRAY_ELEM
+                (SCALAR)
+                (NULL))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)))
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_UNARY_OP
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR))))
+                                (
+                                    (AST_THROW
+                                        (AST_NEW
+                                            (
+                                                (AST_CALL
+                                                    (
+                                                        (AST_BINARY_OP
+                                                            (AST_BINARY_OP
+                                                                (AST_BINARY_OP
+                                                                    (SCALAR)
+                                                                    (SCALAR))
+                                                                (SCALAR))
+                                                            (SCALAR))
+                                                        (AST_VAR)
+                                                        (AST_CALL
+                                                            (
+                                                                (AST_VAR))))))))))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_METHOD_CALL
+                (AST_VAR))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (AST_UNARY_OP
+                                (AST_METHOD_CALL
+                                    (AST_VAR))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_NEW
+                                    (
+                                        (AST_VAR))))
+                            (AST_RETURN
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR)))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_METHOD_CALL
+                            (AST_VAR))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_NEW
+                                    (
+                                        (AST_VAR))))
+                            (AST_RETURN
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR))))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_NEW
+            (
+                (AST_CLASS_CONST
+                    (SCALAR))
+                (AST_ARRAY
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (SCALAR))
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (SCALAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)))
+    (AST_STATIC_CALL
+        (
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (SCALAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (SCALAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_STATIC_CALL
+            (
+                (AST_VAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_METHOD_CALL
+                    (AST_VAR)))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (AST_METHOD_CALL
+                                (AST_METHOD_CALL
+                                    (AST_VAR))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_NEW
+                                    (
+                                        (AST_VAR))))
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)))
+                            (AST_RETURN
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR))))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_UNARY_OP
+                    (AST_VAR)))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR)))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_NEW
+                                    (
+                                        (AST_VAR))))
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)))
+                            (AST_RETURN
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR))))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_METHOD_CALL
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_BINARY_OP
+                        (AST_METHOD_CALL
+                            (AST_VAR))
+                        (AST_STATIC_CALL
+                            (
+                                (SCALAR)))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_UNARY_OP
+                                (AST_VAR))
+                            (AST_UNARY_OP
+                                (AST_METHOD_CALL
+                                    (AST_VAR))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_NEW
+                                    (
+                                        (AST_VAR))))
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)))
+                            (AST_RETURN
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR)))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_METHOD_CALL
+                            (AST_VAR))
+                        (
+                            (AST_IF
+                                (AST_IF_ELEM
+                                    (AST_METHOD_CALL
+                                        (AST_VAR))
+                                    (
+                                        (AST_IF
+                                            (AST_IF_ELEM
+                                                (AST_UNARY_OP
+                                                    (AST_METHOD_CALL
+                                                        (AST_VAR)))
+                                                (
+                                                    (AST_ASSIGN
+                                                        (AST_VAR)
+                                                        (AST_NEW
+                                                            (
+                                                                (AST_VAR))))
+                                                    (AST_METHOD_CALL
+                                                        (AST_VAR)
+                                                        (
+                                                            (AST_VAR)))
+                                                    (AST_RETURN
+                                                        (AST_METHOD_CALL
+                                                            (AST_VAR)
+                                                            (
+                                                                (AST_VAR)))))))))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_VAR)
+                        (
+                            (AST_METHOD_CALL
+                                (AST_METHOD_CALL
+                                    (AST_METHOD_CALL
+                                        (AST_CALL
+                                            (
+                                                (AST_NEW)))
+                                        (
+                                            (AST_VAR)))
+                                    (
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR))
+                                                (NULL))))))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_METHOD_CALL
+                    (AST_VAR))
+                (AST_UNARY_OP
+                    (AST_METHOD_CALL
+                        (AST_VAR))))
+            (
+                (AST_RETURN
+                    (AST_NEW))))))||||||||NO_DOC_COMMENTNO_RETURN_TYPE
+(
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_METHOD_CALL
+                (AST_VAR))
+            (
+                (AST_STATIC_CALL)
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_NEW))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_NEW))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_CLASS_CONST
+                                (SCALAR)))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_CALL
+                            (
+                                (AST_VAR)))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_CLASS_CONST
+                                            (SCALAR))
+                                        (AST_VAR))))
+                            (AST_IF
+                                (AST_IF_ELEM
+                                    (AST_VAR)
+                                    (
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_VAR)))))))
+                    (AST_IF_ELEM
+                        (NULL)
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_CLASS_CONST
+                                            (SCALAR))
+                                        (AST_CONST)
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_CONST)))))
+                            (AST_IF
+                                (AST_IF_ELEM
+                                    (AST_METHOD_CALL
+                                        (AST_VAR))
+                                    (
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_CLASS_CONST
+                                                    (SCALAR))
+                                                (AST_VAR)))))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR)))
+                        (
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_STATIC_CALL
+                                        (
+                                            (AST_VAR))))))))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_BINARY_OP
+                    (AST_VAR)
+                    (AST_STATIC_CALL
+                        (
+                            (SCALAR)))))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (AST_ARRAY))))
+                (AST_METHOD_CALL
+                    (AST_METHOD_CALL
+                        (AST_STATIC_CALL)
+                        (
+                            (AST_METHOD_CALL
+                                (AST_VAR))))
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_STATIC_CALL
+                (
+                    (SCALAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CLASS_CONST
+                        (SCALAR)))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)))
+                            (AST_STATIC_CALL
+                                (
+                                    (SCALAR))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_NEW))
+                            (AST_METHOD_CALL
+                                (AST_METHOD_CALL
+                                    (AST_VAR))
+                                (
+                                    (AST_VAR)))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY
+            (AST_ARRAY_ELEM
+                (SCALAR)
+                (NULL))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)))
+                    (
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_UNARY_OP
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR))))
+                                (
+                                    (AST_THROW
+                                        (AST_NEW
+                                            (
+                                                (AST_CALL
+                                                    (
+                                                        (AST_BINARY_OP
+                                                            (AST_BINARY_OP
+                                                                (AST_BINARY_OP
+                                                                    (SCALAR)
+                                                                    (SCALAR))
+                                                                (SCALAR))
+                                                            (SCALAR))
+                                                        (AST_VAR)
+                                                        (AST_CALL
+                                                            (
+                                                                (AST_VAR))))))))))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_METHOD_CALL
+                (AST_VAR))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (AST_UNARY_OP
+                                (AST_METHOD_CALL
+                                    (AST_VAR))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_NEW))
+                            (AST_RETURN
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR)))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_METHOD_CALL
+                            (AST_VAR))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_NEW))
+                            (AST_RETURN
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR))))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_NEW
+            (
+                (AST_CLASS_CONST
+                    (SCALAR))
+                (AST_ARRAY
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (SCALAR))
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (SCALAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)))
+    (AST_STATIC_CALL
+        (
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (SCALAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (SCALAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_STATIC_CALL
+            (
+                (AST_VAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_METHOD_CALL
+                    (AST_VAR)))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (AST_METHOD_CALL
+                                (AST_METHOD_CALL
+                                    (AST_VAR))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_NEW))
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)))
+                            (AST_RETURN
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR))))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_UNARY_OP
+                    (AST_VAR)))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_METHOD_CALL
+                                (AST_VAR)))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_NEW))
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)))
+                            (AST_RETURN
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR))))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_METHOD_CALL
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_BINARY_OP
+                        (AST_METHOD_CALL
+                            (AST_VAR))
+                        (AST_STATIC_CALL
+                            (
+                                (SCALAR)))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_UNARY_OP
+                                (AST_VAR))
+                            (AST_UNARY_OP
+                                (AST_METHOD_CALL
+                                    (AST_VAR))))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_NEW))
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_VAR)))
+                            (AST_RETURN
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR)))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_METHOD_CALL
+                            (AST_VAR))
+                        (
+                            (AST_IF
+                                (AST_IF_ELEM
+                                    (AST_METHOD_CALL
+                                        (AST_VAR))
+                                    (
+                                        (AST_IF
+                                            (AST_IF_ELEM
+                                                (AST_UNARY_OP
+                                                    (AST_METHOD_CALL
+                                                        (AST_VAR)))
+                                                (
+                                                    (AST_ASSIGN
+                                                        (AST_VAR)
+                                                        (AST_NEW))
+                                                    (AST_METHOD_CALL
+                                                        (AST_VAR)
+                                                        (
+                                                            (AST_VAR)))
+                                                    (AST_RETURN
+                                                        (AST_METHOD_CALL
+                                                            (AST_VAR)
+                                                            (
+                                                                (AST_VAR)))))))))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_VAR)
+                        (
+                            (AST_METHOD_CALL
+                                (AST_METHOD_CALL
+                                    (AST_METHOD_CALL
+                                        (AST_CALL
+                                            (
+                                                (AST_NEW)))
+                                        (
+                                            (AST_VAR)))
+                                    (
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR))
+                                                (NULL))))))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_METHOD_CALL
+                    (AST_VAR))
+                (AST_UNARY_OP
+                    (AST_METHOD_CALL
+                        (AST_VAR))))
+            (
+                (AST_RETURN
+                    (AST_NEW))))))

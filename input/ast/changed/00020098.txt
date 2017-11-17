@@ -1,0 +1,1592 @@
+    public function sync_user_enrolments($user) {
+        global $DB;
+
+        // Do not try to print anything to the output because this method is called during interactive login.
+        $trace = new error_log_progress_trace($this->errorlogtag);
+
+        $ldapconnection = $this->ldap_connect($trace);
+        if (!$ldapconnection) {
+            $trace->finished();
+            return;
+        }
+
+        if (!is_object($user) or !property_exists($user, 'id')) {
+            throw new coding_exception('Invalid $user parameter in sync_user_enrolments()');
+        }
+
+        if (!property_exists($user, 'idnumber')) {
+            debugging('Invalid $user parameter in sync_user_enrolments(), missing idnumber');
+            $user = $DB->get_record('user', array('id'=>$user->id));
+        }
+
+        // We may need a lot of memory here
+        @set_time_limit(0);
+        raise_memory_limit(MEMORY_HUGE);
+
+        // Get enrolments for each type of role.
+        $roles = get_all_roles();
+        $enrolments = array();
+        foreach($roles as $role) {
+            // Get external enrolments according to LDAP server
+            $enrolments[$role->id]['ext'] = $this->find_ext_enrolments($ldapconnection, $user->idnumber, $role);
+
+            // Get the list of current user enrolments that come from LDAP
+            $sql= "SELECT e.courseid, ue.status, e.id as enrolid, c.shortname
+                     FROM {user} u
+                     JOIN {role_assignments} ra ON (ra.userid = u.id AND ra.component = 'enrol_ldap' AND ra.roleid = :roleid)
+                     JOIN {user_enrolments} ue ON (ue.userid = u.id AND ue.enrolid = ra.itemid)
+                     JOIN {enrol} e ON (e.id = ue.enrolid)
+                     JOIN {course} c ON (c.id = e.courseid)
+                    WHERE u.deleted = 0 AND u.id = :userid";
+            $params = array ('roleid'=>$role->id, 'userid'=>$user->id);
+            $enrolments[$role->id]['current'] = $DB->get_records_sql($sql, $params);
+        }
+
+        $ignorehidden = $this->get_config('ignorehiddencourses');
+        $courseidnumber = $this->get_config('course_idnumber');
+        foreach($roles as $role) {
+            foreach ($enrolments[$role->id]['ext'] as $enrol) {
+                $course_ext_id = $enrol[$courseidnumber][0];
+                if (empty($course_ext_id)) {
+                    $trace->output(get_string('extcourseidinvalid', 'enrol_ldap'));
+                    continue; // Next; skip this one!
+                }
+
+                // Create the course if required
+                $course = $DB->get_record('course', array($this->enrol_localcoursefield=>$course_ext_id));
+                if (empty($course)) { // Course doesn't exist
+                    if ($this->get_config('autocreate')) { // Autocreate
+                        $trace->output(get_string('createcourseextid', 'enrol_ldap', array('courseextid'=>$course_ext_id)));
+                        if (!$newcourseid = $this->create_course($enrol, $trace)) {
+                            continue;
+                        }
+                        $course = $DB->get_record('course', array('id'=>$newcourseid));
+                    } else {
+                        $trace->output(get_string('createnotcourseextid', 'enrol_ldap', array('courseextid'=>$course_ext_id)));
+                        continue; // Next; skip this one!
+                    }
+                }
+
+                // Deal with enrolment in the moodle db
+                // Add necessary enrol instance if not present yet;
+                $sql = "SELECT c.id, c.visible, e.id as enrolid
+                          FROM {course} c
+                          JOIN {enrol} e ON (e.courseid = c.id AND e.enrol = 'ldap')
+                         WHERE c.id = :courseid";
+                $params = array('courseid'=>$course->id);
+                if (!($course_instance = $DB->get_record_sql($sql, $params, IGNORE_MULTIPLE))) {
+                    $course_instance = new stdClass();
+                    $course_instance->id = $course->id;
+                    $course_instance->visible = $course->visible;
+                    $course_instance->enrolid = $this->add_instance($course_instance);
+                }
+
+                if (!$instance = $DB->get_record('enrol', array('id'=>$course_instance->enrolid))) {
+                    continue; // Weird; skip this one.
+                }
+
+                if ($ignorehidden && !$course_instance->visible) {
+                    continue;
+                }
+
+                if (empty($enrolments[$role->id]['current'][$course->id])) {
+                    // Enrol the user in the given course, with that role.
+                    $this->enrol_user($instance, $user->id, $role->id);
+                    // Make sure we set the enrolment status to active. If the user wasn't
+                    // previously enrolled to the course, enrol_user() sets it. But if we
+                    // configured the plugin to suspend the user enrolments _AND_ remove
+                    // the role assignments on external unenrol, then enrol_user() doesn't
+                    // set it back to active on external re-enrolment. So set it
+                    // unconditionnally to cover both cases.
+                    $DB->set_field('user_enrolments', 'status', ENROL_USER_ACTIVE, array('enrolid'=>$instance->id, 'userid'=>$user->id));
+                    $trace->output(get_string('enroluser', 'enrol_ldap',
+                        array('user_username'=> $user->username,
+                              'course_shortname'=>$course->shortname,
+                              'course_id'=>$course->id)));
+                } else {
+                    if ($enrolments[$role->id]['current'][$course->id]->status == ENROL_USER_SUSPENDED) {
+                        // Reenable enrolment that was previously disabled. Enrolment refreshed
+                        $DB->set_field('user_enrolments', 'status', ENROL_USER_ACTIVE, array('enrolid'=>$instance->id, 'userid'=>$user->id));
+                        $trace->output(get_string('enroluserenable', 'enrol_ldap',
+                            array('user_username'=> $user->username,
+                                  'course_shortname'=>$course->shortname,
+                                  'course_id'=>$course->id)));
+                    }
+                }
+
+                // Remove this course from the current courses, to be able to detect
+                // which current courses should be unenroled from when we finish processing
+                // external enrolments.
+                unset($enrolments[$role->id]['current'][$course->id]);
+            }
+
+            // Deal with unenrolments.
+            $transaction = $DB->start_delegated_transaction();
+            foreach ($enrolments[$role->id]['current'] as $course) {
+                $context = context_course::instance($course->courseid);
+                $instance = $DB->get_record('enrol', array('id'=>$course->enrolid));
+                switch ($this->get_config('unenrolaction')) {
+                    case ENROL_EXT_REMOVED_UNENROL:
+                        $this->unenrol_user($instance, $user->id);
+                        $trace->output(get_string('extremovedunenrol', 'enrol_ldap',
+                            array('user_username'=> $user->username,
+                                  'course_shortname'=>$course->shortname,
+                                  'course_id'=>$course->courseid)));
+                        break;
+                    case ENROL_EXT_REMOVED_KEEP:
+                        // Keep - only adding enrolments
+                        break;
+                    case ENROL_EXT_REMOVED_SUSPEND:
+                        if ($course->status != ENROL_USER_SUSPENDED) {
+                            $DB->set_field('user_enrolments', 'status', ENROL_USER_SUSPENDED, array('enrolid'=>$instance->id, 'userid'=>$user->id));
+                            $trace->output(get_string('extremovedsuspend', 'enrol_ldap',
+                                array('user_username'=> $user->username,
+                                      'course_shortname'=>$course->shortname,
+                                      'course_id'=>$course->courseid)));
+                        }
+                        break;
+                    case ENROL_EXT_REMOVED_SUSPENDNOROLES:
+                        if ($course->status != ENROL_USER_SUSPENDED) {
+                            $DB->set_field('user_enrolments', 'status', ENROL_USER_SUSPENDED, array('enrolid'=>$instance->id, 'userid'=>$user->id));
+                        }
+                        role_unassign_all(array('contextid'=>$context->id, 'userid'=>$user->id, 'component'=>'enrol_ldap', 'itemid'=>$instance->id));
+                        $trace->output(get_string('extremovedsuspendnoroles', 'enrol_ldap',
+                            array('user_username'=> $user->username,
+                                  'course_shortname'=>$course->shortname,
+                                  'course_id'=>$course->courseid)));
+                        break;
+                }
+            }
+            $transaction->allow_commit();
+        }
+
+        $this->ldap_close($ldapconnection);
+
+        $trace->finished();
+    }
+
+    /**
+     * Forces synchronisation of all enrolments with LDAP server.
+     * It creates courses if the plugin is configured to do so.
+     *
+     * @param progress_trace $trace
+     * @param int|null $onecourse limit sync to one course->id, null if all courses
+     * @return void
+     */
+||||||||    public function sync_user_enrolments($user) {
+        global $DB;
+
+        // Do not try to print anything to the output because this method is called during interactive login.
+        $trace = new error_log_progress_trace($this->errorlogtag);
+
+        if (!$this->ldap_connect($trace)) {
+            $trace->finished();
+            return;
+        }
+
+        if (!is_object($user) or !property_exists($user, 'id')) {
+            throw new coding_exception('Invalid $user parameter in sync_user_enrolments()');
+        }
+
+        if (!property_exists($user, 'idnumber')) {
+            debugging('Invalid $user parameter in sync_user_enrolments(), missing idnumber');
+            $user = $DB->get_record('user', array('id'=>$user->id));
+        }
+
+        // We may need a lot of memory here
+        @set_time_limit(0);
+        raise_memory_limit(MEMORY_HUGE);
+
+        // Get enrolments for each type of role.
+        $roles = get_all_roles();
+        $enrolments = array();
+        foreach($roles as $role) {
+            // Get external enrolments according to LDAP server
+            $enrolments[$role->id]['ext'] = $this->find_ext_enrolments($user->idnumber, $role);
+
+            // Get the list of current user enrolments that come from LDAP
+            $sql= "SELECT e.courseid, ue.status, e.id as enrolid, c.shortname
+                     FROM {user} u
+                     JOIN {role_assignments} ra ON (ra.userid = u.id AND ra.component = 'enrol_ldap' AND ra.roleid = :roleid)
+                     JOIN {user_enrolments} ue ON (ue.userid = u.id AND ue.enrolid = ra.itemid)
+                     JOIN {enrol} e ON (e.id = ue.enrolid)
+                     JOIN {course} c ON (c.id = e.courseid)
+                    WHERE u.deleted = 0 AND u.id = :userid";
+            $params = array ('roleid'=>$role->id, 'userid'=>$user->id);
+            $enrolments[$role->id]['current'] = $DB->get_records_sql($sql, $params);
+        }
+
+        $ignorehidden = $this->get_config('ignorehiddencourses');
+        $courseidnumber = $this->get_config('course_idnumber');
+        foreach($roles as $role) {
+            foreach ($enrolments[$role->id]['ext'] as $enrol) {
+                $course_ext_id = $enrol[$courseidnumber][0];
+                if (empty($course_ext_id)) {
+                    $trace->output(get_string('extcourseidinvalid', 'enrol_ldap'));
+                    continue; // Next; skip this one!
+                }
+
+                // Create the course if required
+                $course = $DB->get_record('course', array($this->enrol_localcoursefield=>$course_ext_id));
+                if (empty($course)) { // Course doesn't exist
+                    if ($this->get_config('autocreate')) { // Autocreate
+                        $trace->output(get_string('createcourseextid', 'enrol_ldap', array('courseextid'=>$course_ext_id)));
+                        if (!$newcourseid = $this->create_course($enrol, $trace)) {
+                            continue;
+                        }
+                        $course = $DB->get_record('course', array('id'=>$newcourseid));
+                    } else {
+                        $trace->output(get_string('createnotcourseextid', 'enrol_ldap', array('courseextid'=>$course_ext_id)));
+                        continue; // Next; skip this one!
+                    }
+                }
+
+                // Deal with enrolment in the moodle db
+                // Add necessary enrol instance if not present yet;
+                $sql = "SELECT c.id, c.visible, e.id as enrolid
+                          FROM {course} c
+                          JOIN {enrol} e ON (e.courseid = c.id AND e.enrol = 'ldap')
+                         WHERE c.id = :courseid";
+                $params = array('courseid'=>$course->id);
+                if (!($course_instance = $DB->get_record_sql($sql, $params, IGNORE_MULTIPLE))) {
+                    $course_instance = new stdClass();
+                    $course_instance->id = $course->id;
+                    $course_instance->visible = $course->visible;
+                    $course_instance->enrolid = $this->add_instance($course_instance);
+                }
+
+                if (!$instance = $DB->get_record('enrol', array('id'=>$course_instance->enrolid))) {
+                    continue; // Weird; skip this one.
+                }
+
+                if ($ignorehidden && !$course_instance->visible) {
+                    continue;
+                }
+
+                if (empty($enrolments[$role->id]['current'][$course->id])) {
+                    // Enrol the user in the given course, with that role.
+                    $this->enrol_user($instance, $user->id, $role->id);
+                    // Make sure we set the enrolment status to active. If the user wasn't
+                    // previously enrolled to the course, enrol_user() sets it. But if we
+                    // configured the plugin to suspend the user enrolments _AND_ remove
+                    // the role assignments on external unenrol, then enrol_user() doesn't
+                    // set it back to active on external re-enrolment. So set it
+                    // unconditionnally to cover both cases.
+                    $DB->set_field('user_enrolments', 'status', ENROL_USER_ACTIVE, array('enrolid'=>$instance->id, 'userid'=>$user->id));
+                    $trace->output(get_string('enroluser', 'enrol_ldap',
+                        array('user_username'=> $user->username,
+                              'course_shortname'=>$course->shortname,
+                              'course_id'=>$course->id)));
+                } else {
+                    if ($enrolments[$role->id]['current'][$course->id]->status == ENROL_USER_SUSPENDED) {
+                        // Reenable enrolment that was previously disabled. Enrolment refreshed
+                        $DB->set_field('user_enrolments', 'status', ENROL_USER_ACTIVE, array('enrolid'=>$instance->id, 'userid'=>$user->id));
+                        $trace->output(get_string('enroluserenable', 'enrol_ldap',
+                            array('user_username'=> $user->username,
+                                  'course_shortname'=>$course->shortname,
+                                  'course_id'=>$course->id)));
+                    }
+                }
+
+                // Remove this course from the current courses, to be able to detect
+                // which current courses should be unenroled from when we finish processing
+                // external enrolments.
+                unset($enrolments[$role->id]['current'][$course->id]);
+            }
+
+            // Deal with unenrolments.
+            $transaction = $DB->start_delegated_transaction();
+            foreach ($enrolments[$role->id]['current'] as $course) {
+                $context = context_course::instance($course->courseid);
+                $instance = $DB->get_record('enrol', array('id'=>$course->enrolid));
+                switch ($this->get_config('unenrolaction')) {
+                    case ENROL_EXT_REMOVED_UNENROL:
+                        $this->unenrol_user($instance, $user->id);
+                        $trace->output(get_string('extremovedunenrol', 'enrol_ldap',
+                            array('user_username'=> $user->username,
+                                  'course_shortname'=>$course->shortname,
+                                  'course_id'=>$course->courseid)));
+                        break;
+                    case ENROL_EXT_REMOVED_KEEP:
+                        // Keep - only adding enrolments
+                        break;
+                    case ENROL_EXT_REMOVED_SUSPEND:
+                        if ($course->status != ENROL_USER_SUSPENDED) {
+                            $DB->set_field('user_enrolments', 'status', ENROL_USER_SUSPENDED, array('enrolid'=>$instance->id, 'userid'=>$user->id));
+                            $trace->output(get_string('extremovedsuspend', 'enrol_ldap',
+                                array('user_username'=> $user->username,
+                                      'course_shortname'=>$course->shortname,
+                                      'course_id'=>$course->courseid)));
+                        }
+                        break;
+                    case ENROL_EXT_REMOVED_SUSPENDNOROLES:
+                        if ($course->status != ENROL_USER_SUSPENDED) {
+                            $DB->set_field('user_enrolments', 'status', ENROL_USER_SUSPENDED, array('enrolid'=>$instance->id, 'userid'=>$user->id));
+                        }
+                        role_unassign_all(array('contextid'=>$context->id, 'userid'=>$user->id, 'component'=>'enrol_ldap', 'itemid'=>$instance->id));
+                        $trace->output(get_string('extremovedsuspendnoroles', 'enrol_ldap',
+                            array('user_username'=> $user->username,
+                                  'course_shortname'=>$course->shortname,
+                                  'course_id'=>$course->courseid)));
+                        break;
+                }
+            }
+            $transaction->allow_commit();
+        }
+
+        $this->ldap_close();
+
+        $trace->finished();
+    }
+
+    /**
+     * Forces synchronisation of all enrolments with LDAP server.
+     * It creates courses if the plugin is configured to do so.
+     *
+     * @param progress_trace $trace
+     * @param int|null $onecourse limit sync to one course->id, null if all courses
+     * @return void
+     */
+||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_GLOBAL
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_NEW
+            (
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_VAR))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR))
+                (AST_RETURN
+                    (NULL)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_UNARY_OP
+                    (AST_CALL
+                        (
+                            (AST_VAR))))
+                (AST_UNARY_OP
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (SCALAR)))))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_CALL
+                    (
+                        (AST_VAR)
+                        (SCALAR))))
+            (
+                (AST_CALL
+                    (
+                        (SCALAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (SCALAR)
+                            (AST_ARRAY
+                                (AST_ARRAY_ELEM
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (SCALAR)))))))))
+    (AST_UNARY_OP
+        (AST_CALL
+            (
+                (SCALAR))))
+    (AST_CALL
+        (
+            (AST_CONST)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_PROP
+                            (AST_VAR)))
+                    (SCALAR))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_PROP
+                            (AST_VAR))
+                        (AST_VAR))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (SCALAR))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_ARRAY
+                    (AST_ARRAY_ELEM
+                        (AST_PROP
+                            (AST_VAR))
+                        (SCALAR))
+                    (AST_ARRAY_ELEM
+                        (AST_PROP
+                            (AST_VAR))
+                        (SCALAR))))
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_PROP
+                            (AST_VAR)))
+                    (SCALAR))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (SCALAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (SCALAR))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_FOREACH
+                (AST_DIM
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_PROP
+                            (AST_VAR)))
+                    (SCALAR))
+                (AST_VAR)
+                (NULL)
+                (
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_DIM
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR))
+                            (SCALAR)))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_EMPTY
+                                (AST_VAR))
+                            (
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_CALL
+                                            (
+                                                (SCALAR)
+                                                (SCALAR)))))
+                                (AST_CONTINUE
+                                    (NULL)))))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (SCALAR)
+                                (AST_ARRAY
+                                    (AST_ARRAY_ELEM
+                                        (AST_VAR)
+                                        (AST_PROP
+                                            (AST_VAR)))))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_EMPTY
+                                (AST_VAR))
+                            (
+                                (AST_IF
+                                    (AST_IF_ELEM
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (SCALAR)))
+                                        (
+                                            (AST_METHOD_CALL
+                                                (AST_VAR)
+                                                (
+                                                    (AST_CALL
+                                                        (
+                                                            (SCALAR)
+                                                            (SCALAR)
+                                                            (AST_ARRAY
+                                                                (AST_ARRAY_ELEM
+                                                                    (AST_VAR)
+                                                                    (SCALAR)))))))
+                                            (AST_IF
+                                                (AST_IF_ELEM
+                                                    (AST_UNARY_OP
+                                                        (AST_ASSIGN
+                                                            (AST_VAR)
+                                                            (AST_METHOD_CALL
+                                                                (AST_VAR)
+                                                                (
+                                                                    (AST_VAR)
+                                                                    (AST_VAR)))))
+                                                    (
+                                                        (AST_CONTINUE
+                                                            (NULL)))))
+                                            (AST_ASSIGN
+                                                (AST_VAR)
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR)
+                                                    (
+                                                        (SCALAR)
+                                                        (AST_ARRAY
+                                                            (AST_ARRAY_ELEM
+                                                                (AST_VAR)
+                                                                (SCALAR))))))))
+                                    (AST_IF_ELEM
+                                        (NULL)
+                                        (
+                                            (AST_METHOD_CALL
+                                                (AST_VAR)
+                                                (
+                                                    (AST_CALL
+                                                        (
+                                                            (SCALAR)
+                                                            (SCALAR)
+                                                            (AST_ARRAY
+                                                                (AST_ARRAY_ELEM
+                                                                    (AST_VAR)
+                                                                    (SCALAR)))))))
+                                            (AST_CONTINUE
+                                                (NULL))))))))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (SCALAR))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_UNARY_OP
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR)
+                                            (AST_VAR)
+                                            (AST_CONST)))))
+                            (
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_NEW))
+                                (AST_ASSIGN
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (AST_PROP
+                                        (AST_VAR)))
+                                (AST_ASSIGN
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (AST_PROP
+                                        (AST_VAR)))
+                                (AST_ASSIGN
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR)))))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_UNARY_OP
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (SCALAR)
+                                            (AST_ARRAY
+                                                (AST_ARRAY_ELEM
+                                                    (AST_PROP
+                                                        (AST_VAR))
+                                                    (SCALAR)))))))
+                            (
+                                (AST_CONTINUE
+                                    (NULL)))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_BINARY_OP
+                                (AST_VAR)
+                                (AST_UNARY_OP
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (
+                                (AST_CONTINUE
+                                    (NULL)))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_EMPTY
+                                (AST_DIM
+                                    (AST_DIM
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (AST_PROP
+                                                (AST_VAR)))
+                                        (SCALAR))
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR)
+                                        (AST_PROP
+                                            (AST_VAR))
+                                        (AST_PROP
+                                            (AST_VAR))))
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (SCALAR)
+                                        (SCALAR)
+                                        (AST_CONST)
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (AST_PROP
+                                                    (AST_VAR))
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (AST_PROP
+                                                    (AST_VAR))
+                                                (SCALAR)))))
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_CALL
+                                            (
+                                                (SCALAR)
+                                                (SCALAR)
+                                                (AST_ARRAY
+                                                    (AST_ARRAY_ELEM
+                                                        (AST_PROP
+                                                            (AST_VAR))
+                                                        (SCALAR))
+                                                    (AST_ARRAY_ELEM
+                                                        (AST_PROP
+                                                            (AST_VAR))
+                                                        (SCALAR))
+                                                    (AST_ARRAY_ELEM
+                                                        (AST_PROP
+                                                            (AST_VAR))
+                                                        (SCALAR)))))))))
+                        (AST_IF_ELEM
+                            (NULL)
+                            (
+                                (AST_IF
+                                    (AST_IF_ELEM
+                                        (AST_BINARY_OP
+                                            (AST_PROP
+                                                (AST_DIM
+                                                    (AST_DIM
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (AST_PROP
+                                                                (AST_VAR)))
+                                                        (SCALAR))
+                                                    (AST_PROP
+                                                        (AST_VAR))))
+                                            (AST_CONST))
+                                        (
+                                            (AST_METHOD_CALL
+                                                (AST_VAR)
+                                                (
+                                                    (SCALAR)
+                                                    (SCALAR)
+                                                    (AST_CONST)
+                                                    (AST_ARRAY
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR))
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR)))))
+                                            (AST_METHOD_CALL
+                                                (AST_VAR)
+                                                (
+                                                    (AST_CALL
+                                                        (
+                                                            (SCALAR)
+                                                            (SCALAR)
+                                                            (AST_ARRAY
+                                                                (AST_ARRAY_ELEM
+                                                                    (AST_PROP
+                                                                        (AST_VAR))
+                                                                    (SCALAR))
+                                                                (AST_ARRAY_ELEM
+                                                                    (AST_PROP
+                                                                        (AST_VAR))
+                                                                    (SCALAR))
+                                                                (AST_ARRAY_ELEM
+                                                                    (AST_PROP
+                                                                        (AST_VAR))
+                                                                    (SCALAR)))))))))))))
+                    (AST_UNSET
+                        (AST_DIM
+                            (AST_DIM
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (AST_PROP
+                                        (AST_VAR)))
+                                (SCALAR))
+                            (AST_PROP
+                                (AST_VAR))))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_METHOD_CALL
+                    (AST_VAR)))
+            (AST_FOREACH
+                (AST_DIM
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_PROP
+                            (AST_VAR)))
+                    (SCALAR))
+                (AST_VAR)
+                (NULL)
+                (
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_STATIC_CALL
+                            (
+                                (AST_PROP
+                                    (AST_VAR)))))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (SCALAR)
+                                (AST_ARRAY
+                                    (AST_ARRAY_ELEM
+                                        (AST_PROP
+                                            (AST_VAR))
+                                        (SCALAR))))))
+                    (AST_SWITCH
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (SCALAR)))
+                        (AST_SWITCH_LIST
+                            (AST_SWITCH_CASE
+                                (AST_CONST)
+                                (
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR)
+                                            (AST_PROP
+                                                (AST_VAR))))
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (SCALAR)
+                                                    (AST_ARRAY
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR))
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR))
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR)))))))
+                                    (AST_BREAK
+                                        (NULL))))
+                            (AST_SWITCH_CASE
+                                (AST_CONST)
+                                (
+                                    (AST_BREAK
+                                        (NULL))))
+                            (AST_SWITCH_CASE
+                                (AST_CONST)
+                                (
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_BINARY_OP
+                                                (AST_PROP
+                                                    (AST_VAR))
+                                                (AST_CONST))
+                                            (
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR)
+                                                    (
+                                                        (SCALAR)
+                                                        (SCALAR)
+                                                        (AST_CONST)
+                                                        (AST_ARRAY
+                                                            (AST_ARRAY_ELEM
+                                                                (AST_PROP
+                                                                    (AST_VAR))
+                                                                (SCALAR))
+                                                            (AST_ARRAY_ELEM
+                                                                (AST_PROP
+                                                                    (AST_VAR))
+                                                                (SCALAR)))))
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR)
+                                                    (
+                                                        (AST_CALL
+                                                            (
+                                                                (SCALAR)
+                                                                (SCALAR)
+                                                                (AST_ARRAY
+                                                                    (AST_ARRAY_ELEM
+                                                                        (AST_PROP
+                                                                            (AST_VAR))
+                                                                        (SCALAR))
+                                                                    (AST_ARRAY_ELEM
+                                                                        (AST_PROP
+                                                                            (AST_VAR))
+                                                                        (SCALAR))
+                                                                    (AST_ARRAY_ELEM
+                                                                        (AST_PROP
+                                                                            (AST_VAR))
+                                                                        (SCALAR))))))))))
+                                    (AST_BREAK
+                                        (NULL))))
+                            (AST_SWITCH_CASE
+                                (AST_CONST)
+                                (
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_BINARY_OP
+                                                (AST_PROP
+                                                    (AST_VAR))
+                                                (AST_CONST))
+                                            (
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR)
+                                                    (
+                                                        (SCALAR)
+                                                        (SCALAR)
+                                                        (AST_CONST)
+                                                        (AST_ARRAY
+                                                            (AST_ARRAY_ELEM
+                                                                (AST_PROP
+                                                                    (AST_VAR))
+                                                                (SCALAR))
+                                                            (AST_ARRAY_ELEM
+                                                                (AST_PROP
+                                                                    (AST_VAR))
+                                                                (SCALAR))))))))
+                                    (AST_CALL
+                                        (
+                                            (AST_ARRAY
+                                                (AST_ARRAY_ELEM
+                                                    (AST_PROP
+                                                        (AST_VAR))
+                                                    (SCALAR))
+                                                (AST_ARRAY_ELEM
+                                                    (AST_PROP
+                                                        (AST_VAR))
+                                                    (SCALAR))
+                                                (AST_ARRAY_ELEM
+                                                    (SCALAR)
+                                                    (SCALAR))
+                                                (AST_ARRAY_ELEM
+                                                    (AST_PROP
+                                                        (AST_VAR))
+                                                    (SCALAR)))))
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (SCALAR)
+                                                    (AST_ARRAY
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR))
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR))
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR)))))))
+                                    (AST_BREAK
+                                        (NULL))))))))
+            (AST_METHOD_CALL
+                (AST_VAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)))||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_GLOBAL
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_NEW
+            (
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR))))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR))
+                (AST_RETURN
+                    (NULL)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_UNARY_OP
+                    (AST_CALL
+                        (
+                            (AST_VAR))))
+                (AST_UNARY_OP
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (SCALAR)))))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_CALL
+                    (
+                        (AST_VAR)
+                        (SCALAR))))
+            (
+                (AST_CALL
+                    (
+                        (SCALAR)))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (SCALAR)
+                            (AST_ARRAY
+                                (AST_ARRAY_ELEM
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (SCALAR)))))))))
+    (AST_UNARY_OP
+        (AST_CALL
+            (
+                (SCALAR))))
+    (AST_CALL
+        (
+            (AST_CONST)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_PROP
+                            (AST_VAR)))
+                    (SCALAR))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_PROP
+                            (AST_VAR))
+                        (AST_VAR))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (SCALAR))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_ARRAY
+                    (AST_ARRAY_ELEM
+                        (AST_PROP
+                            (AST_VAR))
+                        (SCALAR))
+                    (AST_ARRAY_ELEM
+                        (AST_PROP
+                            (AST_VAR))
+                        (SCALAR))))
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_PROP
+                            (AST_VAR)))
+                    (SCALAR))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (SCALAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (SCALAR))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_FOREACH
+                (AST_DIM
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_PROP
+                            (AST_VAR)))
+                    (SCALAR))
+                (AST_VAR)
+                (NULL)
+                (
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_DIM
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR))
+                            (SCALAR)))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_EMPTY
+                                (AST_VAR))
+                            (
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_CALL
+                                            (
+                                                (SCALAR)
+                                                (SCALAR)))))
+                                (AST_CONTINUE
+                                    (NULL)))))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (SCALAR)
+                                (AST_ARRAY
+                                    (AST_ARRAY_ELEM
+                                        (AST_VAR)
+                                        (AST_PROP
+                                            (AST_VAR)))))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_EMPTY
+                                (AST_VAR))
+                            (
+                                (AST_IF
+                                    (AST_IF_ELEM
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (SCALAR)))
+                                        (
+                                            (AST_METHOD_CALL
+                                                (AST_VAR)
+                                                (
+                                                    (AST_CALL
+                                                        (
+                                                            (SCALAR)
+                                                            (SCALAR)
+                                                            (AST_ARRAY
+                                                                (AST_ARRAY_ELEM
+                                                                    (AST_VAR)
+                                                                    (SCALAR)))))))
+                                            (AST_IF
+                                                (AST_IF_ELEM
+                                                    (AST_UNARY_OP
+                                                        (AST_ASSIGN
+                                                            (AST_VAR)
+                                                            (AST_METHOD_CALL
+                                                                (AST_VAR)
+                                                                (
+                                                                    (AST_VAR)
+                                                                    (AST_VAR)))))
+                                                    (
+                                                        (AST_CONTINUE
+                                                            (NULL)))))
+                                            (AST_ASSIGN
+                                                (AST_VAR)
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR)
+                                                    (
+                                                        (SCALAR)
+                                                        (AST_ARRAY
+                                                            (AST_ARRAY_ELEM
+                                                                (AST_VAR)
+                                                                (SCALAR))))))))
+                                    (AST_IF_ELEM
+                                        (NULL)
+                                        (
+                                            (AST_METHOD_CALL
+                                                (AST_VAR)
+                                                (
+                                                    (AST_CALL
+                                                        (
+                                                            (SCALAR)
+                                                            (SCALAR)
+                                                            (AST_ARRAY
+                                                                (AST_ARRAY_ELEM
+                                                                    (AST_VAR)
+                                                                    (SCALAR)))))))
+                                            (AST_CONTINUE
+                                                (NULL))))))))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (SCALAR))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_UNARY_OP
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR)
+                                            (AST_VAR)
+                                            (AST_CONST)))))
+                            (
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_NEW))
+                                (AST_ASSIGN
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (AST_PROP
+                                        (AST_VAR)))
+                                (AST_ASSIGN
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (AST_PROP
+                                        (AST_VAR)))
+                                (AST_ASSIGN
+                                    (AST_PROP
+                                        (AST_VAR))
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR)))))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_UNARY_OP
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (SCALAR)
+                                            (AST_ARRAY
+                                                (AST_ARRAY_ELEM
+                                                    (AST_PROP
+                                                        (AST_VAR))
+                                                    (SCALAR)))))))
+                            (
+                                (AST_CONTINUE
+                                    (NULL)))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_BINARY_OP
+                                (AST_VAR)
+                                (AST_UNARY_OP
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (
+                                (AST_CONTINUE
+                                    (NULL)))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_EMPTY
+                                (AST_DIM
+                                    (AST_DIM
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (AST_PROP
+                                                (AST_VAR)))
+                                        (SCALAR))
+                                    (AST_PROP
+                                        (AST_VAR))))
+                            (
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR)
+                                        (AST_PROP
+                                            (AST_VAR))
+                                        (AST_PROP
+                                            (AST_VAR))))
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (SCALAR)
+                                        (SCALAR)
+                                        (AST_CONST)
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (AST_PROP
+                                                    (AST_VAR))
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (AST_PROP
+                                                    (AST_VAR))
+                                                (SCALAR)))))
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_CALL
+                                            (
+                                                (SCALAR)
+                                                (SCALAR)
+                                                (AST_ARRAY
+                                                    (AST_ARRAY_ELEM
+                                                        (AST_PROP
+                                                            (AST_VAR))
+                                                        (SCALAR))
+                                                    (AST_ARRAY_ELEM
+                                                        (AST_PROP
+                                                            (AST_VAR))
+                                                        (SCALAR))
+                                                    (AST_ARRAY_ELEM
+                                                        (AST_PROP
+                                                            (AST_VAR))
+                                                        (SCALAR)))))))))
+                        (AST_IF_ELEM
+                            (NULL)
+                            (
+                                (AST_IF
+                                    (AST_IF_ELEM
+                                        (AST_BINARY_OP
+                                            (AST_PROP
+                                                (AST_DIM
+                                                    (AST_DIM
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (AST_PROP
+                                                                (AST_VAR)))
+                                                        (SCALAR))
+                                                    (AST_PROP
+                                                        (AST_VAR))))
+                                            (AST_CONST))
+                                        (
+                                            (AST_METHOD_CALL
+                                                (AST_VAR)
+                                                (
+                                                    (SCALAR)
+                                                    (SCALAR)
+                                                    (AST_CONST)
+                                                    (AST_ARRAY
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR))
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR)))))
+                                            (AST_METHOD_CALL
+                                                (AST_VAR)
+                                                (
+                                                    (AST_CALL
+                                                        (
+                                                            (SCALAR)
+                                                            (SCALAR)
+                                                            (AST_ARRAY
+                                                                (AST_ARRAY_ELEM
+                                                                    (AST_PROP
+                                                                        (AST_VAR))
+                                                                    (SCALAR))
+                                                                (AST_ARRAY_ELEM
+                                                                    (AST_PROP
+                                                                        (AST_VAR))
+                                                                    (SCALAR))
+                                                                (AST_ARRAY_ELEM
+                                                                    (AST_PROP
+                                                                        (AST_VAR))
+                                                                    (SCALAR)))))))))))))
+                    (AST_UNSET
+                        (AST_DIM
+                            (AST_DIM
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (AST_PROP
+                                        (AST_VAR)))
+                                (SCALAR))
+                            (AST_PROP
+                                (AST_VAR))))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_METHOD_CALL
+                    (AST_VAR)))
+            (AST_FOREACH
+                (AST_DIM
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_PROP
+                            (AST_VAR)))
+                    (SCALAR))
+                (AST_VAR)
+                (NULL)
+                (
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_STATIC_CALL
+                            (
+                                (AST_PROP
+                                    (AST_VAR)))))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (SCALAR)
+                                (AST_ARRAY
+                                    (AST_ARRAY_ELEM
+                                        (AST_PROP
+                                            (AST_VAR))
+                                        (SCALAR))))))
+                    (AST_SWITCH
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (SCALAR)))
+                        (AST_SWITCH_LIST
+                            (AST_SWITCH_CASE
+                                (AST_CONST)
+                                (
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR)
+                                            (AST_PROP
+                                                (AST_VAR))))
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (SCALAR)
+                                                    (AST_ARRAY
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR))
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR))
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR)))))))
+                                    (AST_BREAK
+                                        (NULL))))
+                            (AST_SWITCH_CASE
+                                (AST_CONST)
+                                (
+                                    (AST_BREAK
+                                        (NULL))))
+                            (AST_SWITCH_CASE
+                                (AST_CONST)
+                                (
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_BINARY_OP
+                                                (AST_PROP
+                                                    (AST_VAR))
+                                                (AST_CONST))
+                                            (
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR)
+                                                    (
+                                                        (SCALAR)
+                                                        (SCALAR)
+                                                        (AST_CONST)
+                                                        (AST_ARRAY
+                                                            (AST_ARRAY_ELEM
+                                                                (AST_PROP
+                                                                    (AST_VAR))
+                                                                (SCALAR))
+                                                            (AST_ARRAY_ELEM
+                                                                (AST_PROP
+                                                                    (AST_VAR))
+                                                                (SCALAR)))))
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR)
+                                                    (
+                                                        (AST_CALL
+                                                            (
+                                                                (SCALAR)
+                                                                (SCALAR)
+                                                                (AST_ARRAY
+                                                                    (AST_ARRAY_ELEM
+                                                                        (AST_PROP
+                                                                            (AST_VAR))
+                                                                        (SCALAR))
+                                                                    (AST_ARRAY_ELEM
+                                                                        (AST_PROP
+                                                                            (AST_VAR))
+                                                                        (SCALAR))
+                                                                    (AST_ARRAY_ELEM
+                                                                        (AST_PROP
+                                                                            (AST_VAR))
+                                                                        (SCALAR))))))))))
+                                    (AST_BREAK
+                                        (NULL))))
+                            (AST_SWITCH_CASE
+                                (AST_CONST)
+                                (
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_BINARY_OP
+                                                (AST_PROP
+                                                    (AST_VAR))
+                                                (AST_CONST))
+                                            (
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR)
+                                                    (
+                                                        (SCALAR)
+                                                        (SCALAR)
+                                                        (AST_CONST)
+                                                        (AST_ARRAY
+                                                            (AST_ARRAY_ELEM
+                                                                (AST_PROP
+                                                                    (AST_VAR))
+                                                                (SCALAR))
+                                                            (AST_ARRAY_ELEM
+                                                                (AST_PROP
+                                                                    (AST_VAR))
+                                                                (SCALAR))))))))
+                                    (AST_CALL
+                                        (
+                                            (AST_ARRAY
+                                                (AST_ARRAY_ELEM
+                                                    (AST_PROP
+                                                        (AST_VAR))
+                                                    (SCALAR))
+                                                (AST_ARRAY_ELEM
+                                                    (AST_PROP
+                                                        (AST_VAR))
+                                                    (SCALAR))
+                                                (AST_ARRAY_ELEM
+                                                    (SCALAR)
+                                                    (SCALAR))
+                                                (AST_ARRAY_ELEM
+                                                    (AST_PROP
+                                                        (AST_VAR))
+                                                    (SCALAR)))))
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (SCALAR)
+                                                    (AST_ARRAY
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR))
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR))
+                                                        (AST_ARRAY_ELEM
+                                                            (AST_PROP
+                                                                (AST_VAR))
+                                                            (SCALAR)))))))
+                                    (AST_BREAK
+                                        (NULL))))))))
+            (AST_METHOD_CALL
+                (AST_VAR))))
+    (AST_METHOD_CALL
+        (AST_VAR))
+    (AST_METHOD_CALL
+        (AST_VAR)))

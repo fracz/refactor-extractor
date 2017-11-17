@@ -1,0 +1,1074 @@
+    public function save(question_engine_data_mapper $dm) {
+        $dm->delete_steps(array_keys($this->stepsdeleted), $this->quba->get_owning_context());
+
+        foreach ($this->stepsmodified as $stepinfo) {
+            list($step, $questionattemptid, $seq) = $stepinfo;
+            $dm->update_question_attempt_step($step, $questionattemptid, $seq,
+                    $this->quba->get_owning_context());
+        }
+
+        foreach ($this->stepsadded as $stepinfo) {
+            list($step, $questionattemptid, $seq) = $stepinfo;
+            $dm->insert_question_attempt_step($step, $questionattemptid, $seq,
+                    $this->quba->get_owning_context());
+        }
+
+        foreach ($this->attemptsadded as $qa) {
+            $dm->insert_question_attempt($qa, $this->quba->get_owning_context());
+        }
+
+        foreach ($this->attemptsmodified as $qa) {
+            $dm->update_question_attempt($qa);
+        }
+
+        if ($this->modified) {
+            $dm->update_questions_usage_by_activity($this->quba);
+        }
+    }
+}
+
+
+/**
+ * The interface implemented by {@link question_file_saver} and {@link question_file_loader}.
+ *
+ * @copyright  2012 The Open University
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+interface question_response_files {
+    /**
+     * Get the files that were submitted.
+     * @return array of stored_files objects.
+     */
+    public function get_files();
+}
+
+
+/**
+ * This class represents the promise to save some files from a particular draft
+ * file area into a particular file area. It is used beause the necessary
+ * information about what to save is to hand in the
+ * {@link question_attempt::process_response_files()} method, but we don't know
+ * if this question attempt will actually be saved in the database until later,
+ * when the {@link question_engine_unit_of_work} is saved, if it is.
+ *
+ * @copyright  2011 The Open University
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+class question_file_saver implements question_response_files {
+    /** @var int the id of the draft file area to save files from. */
+    protected $draftitemid;
+    /** @var string the owning component name. */
+    protected $component;
+    /** @var string the file area name. */
+    protected $filearea;
+
+    /**
+     * @var string the value to store in the question_attempt_step_data to
+     * represent these files.
+     */
+    protected $value = null;
+
+    /**
+     * Constuctor.
+     * @param int $draftitemid the draft area to save the files from.
+     * @param string $component the component for the file area to save into.
+     * @param string $filearea the name of the file area to save into.
+     */
+    public function __construct($draftitemid, $component, $filearea, $text = null) {
+        $this->draftitemid = $draftitemid;
+        $this->component = $component;
+        $this->filearea = $filearea;
+        $this->value = $this->compute_value($draftitemid, $text);
+    }
+
+    /**
+     * Compute the value that should be stored in the question_attempt_step_data
+     * table. Contains a hash that (almost) uniquely encodes all the files.
+     * @param int $draftitemid the draft file area itemid.
+     * @param string $text optional content containing file links.
+     */
+    protected function compute_value($draftitemid, $text) {
+        global $USER;
+
+        $fs = get_file_storage();
+        $usercontext = context_user::instance($USER->id);
+
+        $files = $fs->get_area_files($usercontext->id, 'user', 'draft',
+                $draftitemid, 'sortorder, filepath, filename', false);
+
+        $string = '';
+        foreach ($files as $file) {
+            $string .= $file->get_filepath() . $file->get_filename() . '|' .
+                    $file->get_contenthash() . '|';
+        }
+        $hash = md5($string);
+
+        if (is_null($text)) {
+            if ($string) {
+                return $hash;
+            } else {
+                return '';
+            }
+        }
+
+        // We add the file hash so a simple string comparison will say if the
+        // files have been changed. First strip off any existing file hash.
+        if ($text !== '') {
+            $text = preg_replace('/\s*<!-- File hash: \w+ -->\s*$/', '', $text);
+            $text = file_rewrite_urls_to_pluginfile($text, $draftitemid);
+            if ($string) {
+                $text .= '<!-- File hash: ' . $hash . ' -->';
+            }
+        }
+        return $text;
+    }
+
+    public function __toString() {
+        return $this->value;
+    }
+
+    /**
+     * Actually save the files.
+     * @param integer $itemid the item id for the file area to save into.
+     */
+    public function save_files($itemid, $context) {
+        file_save_draft_area_files($this->draftitemid, $context->id,
+                $this->component, $this->filearea, $itemid);
+    }
+
+    /**
+     * Get the files that were submitted.
+     * @return array of stored_files objects.
+     */
+    public function get_files() {
+        global $USER;
+
+        $fs = get_file_storage();
+        $usercontext = context_user::instance($USER->id);
+
+        return $fs->get_area_files($usercontext->id, 'user', 'draft',
+                $this->draftitemid, 'sortorder, filepath, filename', false);
+    }
+}
+
+
+/**
+ * This class is the mirror image of {@link question_file_saver}. It allows
+ * files to be accessed again later (e.g. when re-grading) using that same
+ * API as when doing the original grading.
+ *
+ * @copyright  2012 The Open University
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+class question_file_loader implements question_response_files {
+    /** @var question_attempt_step the step that these files belong to. */
+    protected $step;
+
+    /** @var string the field name for these files - which is used to construct the file area name. */
+    protected $name;
+
+    /**
+    * @var string the value to stored in the question_attempt_step_data to
+     * represent these files.
+    */
+    protected $value;
+
+    /** @var int the context id that the files belong to. */
+    protected $contextid;
+
+    /**
+     * Constuctor.
+     * @param question_attempt_step $step the step that these files belong to.
+     * @param string $name string the field name for these files - which is used to construct the file area name.
+     * @param string $value the value to stored in the question_attempt_step_data to
+     *      represent these files.
+     * @param int $contextid the context id that the files belong to.
+     */
+    public function __construct(question_attempt_step $step, $name, $value, $contextid) {
+        $this->step = $step;
+        $this->name = $name;
+        $this->value = $value;
+        $this->contextid = $contextid;
+    }
+
+    public function __toString() {
+        return $this->value;
+    }
+
+    /**
+     * Get the files that were submitted.
+     * @return array of stored_files objects.
+     */
+    public function get_files() {
+        return $this->step->get_qt_files($this->name, $this->contextid);
+    }
+
+    /**
+     * Copy these files into a draft area, and return the corresponding
+     * {@link question_file_saver} that can save them again.
+     *
+     * This is used by {@link question_attempt::start_based_on()}, which is used
+     * (for example) by the quizzes 'Each attempt builds on last' feature.
+     *
+     * @return question_file_saver that can re-save these files again.
+     */
+    public function get_question_file_saver() {
+
+        // There are three possibilities here for what $value will look like:
+        // 1) some HTML content followed by an MD5 hash in a HTML comment;
+        // 2) a plain MD5 hash;
+        // 3) or some real content, without any hash.
+        // The problem is that 3) is ambiguous in the case where a student writes
+        // a response that looks exactly like an MD5 hash. For attempts made now,
+        // we avoid case 3) by always going for case 1) or 2) (except when the
+        // response is blank. However, there may be case 3) data in the database
+        // so we need to handle it as best we can.
+        if (preg_match('/\s*<!-- File hash: [0-9a-zA-Z]{32} -->\s*$/', $this->value)) {
+            $value = preg_replace('/\s*<!-- File hash: [0-9a-zA-Z]{32} -->\s*$/', '', $this->value);
+
+        } else if (preg_match('/^[0-9a-zA-Z]{32}$/', $this->value)) {
+            $value = null;
+
+        } else {
+            $value = $this->value;
+        }
+
+        list($draftid, $text) = $this->step->prepare_response_files_draft_itemid_with_text(
+                $this->name, $this->contextid, $value);
+        return new question_file_saver($draftid, 'question', 'response_' . $this->name, $text);
+    }
+}
+
+
+/**
+ * This class represents a restriction on the set of question_usage ids to include
+ * in a larger database query. Depending of the how you are going to restrict the
+ * list of usages, construct an appropriate subclass.
+ *
+ * If $qubaids is an instance of this class, example usage might be
+ *
+ * SELECT qa.id, qa.maxmark
+ * FROM $qubaids->from_question_attempts('qa')
+ * WHERE $qubaids->where() AND qa.slot = 1
+ *
+ * @copyright  2010 The Open University
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+abstract class qubaid_condition {
+
+    /**
+     * @return string the SQL that needs to go in the FROM clause when trying
+     * to select records from the 'question_attempts' table based on the
+     * qubaid_condition.
+     */
+    public abstract function from_question_attempts($alias);
+
+    /** @return string the SQL that needs to go in the where clause. */
+    public abstract function where();
+
+    /**
+     * @return the params needed by a query that uses
+     * {@link from_question_attempts()} and {@link where()}.
+     */
+    public abstract function from_where_params();
+
+    /**
+     * @return string SQL that can use used in a WHERE qubaid IN (...) query.
+     * This method returns the "IN (...)" part.
+     */
+    public abstract function usage_id_in();
+
+    /**
+     * @return the params needed by a query that uses {@link usage_id_in()}.
+     */
+    public abstract function usage_id_in_params();
+
+    /**
+     * @return string 40-character hash code that uniquely identifies the combination of properties and class name of this qubaid
+     *                  condition.
+     */
+    public function get_hash_code() {
+        return sha1(serialize($this));
+    }
+}
+
+
+/**
+ * This class represents a restriction on the set of question_usage ids to include
+ * in a larger database query based on an explicit list of ids.
+ *
+ * @copyright  2010 The Open University
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+class qubaid_list extends qubaid_condition {
+    /** @var array of ids. */
+    protected $qubaids;
+    protected $columntotest = null;
+    protected $params;
+
+    /**
+     * Constructor.
+     * @param array $qubaids of question usage ids.
+     */
+    public function __construct(array $qubaids) {
+        $this->qubaids = $qubaids;
+    }
+
+    public function from_question_attempts($alias) {
+        $this->columntotest = $alias . '.questionusageid';
+        return '{question_attempts} ' . $alias;
+    }
+
+    public function where() {
+        global $DB;
+
+        if (is_null($this->columntotest)) {
+            throw new coding_exception('Must call from_question_attempts before where().');
+        }
+        if (empty($this->qubaids)) {
+            $this->params = array();
+            return '1 = 0';
+        }
+
+        return $this->columntotest . ' ' . $this->usage_id_in();
+    }
+
+    public function from_where_params() {
+        return $this->params;
+    }
+
+    public function usage_id_in() {
+        global $DB;
+
+        if (empty($this->qubaids)) {
+            $this->params = array();
+            return '= 0';
+        }
+        list($where, $this->params) = $DB->get_in_or_equal(
+                $this->qubaids, SQL_PARAMS_NAMED, 'qubaid');
+        return $where;
+    }
+
+    public function usage_id_in_params() {
+        return $this->params;
+    }
+}
+
+
+/**
+ * This class represents a restriction on the set of question_usage ids to include
+ * in a larger database query based on JOINing to some other tables.
+ *
+ * The general form of the query is something like
+ *
+ * SELECT qa.id, qa.maxmark
+ * FROM $from
+ * JOIN {question_attempts} qa ON qa.questionusageid = $usageidcolumn
+ * WHERE $where AND qa.slot = 1
+ *
+ * where $from, $usageidcolumn and $where are the arguments to the constructor.
+ *
+ * @copyright  2010 The Open University
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+class qubaid_join extends qubaid_condition {
+    public $from;
+    public $usageidcolumn;
+    public $where;
+    public $params;
+
+    /**
+     * Constructor. The meaning of the arguments is explained in the class comment.
+     * @param string $from SQL fragemnt to go in the FROM clause.
+     * @param string $usageidcolumn the column in $from that should be
+     * made equal to the usageid column in the JOIN clause.
+     * @param string $where SQL fragment to go in the where clause.
+     * @param array $params required by the SQL. You must use named parameters.
+     */
+    public function __construct($from, $usageidcolumn, $where = '', $params = array()) {
+        $this->from = $from;
+        $this->usageidcolumn = $usageidcolumn;
+        $this->params = $params;
+        if (empty($where)) {
+            $where = '1 = 1';
+        }
+        $this->where = $where;
+    }
+
+    public function from_question_attempts($alias) {
+        return "{$this->from}
+                JOIN {question_attempts} {$alias} ON " .
+                        "{$alias}.questionusageid = $this->usageidcolumn";
+    }
+
+    public function where() {
+        return $this->where;
+    }
+
+    public function from_where_params() {
+        return $this->params;
+    }
+
+    public function usage_id_in() {
+        return "IN (SELECT {$this->usageidcolumn} FROM {$this->from} WHERE {$this->where})";
+    }
+
+    public function usage_id_in_params() {
+        return $this->params;
+    }
+}||||||||    public function save(question_engine_data_mapper $dm) {
+        $dm->delete_steps(array_keys($this->stepsdeleted), $this->quba->get_owning_context());
+
+        // Initially an array of array of question_attempt_step_objects.
+        // Built as a nested array for efficiency, then flattened.
+        $stepdata = array();
+
+        foreach ($this->stepsmodified as $stepinfo) {
+            list($step, $questionattemptid, $seq) = $stepinfo;
+            $stepdata[] = $dm->update_question_attempt_step(
+                    $step, $questionattemptid, $seq, $this->quba->get_owning_context());
+        }
+
+        foreach ($this->stepsadded as $stepinfo) {
+            list($step, $questionattemptid, $seq) = $stepinfo;
+            $stepdata[] = $dm->insert_question_attempt_step(
+                    $step, $questionattemptid, $seq, $this->quba->get_owning_context());
+        }
+
+        foreach ($this->attemptsadded as $qa) {
+            $stepdata[] = $dm->insert_question_attempt(
+                    $qa, $this->quba->get_owning_context());
+        }
+
+        foreach ($this->attemptsmodified as $qa) {
+            $dm->update_question_attempt($qa);
+        }
+
+        if ($this->modified) {
+            $dm->update_questions_usage_by_activity($this->quba);
+        }
+
+        if (!$stepdata) {
+            return;
+        }
+        $dm->insert_all_step_data(call_user_func_array('array_merge', $stepdata));
+    }
+}
+
+
+/**
+ * The interface implemented by {@link question_file_saver} and {@link question_file_loader}.
+ *
+ * @copyright  2012 The Open University
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+interface question_response_files {
+    /**
+     * Get the files that were submitted.
+     * @return array of stored_files objects.
+     */
+    public function get_files();
+}
+
+
+/**
+ * This class represents the promise to save some files from a particular draft
+ * file area into a particular file area. It is used beause the necessary
+ * information about what to save is to hand in the
+ * {@link question_attempt::process_response_files()} method, but we don't know
+ * if this question attempt will actually be saved in the database until later,
+ * when the {@link question_engine_unit_of_work} is saved, if it is.
+ *
+ * @copyright  2011 The Open University
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+class question_file_saver implements question_response_files {
+    /** @var int the id of the draft file area to save files from. */
+    protected $draftitemid;
+    /** @var string the owning component name. */
+    protected $component;
+    /** @var string the file area name. */
+    protected $filearea;
+
+    /**
+     * @var string the value to store in the question_attempt_step_data to
+     * represent these files.
+     */
+    protected $value = null;
+
+    /**
+     * Constuctor.
+     * @param int $draftitemid the draft area to save the files from.
+     * @param string $component the component for the file area to save into.
+     * @param string $filearea the name of the file area to save into.
+     */
+    public function __construct($draftitemid, $component, $filearea, $text = null) {
+        $this->draftitemid = $draftitemid;
+        $this->component = $component;
+        $this->filearea = $filearea;
+        $this->value = $this->compute_value($draftitemid, $text);
+    }
+
+    /**
+     * Compute the value that should be stored in the question_attempt_step_data
+     * table. Contains a hash that (almost) uniquely encodes all the files.
+     * @param int $draftitemid the draft file area itemid.
+     * @param string $text optional content containing file links.
+     */
+    protected function compute_value($draftitemid, $text) {
+        global $USER;
+
+        $fs = get_file_storage();
+        $usercontext = context_user::instance($USER->id);
+
+        $files = $fs->get_area_files($usercontext->id, 'user', 'draft',
+                $draftitemid, 'sortorder, filepath, filename', false);
+
+        $string = '';
+        foreach ($files as $file) {
+            $string .= $file->get_filepath() . $file->get_filename() . '|' .
+                    $file->get_contenthash() . '|';
+        }
+        $hash = md5($string);
+
+        if (is_null($text)) {
+            if ($string) {
+                return $hash;
+            } else {
+                return '';
+            }
+        }
+
+        // We add the file hash so a simple string comparison will say if the
+        // files have been changed. First strip off any existing file hash.
+        if ($text !== '') {
+            $text = preg_replace('/\s*<!-- File hash: \w+ -->\s*$/', '', $text);
+            $text = file_rewrite_urls_to_pluginfile($text, $draftitemid);
+            if ($string) {
+                $text .= '<!-- File hash: ' . $hash . ' -->';
+            }
+        }
+        return $text;
+    }
+
+    public function __toString() {
+        return $this->value;
+    }
+
+    /**
+     * Actually save the files.
+     * @param integer $itemid the item id for the file area to save into.
+     */
+    public function save_files($itemid, $context) {
+        file_save_draft_area_files($this->draftitemid, $context->id,
+                $this->component, $this->filearea, $itemid);
+    }
+
+    /**
+     * Get the files that were submitted.
+     * @return array of stored_files objects.
+     */
+    public function get_files() {
+        global $USER;
+
+        $fs = get_file_storage();
+        $usercontext = context_user::instance($USER->id);
+
+        return $fs->get_area_files($usercontext->id, 'user', 'draft',
+                $this->draftitemid, 'sortorder, filepath, filename', false);
+    }
+}
+
+
+/**
+ * This class is the mirror image of {@link question_file_saver}. It allows
+ * files to be accessed again later (e.g. when re-grading) using that same
+ * API as when doing the original grading.
+ *
+ * @copyright  2012 The Open University
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+class question_file_loader implements question_response_files {
+    /** @var question_attempt_step the step that these files belong to. */
+    protected $step;
+
+    /** @var string the field name for these files - which is used to construct the file area name. */
+    protected $name;
+
+    /**
+    * @var string the value to stored in the question_attempt_step_data to
+     * represent these files.
+    */
+    protected $value;
+
+    /** @var int the context id that the files belong to. */
+    protected $contextid;
+
+    /**
+     * Constuctor.
+     * @param question_attempt_step $step the step that these files belong to.
+     * @param string $name string the field name for these files - which is used to construct the file area name.
+     * @param string $value the value to stored in the question_attempt_step_data to
+     *      represent these files.
+     * @param int $contextid the context id that the files belong to.
+     */
+    public function __construct(question_attempt_step $step, $name, $value, $contextid) {
+        $this->step = $step;
+        $this->name = $name;
+        $this->value = $value;
+        $this->contextid = $contextid;
+    }
+
+    public function __toString() {
+        return $this->value;
+    }
+
+    /**
+     * Get the files that were submitted.
+     * @return array of stored_files objects.
+     */
+    public function get_files() {
+        return $this->step->get_qt_files($this->name, $this->contextid);
+    }
+
+    /**
+     * Copy these files into a draft area, and return the corresponding
+     * {@link question_file_saver} that can save them again.
+     *
+     * This is used by {@link question_attempt::start_based_on()}, which is used
+     * (for example) by the quizzes 'Each attempt builds on last' feature.
+     *
+     * @return question_file_saver that can re-save these files again.
+     */
+    public function get_question_file_saver() {
+
+        // There are three possibilities here for what $value will look like:
+        // 1) some HTML content followed by an MD5 hash in a HTML comment;
+        // 2) a plain MD5 hash;
+        // 3) or some real content, without any hash.
+        // The problem is that 3) is ambiguous in the case where a student writes
+        // a response that looks exactly like an MD5 hash. For attempts made now,
+        // we avoid case 3) by always going for case 1) or 2) (except when the
+        // response is blank. However, there may be case 3) data in the database
+        // so we need to handle it as best we can.
+        if (preg_match('/\s*<!-- File hash: [0-9a-zA-Z]{32} -->\s*$/', $this->value)) {
+            $value = preg_replace('/\s*<!-- File hash: [0-9a-zA-Z]{32} -->\s*$/', '', $this->value);
+
+        } else if (preg_match('/^[0-9a-zA-Z]{32}$/', $this->value)) {
+            $value = null;
+
+        } else {
+            $value = $this->value;
+        }
+
+        list($draftid, $text) = $this->step->prepare_response_files_draft_itemid_with_text(
+                $this->name, $this->contextid, $value);
+        return new question_file_saver($draftid, 'question', 'response_' . $this->name, $text);
+    }
+}
+
+
+/**
+ * This class represents a restriction on the set of question_usage ids to include
+ * in a larger database query. Depending of the how you are going to restrict the
+ * list of usages, construct an appropriate subclass.
+ *
+ * If $qubaids is an instance of this class, example usage might be
+ *
+ * SELECT qa.id, qa.maxmark
+ * FROM $qubaids->from_question_attempts('qa')
+ * WHERE $qubaids->where() AND qa.slot = 1
+ *
+ * @copyright  2010 The Open University
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+abstract class qubaid_condition {
+
+    /**
+     * @return string the SQL that needs to go in the FROM clause when trying
+     * to select records from the 'question_attempts' table based on the
+     * qubaid_condition.
+     */
+    public abstract function from_question_attempts($alias);
+
+    /** @return string the SQL that needs to go in the where clause. */
+    public abstract function where();
+
+    /**
+     * @return the params needed by a query that uses
+     * {@link from_question_attempts()} and {@link where()}.
+     */
+    public abstract function from_where_params();
+
+    /**
+     * @return string SQL that can use used in a WHERE qubaid IN (...) query.
+     * This method returns the "IN (...)" part.
+     */
+    public abstract function usage_id_in();
+
+    /**
+     * @return the params needed by a query that uses {@link usage_id_in()}.
+     */
+    public abstract function usage_id_in_params();
+
+    /**
+     * @return string 40-character hash code that uniquely identifies the combination of properties and class name of this qubaid
+     *                  condition.
+     */
+    public function get_hash_code() {
+        return sha1(serialize($this));
+    }
+}
+
+
+/**
+ * This class represents a restriction on the set of question_usage ids to include
+ * in a larger database query based on an explicit list of ids.
+ *
+ * @copyright  2010 The Open University
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+class qubaid_list extends qubaid_condition {
+    /** @var array of ids. */
+    protected $qubaids;
+    protected $columntotest = null;
+    protected $params;
+
+    /**
+     * Constructor.
+     * @param array $qubaids of question usage ids.
+     */
+    public function __construct(array $qubaids) {
+        $this->qubaids = $qubaids;
+    }
+
+    public function from_question_attempts($alias) {
+        $this->columntotest = $alias . '.questionusageid';
+        return '{question_attempts} ' . $alias;
+    }
+
+    public function where() {
+        global $DB;
+
+        if (is_null($this->columntotest)) {
+            throw new coding_exception('Must call from_question_attempts before where().');
+        }
+        if (empty($this->qubaids)) {
+            $this->params = array();
+            return '1 = 0';
+        }
+
+        return $this->columntotest . ' ' . $this->usage_id_in();
+    }
+
+    public function from_where_params() {
+        return $this->params;
+    }
+
+    public function usage_id_in() {
+        global $DB;
+
+        if (empty($this->qubaids)) {
+            $this->params = array();
+            return '= 0';
+        }
+        list($where, $this->params) = $DB->get_in_or_equal(
+                $this->qubaids, SQL_PARAMS_NAMED, 'qubaid');
+        return $where;
+    }
+
+    public function usage_id_in_params() {
+        return $this->params;
+    }
+}
+
+
+/**
+ * This class represents a restriction on the set of question_usage ids to include
+ * in a larger database query based on JOINing to some other tables.
+ *
+ * The general form of the query is something like
+ *
+ * SELECT qa.id, qa.maxmark
+ * FROM $from
+ * JOIN {question_attempts} qa ON qa.questionusageid = $usageidcolumn
+ * WHERE $where AND qa.slot = 1
+ *
+ * where $from, $usageidcolumn and $where are the arguments to the constructor.
+ *
+ * @copyright  2010 The Open University
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+class qubaid_join extends qubaid_condition {
+    public $from;
+    public $usageidcolumn;
+    public $where;
+    public $params;
+
+    /**
+     * Constructor. The meaning of the arguments is explained in the class comment.
+     * @param string $from SQL fragemnt to go in the FROM clause.
+     * @param string $usageidcolumn the column in $from that should be
+     * made equal to the usageid column in the JOIN clause.
+     * @param string $where SQL fragment to go in the where clause.
+     * @param array $params required by the SQL. You must use named parameters.
+     */
+    public function __construct($from, $usageidcolumn, $where = '', $params = array()) {
+        $this->from = $from;
+        $this->usageidcolumn = $usageidcolumn;
+        $this->params = $params;
+        if (empty($where)) {
+            $where = '1 = 1';
+        }
+        $this->where = $where;
+    }
+
+    public function from_question_attempts($alias) {
+        return "{$this->from}
+                JOIN {question_attempts} {$alias} ON " .
+                        "{$alias}.questionusageid = $this->usageidcolumn";
+    }
+
+    public function where() {
+        return $this->where;
+    }
+
+    public function from_where_params() {
+        return $this->params;
+    }
+
+    public function usage_id_in() {
+        return "IN (SELECT {$this->usageidcolumn} FROM {$this->from} WHERE {$this->where})";
+    }
+
+    public function usage_id_in_params() {
+        return $this->params;
+    }
+}||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_CALL
+                (
+                    (AST_PROP
+                        (AST_VAR))))
+            (AST_METHOD_CALL
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_FOREACH
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_ASSIGN
+                (AST_ARRAY
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (NULL))
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (NULL))
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (NULL)))
+                (AST_VAR))
+            (AST_METHOD_CALL
+                (AST_VAR)
+                (
+                    (AST_VAR)
+                    (AST_VAR)
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_PROP
+                            (AST_VAR)))))))
+    (AST_FOREACH
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_ASSIGN
+                (AST_ARRAY
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (NULL))
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (NULL))
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (NULL)))
+                (AST_VAR))
+            (AST_METHOD_CALL
+                (AST_VAR)
+                (
+                    (AST_VAR)
+                    (AST_VAR)
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_PROP
+                            (AST_VAR)))))))
+    (AST_FOREACH
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_METHOD_CALL
+                (AST_VAR)
+                (
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_PROP
+                            (AST_VAR)))))))
+    (AST_FOREACH
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_METHOD_CALL
+                (AST_VAR)
+                (
+                    (AST_VAR)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_PROP
+                (AST_VAR))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_PROP
+                            (AST_VAR))))))))||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_CALL
+                (
+                    (AST_PROP
+                        (AST_VAR))))
+            (AST_METHOD_CALL
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_FOREACH
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_ASSIGN
+                (AST_ARRAY
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (NULL))
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (NULL))
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (NULL)))
+                (AST_VAR))
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_VAR)
+                    (NULL))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_METHOD_CALL
+                            (AST_PROP
+                                (AST_VAR))))))))
+    (AST_FOREACH
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_ASSIGN
+                (AST_ARRAY
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (NULL))
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (NULL))
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (NULL)))
+                (AST_VAR))
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_VAR)
+                    (NULL))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_METHOD_CALL
+                            (AST_PROP
+                                (AST_VAR))))))))
+    (AST_FOREACH
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_VAR)
+                    (NULL))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_METHOD_CALL
+                            (AST_PROP
+                                (AST_VAR))))))))
+    (AST_FOREACH
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_METHOD_CALL
+                (AST_VAR)
+                (
+                    (AST_VAR)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_PROP
+                (AST_VAR))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_PROP
+                            (AST_VAR)))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_VAR))
+            (
+                (AST_RETURN
+                    (NULL)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_CALL
+                (
+                    (SCALAR)
+                    (AST_VAR))))))

@@ -1,0 +1,3179 @@
+	public function __construct(Generator $generator)
+	{
+		$this->generator = $generator;
+		$this->config = $generator->getConfig();
+
+		$that = $this;
+
+		// Output in HTML5
+		Nette\Utils\Html::$xhtml = false;
+
+		// FSHL
+		$fshl = new FSHL\Highlighter(new FSHL\Output\Html());
+		$fshl->setLexer(new FSHL\Lexer\Php());
+
+		// Texy
+		$this->texy = new \Texy();
+		$this->texy->allowedTags = array_flip($this->config->allowedHtml);
+		$this->texy->allowed['list/definition'] = false;
+		$this->texy->allowed['phrase/em-alt'] = false;
+		$this->texy->allowed['longwords'] = false;
+		$this->texy->allowed['typography'] = false;
+		$this->texy->linkModule->shorten = false;
+		// Highlighting <code>, <pre>
+		$this->texy->addHandler('beforeParse', function($texy, &$text, $singleLine) {
+			$text = preg_replace('~<code>(.+?)</code>~', '#code#\\1#/code#', $text);
+		});
+		$this->texy->registerLinePattern(
+			function($parser, $matches, $name) use ($fshl) {
+				return \TexyHtml::el('code', $fshl->highlight($matches[1]));
+			},
+			'~#code#(.+?)#/code#~',
+			'codeInlineSyntax'
+		);
+		$this->texy->registerBlockPattern(
+			function($parser, $matches, $name) use ($fshl) {
+				if ('code' === $matches[1]) {
+					$lines = array_filter(explode("\n", $matches[2]));
+					if (!empty($lines)) {
+						$firstLine = array_shift($lines);
+
+						$indent = '';
+						$li = 0;
+
+						while (isset($firstLine[$li]) && preg_match('~\s~', $firstLine[$li])) {
+							foreach ($lines as $line) {
+								if (!isset($line[$li]) || $firstLine[$li] !== $line[$li]) {
+									break 2;
+								}
+							}
+
+							$indent .= $firstLine[$li++];
+						}
+
+						if (!empty($indent)) {
+							$matches[2] = str_replace(
+								"\n" . $indent,
+								"\n",
+								0 === strpos($matches[2], $indent) ? substr($matches[2], $li) : $matches[2]
+							);
+						}
+					}
+
+					$content = $fshl->highlight($matches[2]);
+				} else {
+					$content = htmlspecialchars($matches[2]);
+				}
+
+				$content = $parser->getTexy()->protect($content, \Texy::CONTENT_BLOCK);
+				return \TexyHtml::el('pre', $content);
+			},
+			'~<(code|pre)>(.+?)</\1>~s',
+			'codeBlockSyntax'
+		);
+
+		// Common operations
+		$this->registerHelperLoader('Nette\Templating\Helpers::loader');
+
+		// PHP source highlight
+		$this->registerHelper('highlightPHP', function($source, $context) use ($that, $fshl) {
+			return $that->resolveLink($that->getTypeName($source), $context) ?: $fshl->highlight((string) $source);
+		});
+		$this->registerHelper('highlightValue', function($definition, $context) use ($that) {
+			return $that->highlightPHP(preg_replace('~^(?:[ ]{4}|\t)~m', '', $definition), $context);
+		});
+
+		// Urls
+		$this->registerHelper('packageUrl', new Nette\Callback($this, 'getPackageUrl'));
+		$this->registerHelper('namespaceUrl', new Nette\Callback($this, 'getNamespaceUrl'));
+		$this->registerHelper('groupUrl', new Nette\Callback($this, 'getGroupUrl'));
+		$this->registerHelper('classUrl', new Nette\Callback($this, 'getClassUrl'));
+		$this->registerHelper('methodUrl', new Nette\Callback($this, 'getMethodUrl'));
+		$this->registerHelper('propertyUrl', new Nette\Callback($this, 'getPropertyUrl'));
+		$this->registerHelper('constantUrl', new Nette\Callback($this, 'getConstantUrl'));
+		$this->registerHelper('functionUrl', new Nette\Callback($this, 'getFunctionUrl'));
+		$this->registerHelper('elementUrl', new Nette\Callback($this, 'getElementUrl'));
+		$this->registerHelper('sourceUrl', new Nette\Callback($this, 'getSourceUrl'));
+		$this->registerHelper('manualUrl', new Nette\Callback($this, 'getManualUrl'));
+
+		// Packages & namespaces
+		$this->registerHelper('packageLinks', new Nette\Callback($this, 'getPackageLinks'));
+		$this->registerHelper('namespaceLinks', new Nette\Callback($this, 'getNamespaceLinks'));
+		$this->registerHelper('subgroupName', function($groupName) {
+			if ($pos = strrpos($groupName, '\\')) {
+				return substr($groupName, $pos + 1);
+			}
+			return $groupName;
+		});
+
+		// Types
+		$this->registerHelper('typeLinks', new Nette\Callback($this, 'getTypeLinks'));
+		$this->registerHelper('type', function($value) use ($that) {
+			$type = $that->getTypeName(gettype($value));
+			return 'null' !== $type ? $type : '';
+		});
+
+		// Docblock descriptions
+		$this->registerHelper('description', function($annotation, $context) use ($that) {
+			$description = trim(strpbrk($annotation, "\n\r\t $"));
+
+			if ($context instanceof ReflectionParameter) {
+				$description = preg_replace('~^(\\$' . $context->getName() . '(?:,\\.{3})?)(\s+|$)~i', '\\2', $description, 1);
+				$context = $context->getDeclaringFunction();
+			}
+			return $that->doc($description, $context);
+		});
+		$this->registerHelper('shortDescription', function($element, $block = false) use ($that) {
+			return $that->doc($element->getShortDescription(), $element, $block);
+		});
+		$this->registerHelper('longDescription', function($element) use ($that) {
+			$long = $element->getLongDescription();
+
+			// Merge lines
+			$long = preg_replace_callback('~(?:<(code|pre)>.+?</\1>)|([^<]*)~s', function($matches) {
+				return !empty($matches[2])
+					? preg_replace('~\n(?:\t|[ ])+~', ' ', $matches[2])
+					: $matches[0];
+			}, $long);
+
+			return $that->doc($long, $element, true);
+		});
+
+		// Individual annotations processing
+		$this->registerHelper('annotation', function($value, $name, $context) use ($that, $generator) {
+			switch ($name) {
+				case 'param':
+				case 'return':
+				case 'throws':
+					$description = $that->description($value, $context);
+					return sprintf('<code>%s</code>%s', $that->getTypeLinks($value, $context), $description ? '<br>' . $description : '');
+				case 'license':
+					list($url, $description) = $that->split($value);
+					return $that->link($url, $description ?: $url);
+				case 'link':
+					list($url, $description) = $that->split($value);
+					if (Nette\Utils\Validators::isUrl($url)) {
+						return $that->link($url, $description ?: $url);
+					}
+					break;
+				case 'see':
+					$doc = array();
+					foreach (preg_split('~\\s*,\\s*~', $value) as $link) {
+						if (null !== $generator->resolveElement($link, $context)) {
+							$doc[] = sprintf('<code>%s</code>', $that->getTypeLinks($link, $context));
+						} else {
+							$doc[] = $that->doc($link, $context);
+						}
+					}
+					return implode(', ', $doc);
+				case 'uses':
+				case 'usedby':
+					list($link, $description) = $that->split($value);
+					$separator = $context instanceof ReflectionClass || !$description ? ' ' : '<br>';
+					if (null !== $generator->resolveElement($link, $context)) {
+						return sprintf('<code>%s</code>%s%s', $that->getTypeLinks($link, $context), $separator, $description);
+					}
+					break;
+				default:
+					break;
+			}
+
+			// Default
+			return $that->doc($value, $context);
+		});
+
+		$todo = $this->config->todo;
+		$internal = $this->config->internal;
+		$this->registerHelper('annotationFilter', function(array $annotations, array $filter = array()) use ($todo, $internal) {
+			// Filtered, unsupported or deprecated annotations
+			static $filtered = array(
+				'package', 'subpackage', 'property', 'property-read', 'property-write', 'method', 'abstract',
+				'access', 'final', 'filesource', 'global', 'name', 'static', 'staticvar'
+			);
+			foreach ($filtered as $annotation) {
+				unset($annotations[$annotation]);
+			}
+
+			// Custom filter
+			foreach ($filter as $annotation) {
+				unset($annotations[$annotation]);
+			}
+
+			// Show/hide internal
+			if (!$internal) {
+				unset($annotations['internal']);
+			}
+
+			// Show/hide tasks
+			if (!$todo) {
+				unset($annotations['todo']);
+			}
+
+			return $annotations;
+		});
+
+		$this->registerHelper('annotationSort', function(array $annotations) {
+			uksort($annotations, function($one, $two) {
+				static $order = array(
+					'deprecated' => 0, 'category' => 1, 'copyright' => 2, 'license' => 3, 'author' => 4, 'version' => 5,
+					'since' => 6, 'see' => 7, 'uses' => 8, 'usedby' => 9, 'link' => 10, 'internal' => 11,
+					'example' => 12, 'tutorial' => 13, 'todo' => 14
+				);
+
+				if (isset($order[$one], $order[$two])) {
+					return $order[$one] - $order[$two];
+				} elseif (isset($order[$one])) {
+					return -1;
+				} elseif (isset($order[$two])) {
+					return 1;
+				} else {
+					return strcasecmp($one, $two);
+				}
+			});
+			return $annotations;
+		});
+
+		$this->registerHelper('annotationBeautify', function($annotation) {
+			static $names = array(
+				'usedby' => 'Used by'
+			);
+
+			if (isset($names[$annotation])) {
+				return $names[$annotation];
+			}
+
+			return Nette\Utils\Strings::firstUpper($annotation);
+		});
+
+		// Static files versioning
+		$destination = $this->config->destination;
+		$this->registerHelper('staticFile', function($name) use ($destination) {
+			static $versions = array();
+
+			$filename = $destination . DIRECTORY_SEPARATOR . $name;
+			if (!isset($versions[$filename]) && is_file($filename)) {
+				$versions[$filename] = sprintf('%u', crc32(file_get_contents($filename)));
+			}
+			if (isset($versions[$filename])) {
+				$name .= '?' . $versions[$filename];
+			}
+			return $name;
+		});
+
+		// Source anchors
+		$this->registerHelper('sourceAnchors', function($source) {
+			// Classes, interfaces, traits and exceptions
+			$source = preg_replace_callback('~(<span\\s+class="php-keyword1">(?:class|interface|trait)</span>\\s+)(\\w+)~i', function($matches) {
+				$link = sprintf('<a id="%1$s" href="#%1$s">%1$s</a>', $matches[2]);
+				return $matches[1] . $link;
+			}, $source);
+
+			// Methods and functions
+			$source = preg_replace_callback('~(<span\\s+class="php-keyword1">function</span>\\s+)(\\w+)~i', function($matches) {
+				$link = sprintf('<a id="_%1$s" href="#_%1$s">%1$s</a>', $matches[2]);
+				return $matches[1] . $link;
+			}, $source);
+
+			// Constants
+			$source = preg_replace_callback('~(<span class="php-keyword1">const</span>)(.*?)(;)~is', function($matches) {
+				$links = preg_replace_callback('~(\\s|,)([A-Z_]+)(\\s+=)~', function($matches) {
+					return $matches[1] . sprintf('<a id="%1$s" href="#%1$s">%1$s</a>', $matches[2]) . $matches[3];
+				}, $matches[2]);
+				return $matches[1] . $links . $matches[3];
+			}, $source);
+
+			// Properties
+			$source = preg_replace_callback('~(<span\\s+class="php-keyword1">(?:private|protected|public|var|static)</span>\\s+)(<span\\s+class="php-var">.*?)(;)~is', function($matches) {
+				$links = preg_replace_callback('~(<span\\s+class="php-var">)(\\$\\w+)~i', function($matches) {
+					return $matches[1] . sprintf('<a id="%1$s" href="#%1$s">%1$s</a>', $matches[2]);
+				}, $matches[2]);
+				return $matches[1] . $links . $matches[3];
+			}, $source);
+
+			return $source;
+		});
+
+		$this->registerHelper('urlize', array($this, 'urlize'));
+
+		$this->registerHelper('relativePath', array($generator, 'getRelativePath'));
+		$this->registerHelper('resolveElement', array($generator, 'resolveElement'));
+		$this->registerHelper('getClass', array($generator, 'getClass'));
+	}
+
+	/**
+	 * Returns unified type value definition (class name or member data type).
+	 *
+	 * @param string $name
+	 * @param boolean $trimNamespaceSeparator
+	 * @return string
+	 */
+||||||||	public function __construct(Generator $generator)
+	{
+		$this->generator = $generator;
+		$this->config = $generator->getConfig();
+
+		$that = $this;
+
+		// Output in HTML5
+		Nette\Utils\Html::$xhtml = false;
+
+		// FSHL
+		$fshl = new FSHL\Highlighter(new FSHL\Output\Html());
+		$fshl->setLexer(new FSHL\Lexer\Php());
+
+		// Texy
+		$this->texy = new \Texy();
+		$this->texy->allowedTags = array_flip($this->config->allowedHtml);
+		$this->texy->allowed['list/definition'] = false;
+		$this->texy->allowed['phrase/em-alt'] = false;
+		$this->texy->allowed['longwords'] = false;
+		$this->texy->allowed['typography'] = false;
+		$this->texy->linkModule->shorten = false;
+		// Highlighting <code>, <pre>
+		$this->texy->addHandler('beforeParse', function($texy, &$text, $singleLine) {
+			$text = preg_replace('~<code>(.+?)</code>~', '#code#\\1#/code#', $text);
+		});
+		$this->texy->registerLinePattern(
+			function($parser, $matches, $name) use ($fshl) {
+				return \TexyHtml::el('code', $fshl->highlight($matches[1]));
+			},
+			'~#code#(.+?)#/code#~',
+			'codeInlineSyntax'
+		);
+		$this->texy->registerBlockPattern(
+			function($parser, $matches, $name) use ($fshl) {
+				if ('code' === $matches[1]) {
+					$lines = array_filter(explode("\n", $matches[2]));
+					if (!empty($lines)) {
+						$firstLine = array_shift($lines);
+
+						$indent = '';
+						$li = 0;
+
+						while (isset($firstLine[$li]) && preg_match('~\s~', $firstLine[$li])) {
+							foreach ($lines as $line) {
+								if (!isset($line[$li]) || $firstLine[$li] !== $line[$li]) {
+									break 2;
+								}
+							}
+
+							$indent .= $firstLine[$li++];
+						}
+
+						if (!empty($indent)) {
+							$matches[2] = str_replace(
+								"\n" . $indent,
+								"\n",
+								0 === strpos($matches[2], $indent) ? substr($matches[2], $li) : $matches[2]
+							);
+						}
+					}
+
+					$content = $fshl->highlight($matches[2]);
+				} else {
+					$content = htmlspecialchars($matches[2]);
+				}
+
+				$content = $parser->getTexy()->protect($content, \Texy::CONTENT_BLOCK);
+				return \TexyHtml::el('pre', $content);
+			},
+			'~<(code|pre)>(.+?)</\1>~s',
+			'codeBlockSyntax'
+		);
+
+		// Common operations
+		$this->registerHelperLoader('Nette\Templating\Helpers::loader');
+
+		// PHP source highlight
+		$this->registerHelper('highlightPHP', function($source, $context) use ($that, $fshl) {
+			return $that->resolveLink($that->getTypeName($source), $context) ?: $fshl->highlight((string) $source);
+		});
+		$this->registerHelper('highlightValue', function($definition, $context) use ($that) {
+			return $that->highlightPHP(preg_replace('~^(?:[ ]{4}|\t)~m', '', $definition), $context);
+		});
+
+		// Urls
+		$this->registerHelper('packageUrl', new Nette\Callback($this, 'getPackageUrl'));
+		$this->registerHelper('namespaceUrl', new Nette\Callback($this, 'getNamespaceUrl'));
+		$this->registerHelper('groupUrl', new Nette\Callback($this, 'getGroupUrl'));
+		$this->registerHelper('classUrl', new Nette\Callback($this, 'getClassUrl'));
+		$this->registerHelper('methodUrl', new Nette\Callback($this, 'getMethodUrl'));
+		$this->registerHelper('propertyUrl', new Nette\Callback($this, 'getPropertyUrl'));
+		$this->registerHelper('constantUrl', new Nette\Callback($this, 'getConstantUrl'));
+		$this->registerHelper('functionUrl', new Nette\Callback($this, 'getFunctionUrl'));
+		$this->registerHelper('elementUrl', new Nette\Callback($this, 'getElementUrl'));
+		$this->registerHelper('sourceUrl', new Nette\Callback($this, 'getSourceUrl'));
+		$this->registerHelper('manualUrl', new Nette\Callback($this, 'getManualUrl'));
+
+		// Packages & namespaces
+		$this->registerHelper('packageLinks', new Nette\Callback($this, 'getPackageLinks'));
+		$this->registerHelper('namespaceLinks', new Nette\Callback($this, 'getNamespaceLinks'));
+		$this->registerHelper('subgroupName', function($groupName) {
+			if ($pos = strrpos($groupName, '\\')) {
+				return substr($groupName, $pos + 1);
+			}
+			return $groupName;
+		});
+
+		// Types
+		$this->registerHelper('typeLinks', new Nette\Callback($this, 'getTypeLinks'));
+
+		// Docblock descriptions
+		$this->registerHelper('description', function($annotation, $context) use ($that) {
+			$description = trim(strpbrk($annotation, "\n\r\t $"));
+
+			if ($context instanceof ReflectionParameter) {
+				$description = preg_replace('~^(\\$' . $context->getName() . '(?:,\\.{3})?)(\s+|$)~i', '\\2', $description, 1);
+				$context = $context->getDeclaringFunction();
+			}
+			return $that->doc($description, $context);
+		});
+		$this->registerHelper('shortDescription', function($element, $block = false) use ($that) {
+			return $that->doc($element->getShortDescription(), $element, $block);
+		});
+		$this->registerHelper('longDescription', function($element) use ($that) {
+			$long = $element->getLongDescription();
+
+			// Merge lines
+			$long = preg_replace_callback('~(?:<(code|pre)>.+?</\1>)|([^<]*)~s', function($matches) {
+				return !empty($matches[2])
+					? preg_replace('~\n(?:\t|[ ])+~', ' ', $matches[2])
+					: $matches[0];
+			}, $long);
+
+			return $that->doc($long, $element, true);
+		});
+
+		// Individual annotations processing
+		$this->registerHelper('annotation', function($value, $name, $context) use ($that, $generator) {
+			switch ($name) {
+				case 'param':
+				case 'return':
+				case 'throws':
+					$description = $that->description($value, $context);
+					return sprintf('<code>%s</code>%s', $that->getTypeLinks($value, $context), $description ? '<br>' . $description : '');
+				case 'license':
+					list($url, $description) = $that->split($value);
+					return $that->link($url, $description ?: $url);
+				case 'link':
+					list($url, $description) = $that->split($value);
+					if (Nette\Utils\Validators::isUrl($url)) {
+						return $that->link($url, $description ?: $url);
+					}
+					break;
+				case 'see':
+					$doc = array();
+					foreach (preg_split('~\\s*,\\s*~', $value) as $link) {
+						if (null !== $generator->resolveElement($link, $context)) {
+							$doc[] = sprintf('<code>%s</code>', $that->getTypeLinks($link, $context));
+						} else {
+							$doc[] = $that->doc($link, $context);
+						}
+					}
+					return implode(', ', $doc);
+				case 'uses':
+				case 'usedby':
+					list($link, $description) = $that->split($value);
+					$separator = $context instanceof ReflectionClass || !$description ? ' ' : '<br>';
+					if (null !== $generator->resolveElement($link, $context)) {
+						return sprintf('<code>%s</code>%s%s', $that->getTypeLinks($link, $context), $separator, $description);
+					}
+					break;
+				default:
+					break;
+			}
+
+			// Default
+			return $that->doc($value, $context);
+		});
+
+		$todo = $this->config->todo;
+		$internal = $this->config->internal;
+		$this->registerHelper('annotationFilter', function(array $annotations, array $filter = array()) use ($todo, $internal) {
+			// Filtered, unsupported or deprecated annotations
+			static $filtered = array(
+				'package', 'subpackage', 'property', 'property-read', 'property-write', 'method', 'abstract',
+				'access', 'final', 'filesource', 'global', 'name', 'static', 'staticvar'
+			);
+			foreach ($filtered as $annotation) {
+				unset($annotations[$annotation]);
+			}
+
+			// Custom filter
+			foreach ($filter as $annotation) {
+				unset($annotations[$annotation]);
+			}
+
+			// Show/hide internal
+			if (!$internal) {
+				unset($annotations['internal']);
+			}
+
+			// Show/hide tasks
+			if (!$todo) {
+				unset($annotations['todo']);
+			}
+
+			return $annotations;
+		});
+
+		$this->registerHelper('annotationSort', function(array $annotations) {
+			uksort($annotations, function($one, $two) {
+				static $order = array(
+					'deprecated' => 0, 'category' => 1, 'copyright' => 2, 'license' => 3, 'author' => 4, 'version' => 5,
+					'since' => 6, 'see' => 7, 'uses' => 8, 'usedby' => 9, 'link' => 10, 'internal' => 11,
+					'example' => 12, 'tutorial' => 13, 'todo' => 14
+				);
+
+				if (isset($order[$one], $order[$two])) {
+					return $order[$one] - $order[$two];
+				} elseif (isset($order[$one])) {
+					return -1;
+				} elseif (isset($order[$two])) {
+					return 1;
+				} else {
+					return strcasecmp($one, $two);
+				}
+			});
+			return $annotations;
+		});
+
+		$this->registerHelper('annotationBeautify', function($annotation) {
+			static $names = array(
+				'usedby' => 'Used by'
+			);
+
+			if (isset($names[$annotation])) {
+				return $names[$annotation];
+			}
+
+			return Nette\Utils\Strings::firstUpper($annotation);
+		});
+
+		// Static files versioning
+		$destination = $this->config->destination;
+		$this->registerHelper('staticFile', function($name) use ($destination) {
+			static $versions = array();
+
+			$filename = $destination . DIRECTORY_SEPARATOR . $name;
+			if (!isset($versions[$filename]) && is_file($filename)) {
+				$versions[$filename] = sprintf('%u', crc32(file_get_contents($filename)));
+			}
+			if (isset($versions[$filename])) {
+				$name .= '?' . $versions[$filename];
+			}
+			return $name;
+		});
+
+		// Source anchors
+		$this->registerHelper('sourceAnchors', function($source) {
+			// Classes, interfaces, traits and exceptions
+			$source = preg_replace_callback('~(<span\\s+class="php-keyword1">(?:class|interface|trait)</span>\\s+)(\\w+)~i', function($matches) {
+				$link = sprintf('<a id="%1$s" href="#%1$s">%1$s</a>', $matches[2]);
+				return $matches[1] . $link;
+			}, $source);
+
+			// Methods and functions
+			$source = preg_replace_callback('~(<span\\s+class="php-keyword1">function</span>\\s+)(\\w+)~i', function($matches) {
+				$link = sprintf('<a id="_%1$s" href="#_%1$s">%1$s</a>', $matches[2]);
+				return $matches[1] . $link;
+			}, $source);
+
+			// Constants
+			$source = preg_replace_callback('~(<span class="php-keyword1">const</span>)(.*?)(;)~is', function($matches) {
+				$links = preg_replace_callback('~(\\s|,)([A-Z_]+)(\\s+=)~', function($matches) {
+					return $matches[1] . sprintf('<a id="%1$s" href="#%1$s">%1$s</a>', $matches[2]) . $matches[3];
+				}, $matches[2]);
+				return $matches[1] . $links . $matches[3];
+			}, $source);
+
+			// Properties
+			$source = preg_replace_callback('~(<span\\s+class="php-keyword1">(?:private|protected|public|var|static)</span>\\s+)(<span\\s+class="php-var">.*?)(;)~is', function($matches) {
+				$links = preg_replace_callback('~(<span\\s+class="php-var">)(\\$\\w+)~i', function($matches) {
+					return $matches[1] . sprintf('<a id="%1$s" href="#%1$s">%1$s</a>', $matches[2]);
+				}, $matches[2]);
+				return $matches[1] . $links . $matches[3];
+			}, $source);
+
+			return $source;
+		});
+
+		$this->registerHelper('urlize', array($this, 'urlize'));
+
+		$this->registerHelper('relativePath', array($generator, 'getRelativePath'));
+		$this->registerHelper('resolveElement', array($generator, 'resolveElement'));
+		$this->registerHelper('getClass', array($generator, 'getClass'));
+	}
+
+	/**
+	 * Returns unified type value definition (class name or member data type).
+	 *
+	 * @param string $name
+	 * @param boolean $trimNamespaceSeparator
+	 * @return string
+	 */
+||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_STATIC_PROP)
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_NEW
+            (
+                (AST_NEW))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_NEW)))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_NEW))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_PROP
+                (AST_VAR)))
+        (AST_CALL
+            (
+                (AST_PROP
+                    (AST_PROP
+                        (AST_VAR))))))
+    (AST_ASSIGN
+        (AST_DIM
+            (AST_PROP
+                (AST_PROP
+                    (AST_VAR)))
+            (SCALAR))
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_DIM
+            (AST_PROP
+                (AST_PROP
+                    (AST_VAR)))
+            (SCALAR))
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_DIM
+            (AST_PROP
+                (AST_PROP
+                    (AST_VAR)))
+            (SCALAR))
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_DIM
+            (AST_PROP
+                (AST_PROP
+                    (AST_VAR)))
+            (SCALAR))
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_PROP
+                (AST_PROP
+                    (AST_VAR))))
+        (AST_CONST))
+    (AST_METHOD_CALL
+        (AST_PROP
+            (AST_VAR))
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                (NULL)
+                (
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CALL
+                            (
+                                (SCALAR)
+                                (SCALAR)
+                                (AST_VAR))))))))
+    (AST_METHOD_CALL
+        (AST_PROP
+            (AST_VAR))
+        (
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_RETURN
+                        (AST_STATIC_CALL
+                            (
+                                (SCALAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (SCALAR)))))))))
+            (SCALAR)
+            (SCALAR)))
+    (AST_METHOD_CALL
+        (AST_PROP
+            (AST_VAR))
+        (
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_BINARY_OP
+                                (SCALAR)
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (SCALAR)))
+                            (
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_CALL
+                                        (
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR)))))))
+                                (AST_IF
+                                    (AST_IF_ELEM
+                                        (AST_UNARY_OP
+                                            (AST_EMPTY
+                                                (AST_VAR)))
+                                        (
+                                            (AST_ASSIGN
+                                                (AST_VAR)
+                                                (AST_CALL
+                                                    (
+                                                        (AST_VAR))))
+                                            (AST_ASSIGN
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (AST_ASSIGN
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (AST_WHILE
+                                                (AST_BINARY_OP
+                                                    (AST_ISSET
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (AST_VAR)))
+                                                    (AST_CALL
+                                                        (
+                                                            (SCALAR)
+                                                            (AST_DIM
+                                                                (AST_VAR)
+                                                                (AST_VAR)))))
+                                                (
+                                                    (AST_FOREACH
+                                                        (AST_VAR)
+                                                        (AST_VAR)
+                                                        (NULL)
+                                                        (
+                                                            (AST_IF
+                                                                (AST_IF_ELEM
+                                                                    (AST_BINARY_OP
+                                                                        (AST_UNARY_OP
+                                                                            (AST_ISSET
+                                                                                (AST_DIM
+                                                                                    (AST_VAR)
+                                                                                    (AST_VAR))))
+                                                                        (AST_BINARY_OP
+                                                                            (AST_DIM
+                                                                                (AST_VAR)
+                                                                                (AST_VAR))
+                                                                            (AST_DIM
+                                                                                (AST_VAR)
+                                                                                (AST_VAR))))
+                                                                    (
+                                                                        (AST_BREAK
+                                                                            (SCALAR)))))))
+                                                    (AST_ASSIGN_OP
+                                                        (AST_VAR)
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (AST_POST_INC
+                                                                (AST_VAR))))))
+                                            (AST_IF
+                                                (AST_IF_ELEM
+                                                    (AST_UNARY_OP
+                                                        (AST_EMPTY
+                                                            (AST_VAR)))
+                                                    (
+                                                        (AST_ASSIGN
+                                                            (AST_DIM
+                                                                (AST_VAR)
+                                                                (SCALAR))
+                                                            (AST_CALL
+                                                                (
+                                                                    (AST_BINARY_OP
+                                                                        (SCALAR)
+                                                                        (AST_VAR))
+                                                                    (SCALAR)
+                                                                    (AST_CONDITIONAL
+                                                                        (AST_BINARY_OP
+                                                                            (SCALAR)
+                                                                            (AST_CALL
+                                                                                (
+                                                                                    (AST_DIM
+                                                                                        (AST_VAR)
+                                                                                        (SCALAR))
+                                                                                    (AST_VAR))))
+                                                                        (AST_CALL
+                                                                            (
+                                                                                (AST_DIM
+                                                                                    (AST_VAR)
+                                                                                    (SCALAR))
+                                                                                (AST_VAR)))
+                                                                        (AST_DIM
+                                                                            (AST_VAR)
+                                                                            (SCALAR))))))))))))
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_DIM
+                                                (AST_VAR)
+                                                (SCALAR)))))))
+                        (AST_IF_ELEM
+                            (NULL)
+                            (
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_CALL
+                                        (
+                                            (AST_DIM
+                                                (AST_VAR)
+                                                (SCALAR))))))))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_METHOD_CALL
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (
+                                (AST_VAR)
+                                (AST_CLASS_CONST
+                                    (SCALAR)))))
+                    (AST_RETURN
+                        (AST_STATIC_CALL
+                            (
+                                (SCALAR)
+                                (AST_VAR))))))
+            (SCALAR)
+            (SCALAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR)
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_RETURN
+                        (AST_CONDITIONAL
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR)))
+                                    (AST_VAR)))
+                            (NULL)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_CAST
+                                        (AST_VAR))))))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_RETURN
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_CALL
+                                    (
+                                        (SCALAR)
+                                        (SCALAR)
+                                        (AST_VAR)))
+                                (AST_VAR))))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                (NULL)
+                (
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_CALL
+                                    (
+                                        (AST_VAR)
+                                        (SCALAR))))
+                            (
+                                (AST_RETURN
+                                    (AST_CALL
+                                        (
+                                            (AST_VAR)
+                                            (AST_BINARY_OP
+                                                (AST_VAR)
+                                                (SCALAR))))))))
+                    (AST_RETURN
+                        (AST_VAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_CALL
+                                    (
+                                        (AST_VAR))))))
+                    (AST_RETURN
+                        (AST_CONDITIONAL
+                            (AST_BINARY_OP
+                                (SCALAR)
+                                (AST_VAR))
+                            (AST_VAR)
+                            (SCALAR)))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CALL
+                            (
+                                (AST_CALL
+                                    (
+                                        (AST_VAR)
+                                        (SCALAR))))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_INSTANCEOF
+                                (AST_VAR))
+                            (
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_CALL
+                                        (
+                                            (AST_BINARY_OP
+                                                (AST_BINARY_OP
+                                                    (SCALAR)
+                                                    (AST_METHOD_CALL
+                                                        (AST_VAR)))
+                                                (SCALAR))
+                                            (SCALAR)
+                                            (AST_VAR)
+                                            (SCALAR))))
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_METHOD_CALL
+                                        (AST_VAR))))))
+                    (AST_RETURN
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_VAR)
+                                (AST_VAR))))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPEPARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_RETURN
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_METHOD_CALL
+                                    (AST_VAR))
+                                (AST_VAR)
+                                (AST_VAR))))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_METHOD_CALL
+                            (AST_VAR)))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CALL
+                            (
+                                (SCALAR)
+                                (AST_CLOSURE
+                                    (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                    (NULL)
+                                    (
+                                        (AST_RETURN
+                                            (AST_CONDITIONAL
+                                                (AST_UNARY_OP
+                                                    (AST_EMPTY
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (SCALAR))))
+                                                (AST_CALL
+                                                    (
+                                                        (SCALAR)
+                                                        (SCALAR)
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (SCALAR))))
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (SCALAR))))))
+                                (AST_VAR))))
+                    (AST_RETURN
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_VAR)
+                                (AST_VAR)
+                                (AST_CONST))))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR)
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_SWITCH
+                        (AST_VAR)
+                        (AST_SWITCH_LIST
+                            (AST_SWITCH_CASE
+                                (SCALAR))
+                            (AST_SWITCH_CASE
+                                (SCALAR))
+                            (AST_SWITCH_CASE
+                                (SCALAR)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR)
+                                                (AST_VAR))))
+                                    (AST_RETURN
+                                        (AST_CALL
+                                            (
+                                                (SCALAR)
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR)
+                                                    (
+                                                        (AST_VAR)
+                                                        (AST_VAR)))
+                                                (AST_CONDITIONAL
+                                                    (AST_VAR)
+                                                    (AST_BINARY_OP
+                                                        (SCALAR)
+                                                        (AST_VAR))
+                                                    (SCALAR)))))))
+                            (AST_SWITCH_CASE
+                                (SCALAR)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (AST_VAR)
+                                                (NULL))
+                                            (AST_ARRAY_ELEM
+                                                (AST_VAR)
+                                                (NULL)))
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR))))
+                                    (AST_RETURN
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR)
+                                                (AST_CONDITIONAL
+                                                    (AST_VAR)
+                                                    (NULL)
+                                                    (AST_VAR)))))))
+                            (AST_SWITCH_CASE
+                                (SCALAR)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (AST_VAR)
+                                                (NULL))
+                                            (AST_ARRAY_ELEM
+                                                (AST_VAR)
+                                                (NULL)))
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR))))
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_STATIC_CALL
+                                                (
+                                                    (AST_VAR)))
+                                            (
+                                                (AST_RETURN
+                                                    (AST_METHOD_CALL
+                                                        (AST_VAR)
+                                                        (
+                                                            (AST_VAR)
+                                                            (AST_CONDITIONAL
+                                                                (AST_VAR)
+                                                                (NULL)
+                                                                (AST_VAR))))))))
+                                    (AST_BREAK
+                                        (NULL))))
+                            (AST_SWITCH_CASE
+                                (SCALAR)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_ARRAY))
+                                    (AST_FOREACH
+                                        (AST_CALL
+                                            (
+                                                (SCALAR)
+                                                (AST_VAR)))
+                                        (AST_VAR)
+                                        (NULL)
+                                        (
+                                            (AST_IF
+                                                (AST_IF_ELEM
+                                                    (AST_BINARY_OP
+                                                        (AST_CONST)
+                                                        (AST_METHOD_CALL
+                                                            (AST_VAR)
+                                                            (
+                                                                (AST_VAR)
+                                                                (AST_VAR))))
+                                                    (
+                                                        (AST_ASSIGN
+                                                            (AST_DIM
+                                                                (AST_VAR)
+                                                                (NULL))
+                                                            (AST_CALL
+                                                                (
+                                                                    (SCALAR)
+                                                                    (AST_METHOD_CALL
+                                                                        (AST_VAR)
+                                                                        (
+                                                                            (AST_VAR)
+                                                                            (AST_VAR))))))))
+                                                (AST_IF_ELEM
+                                                    (NULL)
+                                                    (
+                                                        (AST_ASSIGN
+                                                            (AST_DIM
+                                                                (AST_VAR)
+                                                                (NULL))
+                                                            (AST_METHOD_CALL
+                                                                (AST_VAR)
+                                                                (
+                                                                    (AST_VAR)
+                                                                    (AST_VAR)))))))))
+                                    (AST_RETURN
+                                        (AST_CALL
+                                            (
+                                                (SCALAR)
+                                                (AST_VAR))))))
+                            (AST_SWITCH_CASE
+                                (SCALAR))
+                            (AST_SWITCH_CASE
+                                (SCALAR)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (AST_VAR)
+                                                (NULL))
+                                            (AST_ARRAY_ELEM
+                                                (AST_VAR)
+                                                (NULL)))
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR))))
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_CONDITIONAL
+                                            (AST_BINARY_OP
+                                                (AST_INSTANCEOF
+                                                    (AST_VAR))
+                                                (AST_UNARY_OP
+                                                    (AST_VAR)))
+                                            (SCALAR)
+                                            (SCALAR)))
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_BINARY_OP
+                                                (AST_CONST)
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR)
+                                                    (
+                                                        (AST_VAR)
+                                                        (AST_VAR))))
+                                            (
+                                                (AST_RETURN
+                                                    (AST_CALL
+                                                        (
+                                                            (SCALAR)
+                                                            (AST_METHOD_CALL
+                                                                (AST_VAR)
+                                                                (
+                                                                    (AST_VAR)
+                                                                    (AST_VAR)))
+                                                            (AST_VAR)
+                                                            (AST_VAR)))))))
+                                    (AST_BREAK
+                                        (NULL))))
+                            (AST_SWITCH_CASE
+                                (NULL)
+                                (
+                                    (AST_BREAK
+                                        (NULL))))))
+                    (AST_RETURN
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_VAR)
+                                (AST_VAR))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_PROP
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_PROP
+            (AST_PROP
+                (AST_VAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (PARAM_TYPENO_PARAM_DEFAULTPARAM_TYPEPARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR)
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_STATIC
+                        (AST_VAR)
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))))
+                    (AST_FOREACH
+                        (AST_VAR)
+                        (AST_VAR)
+                        (NULL)
+                        (
+                            (AST_UNSET
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (AST_VAR)))))
+                    (AST_FOREACH
+                        (AST_VAR)
+                        (AST_VAR)
+                        (NULL)
+                        (
+                            (AST_UNSET
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (AST_VAR)))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_UNARY_OP
+                                (AST_VAR))
+                            (
+                                (AST_UNSET
+                                    (AST_DIM
+                                        (AST_VAR)
+                                        (SCALAR))))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_UNARY_OP
+                                (AST_VAR))
+                            (
+                                (AST_UNSET
+                                    (AST_DIM
+                                        (AST_VAR)
+                                        (SCALAR))))))
+                    (AST_RETURN
+                        (AST_VAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (PARAM_TYPENO_PARAM_DEFAULT)
+                (NULL)
+                (
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (AST_CLOSURE
+                                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                                (NULL)
+                                (
+                                    (AST_STATIC
+                                        (AST_VAR)
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))))
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_BINARY_OP
+                                                (AST_ISSET
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (AST_VAR)))
+                                                (AST_ISSET
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (AST_VAR))))
+                                            (
+                                                (AST_RETURN
+                                                    (AST_BINARY_OP
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (AST_VAR))
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (AST_VAR))))))
+                                        (AST_IF_ELEM
+                                            (AST_ISSET
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (AST_VAR)))
+                                            (
+                                                (AST_RETURN
+                                                    (AST_UNARY_OP
+                                                        (SCALAR)))))
+                                        (AST_IF_ELEM
+                                            (AST_ISSET
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (AST_VAR)))
+                                            (
+                                                (AST_RETURN
+                                                    (SCALAR))))
+                                        (AST_IF_ELEM
+                                            (NULL)
+                                            (
+                                                (AST_RETURN
+                                                    (AST_CALL
+                                                        (
+                                                            (AST_VAR)
+                                                            (AST_VAR)))))))))))
+                    (AST_RETURN
+                        (AST_VAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                (NULL)
+                (
+                    (AST_STATIC
+                        (AST_VAR)
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (SCALAR))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_ISSET
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (AST_VAR)))
+                            (
+                                (AST_RETURN
+                                    (AST_DIM
+                                        (AST_VAR)
+                                        (AST_VAR))))))
+                    (AST_RETURN
+                        (AST_STATIC_CALL
+                            (
+                                (AST_VAR))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_PROP
+            (AST_PROP
+                (AST_VAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_STATIC
+                        (AST_VAR)
+                        (AST_ARRAY))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_VAR)
+                                (AST_CONST))
+                            (AST_VAR)))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_BINARY_OP
+                                (AST_UNARY_OP
+                                    (AST_ISSET
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (AST_VAR))))
+                                (AST_CALL
+                                    (
+                                        (AST_VAR))))
+                            (
+                                (AST_ASSIGN
+                                    (AST_DIM
+                                        (AST_VAR)
+                                        (AST_VAR))
+                                    (AST_CALL
+                                        (
+                                            (SCALAR)
+                                            (AST_CALL
+                                                (
+                                                    (AST_CALL
+                                                        (
+                                                            (AST_VAR)))))))))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_ISSET
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (AST_VAR)))
+                            (
+                                (AST_ASSIGN_OP
+                                    (AST_VAR)
+                                    (AST_BINARY_OP
+                                        (SCALAR)
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (AST_VAR)))))))
+                    (AST_RETURN
+                        (AST_VAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                (NULL)
+                (
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CALL
+                            (
+                                (SCALAR)
+                                (AST_CLOSURE
+                                    (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                    (NULL)
+                                    (
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR)))))
+                                        (AST_RETURN
+                                            (AST_BINARY_OP
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (SCALAR))
+                                                (AST_VAR)))))
+                                (AST_VAR))))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CALL
+                            (
+                                (SCALAR)
+                                (AST_CLOSURE
+                                    (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                    (NULL)
+                                    (
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR)))))
+                                        (AST_RETURN
+                                            (AST_BINARY_OP
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (SCALAR))
+                                                (AST_VAR)))))
+                                (AST_VAR))))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CALL
+                            (
+                                (SCALAR)
+                                (AST_CLOSURE
+                                    (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                    (NULL)
+                                    (
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (AST_CLOSURE
+                                                        (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                                        (NULL)
+                                                        (
+                                                            (AST_RETURN
+                                                                (AST_BINARY_OP
+                                                                    (AST_BINARY_OP
+                                                                        (AST_DIM
+                                                                            (AST_VAR)
+                                                                            (SCALAR))
+                                                                        (AST_CALL
+                                                                            (
+                                                                                (SCALAR)
+                                                                                (AST_DIM
+                                                                                    (AST_VAR)
+                                                                                    (SCALAR)))))
+                                                                    (AST_DIM
+                                                                        (AST_VAR)
+                                                                        (SCALAR))))))
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR)))))
+                                        (AST_RETURN
+                                            (AST_BINARY_OP
+                                                (AST_BINARY_OP
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR))
+                                                    (AST_VAR))
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (SCALAR))))))
+                                (AST_VAR))))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CALL
+                            (
+                                (SCALAR)
+                                (AST_CLOSURE
+                                    (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                    (NULL)
+                                    (
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (AST_CLOSURE
+                                                        (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                                        (NULL)
+                                                        (
+                                                            (AST_RETURN
+                                                                (AST_BINARY_OP
+                                                                    (AST_DIM
+                                                                        (AST_VAR)
+                                                                        (SCALAR))
+                                                                    (AST_CALL
+                                                                        (
+                                                                            (SCALAR)
+                                                                            (AST_DIM
+                                                                                (AST_VAR)
+                                                                                (SCALAR))))))))
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR)))))
+                                        (AST_RETURN
+                                            (AST_BINARY_OP
+                                                (AST_BINARY_OP
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR))
+                                                    (AST_VAR))
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (SCALAR))))))
+                                (AST_VAR))))
+                    (AST_RETURN
+                        (AST_VAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (AST_VAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (AST_VAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (AST_VAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (AST_VAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL))))))||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_STATIC_PROP)
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_NEW
+            (
+                (AST_NEW))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_NEW)))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_NEW))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_PROP
+                (AST_VAR)))
+        (AST_CALL
+            (
+                (AST_PROP
+                    (AST_PROP
+                        (AST_VAR))))))
+    (AST_ASSIGN
+        (AST_DIM
+            (AST_PROP
+                (AST_PROP
+                    (AST_VAR)))
+            (SCALAR))
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_DIM
+            (AST_PROP
+                (AST_PROP
+                    (AST_VAR)))
+            (SCALAR))
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_DIM
+            (AST_PROP
+                (AST_PROP
+                    (AST_VAR)))
+            (SCALAR))
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_DIM
+            (AST_PROP
+                (AST_PROP
+                    (AST_VAR)))
+            (SCALAR))
+        (AST_CONST))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_PROP
+                (AST_PROP
+                    (AST_VAR))))
+        (AST_CONST))
+    (AST_METHOD_CALL
+        (AST_PROP
+            (AST_VAR))
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                (NULL)
+                (
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CALL
+                            (
+                                (SCALAR)
+                                (SCALAR)
+                                (AST_VAR))))))))
+    (AST_METHOD_CALL
+        (AST_PROP
+            (AST_VAR))
+        (
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_RETURN
+                        (AST_STATIC_CALL
+                            (
+                                (SCALAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (SCALAR)))))))))
+            (SCALAR)
+            (SCALAR)))
+    (AST_METHOD_CALL
+        (AST_PROP
+            (AST_VAR))
+        (
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_BINARY_OP
+                                (SCALAR)
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (SCALAR)))
+                            (
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_CALL
+                                        (
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR)))))))
+                                (AST_IF
+                                    (AST_IF_ELEM
+                                        (AST_UNARY_OP
+                                            (AST_EMPTY
+                                                (AST_VAR)))
+                                        (
+                                            (AST_ASSIGN
+                                                (AST_VAR)
+                                                (AST_CALL
+                                                    (
+                                                        (AST_VAR))))
+                                            (AST_ASSIGN
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (AST_ASSIGN
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (AST_WHILE
+                                                (AST_BINARY_OP
+                                                    (AST_ISSET
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (AST_VAR)))
+                                                    (AST_CALL
+                                                        (
+                                                            (SCALAR)
+                                                            (AST_DIM
+                                                                (AST_VAR)
+                                                                (AST_VAR)))))
+                                                (
+                                                    (AST_FOREACH
+                                                        (AST_VAR)
+                                                        (AST_VAR)
+                                                        (NULL)
+                                                        (
+                                                            (AST_IF
+                                                                (AST_IF_ELEM
+                                                                    (AST_BINARY_OP
+                                                                        (AST_UNARY_OP
+                                                                            (AST_ISSET
+                                                                                (AST_DIM
+                                                                                    (AST_VAR)
+                                                                                    (AST_VAR))))
+                                                                        (AST_BINARY_OP
+                                                                            (AST_DIM
+                                                                                (AST_VAR)
+                                                                                (AST_VAR))
+                                                                            (AST_DIM
+                                                                                (AST_VAR)
+                                                                                (AST_VAR))))
+                                                                    (
+                                                                        (AST_BREAK
+                                                                            (SCALAR)))))))
+                                                    (AST_ASSIGN_OP
+                                                        (AST_VAR)
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (AST_POST_INC
+                                                                (AST_VAR))))))
+                                            (AST_IF
+                                                (AST_IF_ELEM
+                                                    (AST_UNARY_OP
+                                                        (AST_EMPTY
+                                                            (AST_VAR)))
+                                                    (
+                                                        (AST_ASSIGN
+                                                            (AST_DIM
+                                                                (AST_VAR)
+                                                                (SCALAR))
+                                                            (AST_CALL
+                                                                (
+                                                                    (AST_BINARY_OP
+                                                                        (SCALAR)
+                                                                        (AST_VAR))
+                                                                    (SCALAR)
+                                                                    (AST_CONDITIONAL
+                                                                        (AST_BINARY_OP
+                                                                            (SCALAR)
+                                                                            (AST_CALL
+                                                                                (
+                                                                                    (AST_DIM
+                                                                                        (AST_VAR)
+                                                                                        (SCALAR))
+                                                                                    (AST_VAR))))
+                                                                        (AST_CALL
+                                                                            (
+                                                                                (AST_DIM
+                                                                                    (AST_VAR)
+                                                                                    (SCALAR))
+                                                                                (AST_VAR)))
+                                                                        (AST_DIM
+                                                                            (AST_VAR)
+                                                                            (SCALAR))))))))))))
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_DIM
+                                                (AST_VAR)
+                                                (SCALAR)))))))
+                        (AST_IF_ELEM
+                            (NULL)
+                            (
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_CALL
+                                        (
+                                            (AST_DIM
+                                                (AST_VAR)
+                                                (SCALAR))))))))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_METHOD_CALL
+                            (AST_METHOD_CALL
+                                (AST_VAR))
+                            (
+                                (AST_VAR)
+                                (AST_CLASS_CONST
+                                    (SCALAR)))))
+                    (AST_RETURN
+                        (AST_STATIC_CALL
+                            (
+                                (SCALAR)
+                                (AST_VAR))))))
+            (SCALAR)
+            (SCALAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR)
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_RETURN
+                        (AST_CONDITIONAL
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR)))
+                                    (AST_VAR)))
+                            (NULL)
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_CAST
+                                        (AST_VAR))))))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_RETURN
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_CALL
+                                    (
+                                        (SCALAR)
+                                        (SCALAR)
+                                        (AST_VAR)))
+                                (AST_VAR))))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                (NULL)
+                (
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_CALL
+                                    (
+                                        (AST_VAR)
+                                        (SCALAR))))
+                            (
+                                (AST_RETURN
+                                    (AST_CALL
+                                        (
+                                            (AST_VAR)
+                                            (AST_BINARY_OP
+                                                (AST_VAR)
+                                                (SCALAR))))))))
+                    (AST_RETURN
+                        (AST_VAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_NEW
+                (
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CALL
+                            (
+                                (AST_CALL
+                                    (
+                                        (AST_VAR)
+                                        (SCALAR))))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_INSTANCEOF
+                                (AST_VAR))
+                            (
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_CALL
+                                        (
+                                            (AST_BINARY_OP
+                                                (AST_BINARY_OP
+                                                    (SCALAR)
+                                                    (AST_METHOD_CALL
+                                                        (AST_VAR)))
+                                                (SCALAR))
+                                            (SCALAR)
+                                            (AST_VAR)
+                                            (SCALAR))))
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_METHOD_CALL
+                                        (AST_VAR))))))
+                    (AST_RETURN
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_VAR)
+                                (AST_VAR))))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPEPARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_RETURN
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_METHOD_CALL
+                                    (AST_VAR))
+                                (AST_VAR)
+                                (AST_VAR))))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_METHOD_CALL
+                            (AST_VAR)))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CALL
+                            (
+                                (SCALAR)
+                                (AST_CLOSURE
+                                    (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                    (NULL)
+                                    (
+                                        (AST_RETURN
+                                            (AST_CONDITIONAL
+                                                (AST_UNARY_OP
+                                                    (AST_EMPTY
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (SCALAR))))
+                                                (AST_CALL
+                                                    (
+                                                        (SCALAR)
+                                                        (SCALAR)
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (SCALAR))))
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (SCALAR))))))
+                                (AST_VAR))))
+                    (AST_RETURN
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_VAR)
+                                (AST_VAR)
+                                (AST_CONST))))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR)
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_SWITCH
+                        (AST_VAR)
+                        (AST_SWITCH_LIST
+                            (AST_SWITCH_CASE
+                                (SCALAR))
+                            (AST_SWITCH_CASE
+                                (SCALAR))
+                            (AST_SWITCH_CASE
+                                (SCALAR)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR)
+                                                (AST_VAR))))
+                                    (AST_RETURN
+                                        (AST_CALL
+                                            (
+                                                (SCALAR)
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR)
+                                                    (
+                                                        (AST_VAR)
+                                                        (AST_VAR)))
+                                                (AST_CONDITIONAL
+                                                    (AST_VAR)
+                                                    (AST_BINARY_OP
+                                                        (SCALAR)
+                                                        (AST_VAR))
+                                                    (SCALAR)))))))
+                            (AST_SWITCH_CASE
+                                (SCALAR)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (AST_VAR)
+                                                (NULL))
+                                            (AST_ARRAY_ELEM
+                                                (AST_VAR)
+                                                (NULL)))
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR))))
+                                    (AST_RETURN
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR)
+                                                (AST_CONDITIONAL
+                                                    (AST_VAR)
+                                                    (NULL)
+                                                    (AST_VAR)))))))
+                            (AST_SWITCH_CASE
+                                (SCALAR)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (AST_VAR)
+                                                (NULL))
+                                            (AST_ARRAY_ELEM
+                                                (AST_VAR)
+                                                (NULL)))
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR))))
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_STATIC_CALL
+                                                (
+                                                    (AST_VAR)))
+                                            (
+                                                (AST_RETURN
+                                                    (AST_METHOD_CALL
+                                                        (AST_VAR)
+                                                        (
+                                                            (AST_VAR)
+                                                            (AST_CONDITIONAL
+                                                                (AST_VAR)
+                                                                (NULL)
+                                                                (AST_VAR))))))))
+                                    (AST_BREAK
+                                        (NULL))))
+                            (AST_SWITCH_CASE
+                                (SCALAR)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_ARRAY))
+                                    (AST_FOREACH
+                                        (AST_CALL
+                                            (
+                                                (SCALAR)
+                                                (AST_VAR)))
+                                        (AST_VAR)
+                                        (NULL)
+                                        (
+                                            (AST_IF
+                                                (AST_IF_ELEM
+                                                    (AST_BINARY_OP
+                                                        (AST_CONST)
+                                                        (AST_METHOD_CALL
+                                                            (AST_VAR)
+                                                            (
+                                                                (AST_VAR)
+                                                                (AST_VAR))))
+                                                    (
+                                                        (AST_ASSIGN
+                                                            (AST_DIM
+                                                                (AST_VAR)
+                                                                (NULL))
+                                                            (AST_CALL
+                                                                (
+                                                                    (SCALAR)
+                                                                    (AST_METHOD_CALL
+                                                                        (AST_VAR)
+                                                                        (
+                                                                            (AST_VAR)
+                                                                            (AST_VAR))))))))
+                                                (AST_IF_ELEM
+                                                    (NULL)
+                                                    (
+                                                        (AST_ASSIGN
+                                                            (AST_DIM
+                                                                (AST_VAR)
+                                                                (NULL))
+                                                            (AST_METHOD_CALL
+                                                                (AST_VAR)
+                                                                (
+                                                                    (AST_VAR)
+                                                                    (AST_VAR)))))))))
+                                    (AST_RETURN
+                                        (AST_CALL
+                                            (
+                                                (SCALAR)
+                                                (AST_VAR))))))
+                            (AST_SWITCH_CASE
+                                (SCALAR))
+                            (AST_SWITCH_CASE
+                                (SCALAR)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (AST_VAR)
+                                                (NULL))
+                                            (AST_ARRAY_ELEM
+                                                (AST_VAR)
+                                                (NULL)))
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR))))
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_CONDITIONAL
+                                            (AST_BINARY_OP
+                                                (AST_INSTANCEOF
+                                                    (AST_VAR))
+                                                (AST_UNARY_OP
+                                                    (AST_VAR)))
+                                            (SCALAR)
+                                            (SCALAR)))
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_BINARY_OP
+                                                (AST_CONST)
+                                                (AST_METHOD_CALL
+                                                    (AST_VAR)
+                                                    (
+                                                        (AST_VAR)
+                                                        (AST_VAR))))
+                                            (
+                                                (AST_RETURN
+                                                    (AST_CALL
+                                                        (
+                                                            (SCALAR)
+                                                            (AST_METHOD_CALL
+                                                                (AST_VAR)
+                                                                (
+                                                                    (AST_VAR)
+                                                                    (AST_VAR)))
+                                                            (AST_VAR)
+                                                            (AST_VAR)))))))
+                                    (AST_BREAK
+                                        (NULL))))
+                            (AST_SWITCH_CASE
+                                (NULL)
+                                (
+                                    (AST_BREAK
+                                        (NULL))))))
+                    (AST_RETURN
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_VAR)
+                                (AST_VAR))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_PROP
+            (AST_PROP
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_PROP
+            (AST_PROP
+                (AST_VAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (PARAM_TYPENO_PARAM_DEFAULTPARAM_TYPEPARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR)
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_STATIC
+                        (AST_VAR)
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))))
+                    (AST_FOREACH
+                        (AST_VAR)
+                        (AST_VAR)
+                        (NULL)
+                        (
+                            (AST_UNSET
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (AST_VAR)))))
+                    (AST_FOREACH
+                        (AST_VAR)
+                        (AST_VAR)
+                        (NULL)
+                        (
+                            (AST_UNSET
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (AST_VAR)))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_UNARY_OP
+                                (AST_VAR))
+                            (
+                                (AST_UNSET
+                                    (AST_DIM
+                                        (AST_VAR)
+                                        (SCALAR))))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_UNARY_OP
+                                (AST_VAR))
+                            (
+                                (AST_UNSET
+                                    (AST_DIM
+                                        (AST_VAR)
+                                        (SCALAR))))))
+                    (AST_RETURN
+                        (AST_VAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (PARAM_TYPENO_PARAM_DEFAULT)
+                (NULL)
+                (
+                    (AST_CALL
+                        (
+                            (AST_VAR)
+                            (AST_CLOSURE
+                                (NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+                                (NULL)
+                                (
+                                    (AST_STATIC
+                                        (AST_VAR)
+                                        (AST_ARRAY
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))
+                                            (AST_ARRAY_ELEM
+                                                (SCALAR)
+                                                (SCALAR))))
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_BINARY_OP
+                                                (AST_ISSET
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (AST_VAR)))
+                                                (AST_ISSET
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (AST_VAR))))
+                                            (
+                                                (AST_RETURN
+                                                    (AST_BINARY_OP
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (AST_VAR))
+                                                        (AST_DIM
+                                                            (AST_VAR)
+                                                            (AST_VAR))))))
+                                        (AST_IF_ELEM
+                                            (AST_ISSET
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (AST_VAR)))
+                                            (
+                                                (AST_RETURN
+                                                    (AST_UNARY_OP
+                                                        (SCALAR)))))
+                                        (AST_IF_ELEM
+                                            (AST_ISSET
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (AST_VAR)))
+                                            (
+                                                (AST_RETURN
+                                                    (SCALAR))))
+                                        (AST_IF_ELEM
+                                            (NULL)
+                                            (
+                                                (AST_RETURN
+                                                    (AST_CALL
+                                                        (
+                                                            (AST_VAR)
+                                                            (AST_VAR)))))))))))
+                    (AST_RETURN
+                        (AST_VAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                (NULL)
+                (
+                    (AST_STATIC
+                        (AST_VAR)
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (SCALAR))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_ISSET
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (AST_VAR)))
+                            (
+                                (AST_RETURN
+                                    (AST_DIM
+                                        (AST_VAR)
+                                        (AST_VAR))))))
+                    (AST_RETURN
+                        (AST_STATIC_CALL
+                            (
+                                (AST_VAR))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_PROP
+            (AST_PROP
+                (AST_VAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                (AST_CLOSURE_USES
+                    (AST_CLOSURE_VAR))
+                (
+                    (AST_STATIC
+                        (AST_VAR)
+                        (AST_ARRAY))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_VAR)
+                                (AST_CONST))
+                            (AST_VAR)))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_BINARY_OP
+                                (AST_UNARY_OP
+                                    (AST_ISSET
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (AST_VAR))))
+                                (AST_CALL
+                                    (
+                                        (AST_VAR))))
+                            (
+                                (AST_ASSIGN
+                                    (AST_DIM
+                                        (AST_VAR)
+                                        (AST_VAR))
+                                    (AST_CALL
+                                        (
+                                            (SCALAR)
+                                            (AST_CALL
+                                                (
+                                                    (AST_CALL
+                                                        (
+                                                            (AST_VAR)))))))))))
+                    (AST_IF
+                        (AST_IF_ELEM
+                            (AST_ISSET
+                                (AST_DIM
+                                    (AST_VAR)
+                                    (AST_VAR)))
+                            (
+                                (AST_ASSIGN_OP
+                                    (AST_VAR)
+                                    (AST_BINARY_OP
+                                        (SCALAR)
+                                        (AST_DIM
+                                            (AST_VAR)
+                                            (AST_VAR)))))))
+                    (AST_RETURN
+                        (AST_VAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_CLOSURE
+                (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                (NULL)
+                (
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CALL
+                            (
+                                (SCALAR)
+                                (AST_CLOSURE
+                                    (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                    (NULL)
+                                    (
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR)))))
+                                        (AST_RETURN
+                                            (AST_BINARY_OP
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (SCALAR))
+                                                (AST_VAR)))))
+                                (AST_VAR))))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CALL
+                            (
+                                (SCALAR)
+                                (AST_CLOSURE
+                                    (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                    (NULL)
+                                    (
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR)))))
+                                        (AST_RETURN
+                                            (AST_BINARY_OP
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (SCALAR))
+                                                (AST_VAR)))))
+                                (AST_VAR))))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CALL
+                            (
+                                (SCALAR)
+                                (AST_CLOSURE
+                                    (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                    (NULL)
+                                    (
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (AST_CLOSURE
+                                                        (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                                        (NULL)
+                                                        (
+                                                            (AST_RETURN
+                                                                (AST_BINARY_OP
+                                                                    (AST_BINARY_OP
+                                                                        (AST_DIM
+                                                                            (AST_VAR)
+                                                                            (SCALAR))
+                                                                        (AST_CALL
+                                                                            (
+                                                                                (SCALAR)
+                                                                                (AST_DIM
+                                                                                    (AST_VAR)
+                                                                                    (SCALAR)))))
+                                                                    (AST_DIM
+                                                                        (AST_VAR)
+                                                                        (SCALAR))))))
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR)))))
+                                        (AST_RETURN
+                                            (AST_BINARY_OP
+                                                (AST_BINARY_OP
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR))
+                                                    (AST_VAR))
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (SCALAR))))))
+                                (AST_VAR))))
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CALL
+                            (
+                                (SCALAR)
+                                (AST_CLOSURE
+                                    (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                    (NULL)
+                                    (
+                                        (AST_ASSIGN
+                                            (AST_VAR)
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (AST_CLOSURE
+                                                        (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                                        (NULL)
+                                                        (
+                                                            (AST_RETURN
+                                                                (AST_BINARY_OP
+                                                                    (AST_DIM
+                                                                        (AST_VAR)
+                                                                        (SCALAR))
+                                                                    (AST_CALL
+                                                                        (
+                                                                            (SCALAR)
+                                                                            (AST_DIM
+                                                                                (AST_VAR)
+                                                                                (SCALAR))))))))
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR)))))
+                                        (AST_RETURN
+                                            (AST_BINARY_OP
+                                                (AST_BINARY_OP
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (SCALAR))
+                                                    (AST_VAR))
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (SCALAR))))))
+                                (AST_VAR))))
+                    (AST_RETURN
+                        (AST_VAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (AST_VAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (AST_VAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (AST_VAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (AST_VAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL))))))

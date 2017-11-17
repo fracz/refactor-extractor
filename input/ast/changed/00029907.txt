@@ -1,0 +1,1002 @@
+    private function buildDataTable($idSitesOrIdSite, $period, $date, $segment, $_restrictSitesToLogin, $enhanced, $multipleWebsitesRequested)
+    {
+        $allWebsitesRequested = ($idSitesOrIdSite == 'all');
+        if ($allWebsitesRequested) {
+            // First clear cache
+            Site::clearCache();
+            /** @var Scheduler $scheduler */
+            $scheduler = StaticContainer::getContainer()->get('Piwik\Scheduler\Scheduler');
+            // Then, warm the cache with only the data we should have access to
+            if (Piwik::hasUserSuperUserAccess()
+                // Hack: when this API function is called as a Scheduled Task, Super User status is enforced.
+                // This means this function would return ALL websites in all cases.
+                // Instead, we make sure that only the right set of data is returned
+                && !$scheduler->isRunningTask()
+            ) {
+                APISitesManager::getInstance()->getAllSites();
+            } else {
+                APISitesManager::getInstance()->getSitesWithAtLeastViewAccess($limit = false, $_restrictSitesToLogin);
+            }
+            // Both calls above have called Site::setSitesFromArray. We now get these sites:
+            $sitesToProblablyAdd = Site::getSites();
+        } else if (is_array($idSitesOrIdSite)) {
+            $model = new ModelSitesManager();
+            $sitesToProblablyAdd = $model->getSitesFromIds($idSitesOrIdSite);
+        } else {
+            $sitesToProblablyAdd = array(APISitesManager::getInstance()->getSiteFromId($idSitesOrIdSite));
+        }
+
+        // build the archive type used to query archive data
+        $archive = Archive::build(
+            $idSitesOrIdSite,
+            $period,
+            $date,
+            $segment,
+            $_restrictSitesToLogin
+        );
+
+        // determine what data will be displayed
+        $fieldsToGet = array();
+        $columnNameRewrites = array();
+        $apiECommerceMetrics = array();
+        $apiMetrics = API::getApiMetrics($enhanced);
+        foreach ($apiMetrics as $metricName => $metricSettings) {
+            $fieldsToGet[] = $metricSettings[self::METRIC_RECORD_NAME_KEY];
+            $columnNameRewrites[$metricSettings[self::METRIC_RECORD_NAME_KEY]] = $metricName;
+
+            if ($metricSettings[self::METRIC_IS_ECOMMERCE_KEY]) {
+                $apiECommerceMetrics[$metricName] = $metricSettings;
+            }
+        }
+
+        // get the data
+        // $dataTable instanceOf Set
+        $dataTable = $archive->getDataTableFromNumeric($fieldsToGet);
+
+        $dataTable = $this->mergeDataTableMapAndPopulateLabel($idSitesOrIdSite, $multipleWebsitesRequested, $dataTable);
+
+        if ($dataTable instanceof DataTable\Map) {
+            foreach ($dataTable->getDataTables() as $table) {
+                $this->addMissingWebsites($table, $fieldsToGet, $sitesToProblablyAdd);
+            }
+        } else {
+            $this->addMissingWebsites($dataTable, $fieldsToGet, $sitesToProblablyAdd);
+        }
+
+        // calculate total visits/actions/revenue
+        $this->setMetricsTotalsMetadata($dataTable, $apiMetrics);
+
+        // if the period isn't a range & a lastN/previousN date isn't used, we get the same
+        // data for the last period to show the evolution of visits/actions/revenue
+        list($strLastDate, $lastPeriod) = Range::getLastDate($date, $period);
+
+        if ($strLastDate !== false) {
+
+            if ($lastPeriod !== false) {
+                // NOTE: no easy way to set last period date metadata when range of dates is requested.
+                //       will be easier if DataTable\Map::metadata is removed, and metadata that is
+                //       put there is put directly in DataTable::metadata.
+                $dataTable->setMetadata(self::getLastPeriodMetadataName('date'), $lastPeriod);
+            }
+
+            $pastArchive = Archive::build($idSitesOrIdSite, $period, $strLastDate, $segment, $_restrictSitesToLogin);
+
+            $pastData = $pastArchive->getDataTableFromNumeric($fieldsToGet);
+
+            $pastData = $this->mergeDataTableMapAndPopulateLabel($idSitesOrIdSite, $multipleWebsitesRequested, $pastData);
+
+            // use past data to calculate evolution percentages
+            $this->calculateEvolutionPercentages($dataTable, $pastData, $apiMetrics);
+        }
+
+        // move the site id to a metadata column
+        $dataTable->filter('ColumnCallbackAddMetadata', array('label', 'group', array('\Piwik\Site', 'getGroupFor'), array()));
+        $dataTable->filter('ColumnCallbackAddMetadata', array('label', 'main_url', array('\Piwik\Site', 'getMainUrlFor'), array()));
+        $dataTable->filter('ColumnCallbackAddMetadata', array('label', 'idsite'));
+
+        // set the label of each row to the site name
+        if ($multipleWebsitesRequested) {
+            $dataTable->queueFilter('ColumnCallbackReplace', array('label', '\Piwik\Site::getNameFor'));
+        } else {
+            $dataTable->queueFilter('ColumnDelete', array('label'));
+        }
+
+        Site::clearCache();
+
+        // replace record names with user friendly metric names
+        $dataTable->queueFilter('ReplaceColumnNames', array($columnNameRewrites));
+
+        // Ensures data set sorted, for Metadata output
+        $dataTable->filter('Sort', array(self::NB_VISITS_METRIC, 'desc', $naturalSort = false));
+
+        // filter rows without visits
+        // note: if only one website is queried and there are no visits, we can not remove the row otherwise
+        // ResponseBuilder throws 'Call to a member function getColumns() on a non-object'
+        if ($multipleWebsitesRequested
+            // We don't delete the 0 visits row, if "Enhanced" mode is on.
+            && !$enhanced
+        ) {
+            $dataTable->filter(
+                'ColumnCallbackDeleteRow',
+                array(
+                     self::NB_VISITS_METRIC,
+                     function ($value) {
+                         return $value == 0;
+                     }
+                )
+            );
+        }
+
+        if ($multipleWebsitesRequested && $dataTable->getRowsCount() === 1 && $dataTable instanceof DataTable\Simple) {
+            $simpleTable = $dataTable;
+            $dataTable   = $simpleTable->getEmptyClone();
+            $dataTable->addRow($simpleTable->getFirstRow());
+            unset($simpleTable);
+        }
+
+        return $dataTable;
+    }
+
+    /**
+     * Performs a binary filter of two
+     * DataTables in order to correctly calculate evolution metrics.
+     *
+     * @param DataTable|DataTable\Map $currentData
+     * @param DataTable|DataTable\Map $pastData
+     * @param array $apiMetrics The array of string fields to calculate evolution
+     *                          metrics for.
+     * @throws Exception
+     */
+||||||||    private function buildDataTable($sitesToProblablyAdd, $period, $date, $segment, $_restrictSitesToLogin, $enhanced, $multipleWebsitesRequested)
+    {
+        $idSites = array();
+        if (!empty($sitesToProblablyAdd)) {
+            Site::setSitesFromArray($sitesToProblablyAdd);
+            foreach ($sitesToProblablyAdd as $site) {
+                $idSites[] = $site['idsite'];
+            }
+        }
+
+        // build the archive type used to query archive data
+        $archive = Archive::build(
+            $idSites,
+            $period,
+            $date,
+            $segment,
+            $_restrictSitesToLogin
+        );
+
+        // determine what data will be displayed
+        $fieldsToGet = array();
+        $columnNameRewrites = array();
+        $apiECommerceMetrics = array();
+        $apiMetrics = API::getApiMetrics($enhanced);
+        foreach ($apiMetrics as $metricName => $metricSettings) {
+            $fieldsToGet[] = $metricSettings[self::METRIC_RECORD_NAME_KEY];
+            $columnNameRewrites[$metricSettings[self::METRIC_RECORD_NAME_KEY]] = $metricName;
+
+            if ($metricSettings[self::METRIC_IS_ECOMMERCE_KEY]) {
+                $apiECommerceMetrics[$metricName] = $metricSettings;
+            }
+        }
+
+        // get the data
+        // $dataTable instanceOf Set
+        $dataTable = $archive->getDataTableFromNumeric($fieldsToGet);
+        $dataTable = $this->mergeDataTableMapAndPopulateLabel($idSites, $multipleWebsitesRequested, $dataTable);
+
+        if ($dataTable instanceof DataTable\Map) {
+            foreach ($dataTable->getDataTables() as $table) {
+                $this->addMissingWebsites($table, $fieldsToGet, $sitesToProblablyAdd);
+            }
+        } else {
+            $this->addMissingWebsites($dataTable, $fieldsToGet, $sitesToProblablyAdd);
+        }
+
+        // calculate total visits/actions/revenue
+        $this->setMetricsTotalsMetadata($dataTable, $apiMetrics);
+
+        // if the period isn't a range & a lastN/previousN date isn't used, we get the same
+        // data for the last period to show the evolution of visits/actions/revenue
+        list($strLastDate, $lastPeriod) = Range::getLastDate($date, $period);
+
+        if ($strLastDate !== false) {
+
+            if ($lastPeriod !== false) {
+                // NOTE: no easy way to set last period date metadata when range of dates is requested.
+                //       will be easier if DataTable\Map::metadata is removed, and metadata that is
+                //       put there is put directly in DataTable::metadata.
+                $dataTable->setMetadata(self::getLastPeriodMetadataName('date'), $lastPeriod);
+            }
+
+            $pastArchive = Archive::build($idSites, $period, $strLastDate, $segment, $_restrictSitesToLogin);
+
+            $pastData = $pastArchive->getDataTableFromNumeric($fieldsToGet);
+
+            $pastData = $this->mergeDataTableMapAndPopulateLabel($idSites, $multipleWebsitesRequested, $pastData);
+
+            // use past data to calculate evolution percentages
+            $this->calculateEvolutionPercentages($dataTable, $pastData, $apiMetrics);
+        }
+
+        // move the site id to a metadata column
+        $dataTable->filter('ColumnCallbackAddMetadata', array('label', 'group', array('\Piwik\Site', 'getGroupFor'), array()));
+        $dataTable->filter('ColumnCallbackAddMetadata', array('label', 'main_url', array('\Piwik\Site', 'getMainUrlFor'), array()));
+        $dataTable->filter('ColumnCallbackAddMetadata', array('label', 'idsite'));
+
+        // set the label of each row to the site name
+        if ($multipleWebsitesRequested) {
+            $dataTable->queueFilter('ColumnCallbackReplace', array('label', '\Piwik\Site::getNameFor'));
+        } else {
+            $dataTable->queueFilter('ColumnDelete', array('label'));
+        }
+
+        // replace record names with user friendly metric names
+        $dataTable->queueFilter('ReplaceColumnNames', array($columnNameRewrites));
+
+        // filter rows without visits
+        // note: if only one website is queried and there are no visits, we can not remove the row otherwise
+        // ResponseBuilder throws 'Call to a member function getColumns() on a non-object'
+        if ($multipleWebsitesRequested
+            // We don't delete the 0 visits row, if "Enhanced" mode is on.
+            && !$enhanced
+        ) {
+            $dataTable->filter(
+                'ColumnCallbackDeleteRow',
+                array(
+                     self::NB_VISITS_METRIC,
+                     function ($value) {
+                         return $value == 0;
+                     }
+                )
+            );
+        }
+
+        if ($multipleWebsitesRequested && $dataTable->getRowsCount() === 1 && $dataTable instanceof DataTable\Simple) {
+            $simpleTable = $dataTable;
+            $dataTable   = $simpleTable->getEmptyClone();
+            $dataTable->addRow($simpleTable->getFirstRow());
+            unset($simpleTable);
+        }
+
+        return $dataTable;
+    }
+
+    /**
+     * Performs a binary filter of two
+     * DataTables in order to correctly calculate evolution metrics.
+     *
+     * @param DataTable|DataTable\Map $currentData
+     * @param DataTable|DataTable\Map $pastData
+     * @param array $apiMetrics The array of string fields to calculate evolution
+     *                          metrics for.
+     * @throws Exception
+     */
+||||||||NO_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_BINARY_OP
+            (AST_VAR)
+            (SCALAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_VAR)
+            (
+                (AST_STATIC_CALL)
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_STATIC_CALL)
+                        (
+                            (SCALAR))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_STATIC_CALL)
+                            (AST_UNARY_OP
+                                (AST_METHOD_CALL
+                                    (AST_VAR))))
+                        (
+                            (AST_METHOD_CALL
+                                (AST_STATIC_CALL))))
+                    (AST_IF_ELEM
+                        (NULL)
+                        (
+                            (AST_METHOD_CALL
+                                (AST_STATIC_CALL)
+                                (
+                                    (AST_ASSIGN
+                                        (AST_VAR)
+                                        (AST_CONST))
+                                    (AST_VAR))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_STATIC_CALL))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_CALL
+                            (
+                                (AST_VAR)))
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_NEW))
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR))))))
+                    (AST_IF_ELEM
+                        (NULL)
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_ARRAY
+                                    (AST_ARRAY_ELEM
+                                        (AST_METHOD_CALL
+                                            (AST_STATIC_CALL)
+                                            (
+                                                (AST_VAR)))
+                                        (NULL))))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_STATIC_CALL
+            (
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_STATIC_CALL
+            (
+                (AST_VAR))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (AST_VAR)
+        (
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_VAR)
+                    (NULL))
+                (AST_DIM
+                    (AST_VAR)
+                    (AST_CLASS_CONST
+                        (SCALAR))))
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_VAR)
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_CLASS_CONST
+                            (SCALAR))))
+                (AST_VAR))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_CLASS_CONST
+                            (SCALAR)))
+                    (
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR))
+                            (AST_VAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_METHOD_CALL
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_VAR)
+                                (AST_VAR)
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_ARRAY
+            (AST_ARRAY_ELEM
+                (AST_VAR)
+                (NULL))
+            (AST_ARRAY_ELEM
+                (AST_VAR)
+                (NULL)))
+        (AST_STATIC_CALL
+            (
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_CONST))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (AST_CONST))
+                        (
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_STATIC_CALL
+                                        (
+                                            (SCALAR)))
+                                    (AST_VAR))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_STATIC_CALL
+                        (
+                            (AST_VAR)
+                            (AST_VAR)
+                            (AST_VAR)
+                            (AST_VAR)
+                            (AST_VAR))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR)
+                            (AST_VAR))))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (SCALAR)
+                            (NULL))
+                        (AST_ARRAY_ELEM
+                            (SCALAR)
+                            (NULL)))
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (AST_ARRAY)
+                    (NULL)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (SCALAR)
+                            (NULL))
+                        (AST_ARRAY_ELEM
+                            (SCALAR)
+                            (NULL)))
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (AST_ARRAY)
+                    (NULL)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_VAR)
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (SCALAR)
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL)))))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (SCALAR)
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))))))))
+    (AST_STATIC_CALL)
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (AST_VAR)
+                    (NULL)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (AST_CLASS_CONST
+                        (SCALAR))
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_CONST))
+                    (NULL)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_UNARY_OP
+                    (AST_VAR)))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (SCALAR)
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (AST_CLASS_CONST
+                                    (SCALAR))
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (AST_CLOSURE
+                                    (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                    (NULL)
+                                    (
+                                        (AST_RETURN
+                                            (AST_BINARY_OP
+                                                (AST_VAR)
+                                                (SCALAR)))))
+                                (NULL))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_VAR)
+                    (AST_BINARY_OP
+                        (AST_METHOD_CALL
+                            (AST_VAR))
+                        (SCALAR)))
+                (AST_INSTANCEOF
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_VAR))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR))))
+                (AST_UNSET
+                    (AST_VAR)))))
+    (AST_RETURN
+        (AST_VAR)))||||||||NO_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_EMPTY
+                    (AST_VAR)))
+            (
+                (AST_STATIC_CALL
+                    (
+                        (AST_VAR)))
+                (AST_FOREACH
+                    (AST_VAR)
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (NULL))
+                            (AST_DIM
+                                (AST_VAR)
+                                (SCALAR))))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_STATIC_CALL
+            (
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ARRAY))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_STATIC_CALL
+            (
+                (AST_VAR))))
+    (AST_FOREACH
+        (AST_VAR)
+        (AST_VAR)
+        (AST_VAR)
+        (
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_VAR)
+                    (NULL))
+                (AST_DIM
+                    (AST_VAR)
+                    (AST_CLASS_CONST
+                        (SCALAR))))
+            (AST_ASSIGN
+                (AST_DIM
+                    (AST_VAR)
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_CLASS_CONST
+                            (SCALAR))))
+                (AST_VAR))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_DIM
+                        (AST_VAR)
+                        (AST_CLASS_CONST
+                            (SCALAR)))
+                    (
+                        (AST_ASSIGN
+                            (AST_DIM
+                                (AST_VAR)
+                                (AST_VAR))
+                            (AST_VAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR)
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_INSTANCEOF
+                (AST_VAR))
+            (
+                (AST_FOREACH
+                    (AST_METHOD_CALL
+                        (AST_VAR))
+                    (AST_VAR)
+                    (NULL)
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_VAR)
+                                (AST_VAR)
+                                (AST_VAR)))))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_ARRAY
+            (AST_ARRAY_ELEM
+                (AST_VAR)
+                (NULL))
+            (AST_ARRAY_ELEM
+                (AST_VAR)
+                (NULL)))
+        (AST_STATIC_CALL
+            (
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_CONST))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (AST_CONST))
+                        (
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_STATIC_CALL
+                                        (
+                                            (SCALAR)))
+                                    (AST_VAR))))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_STATIC_CALL
+                        (
+                            (AST_VAR)
+                            (AST_VAR)
+                            (AST_VAR)
+                            (AST_VAR)
+                            (AST_VAR))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR))))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (AST_VAR)
+                            (AST_VAR))))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_VAR)
+                        (AST_VAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (SCALAR)
+                            (NULL))
+                        (AST_ARRAY_ELEM
+                            (SCALAR)
+                            (NULL)))
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (AST_ARRAY)
+                    (NULL)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (AST_ARRAY
+                        (AST_ARRAY_ELEM
+                            (SCALAR)
+                            (NULL))
+                        (AST_ARRAY_ELEM
+                            (SCALAR)
+                            (NULL)))
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (AST_ARRAY)
+                    (NULL)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL))
+                (AST_ARRAY_ELEM
+                    (SCALAR)
+                    (NULL)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_VAR)
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (SCALAR)
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL)))))))
+        (AST_IF_ELEM
+            (NULL)
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (SCALAR)
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (SCALAR)
+                                (NULL))))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)
+            (AST_ARRAY
+                (AST_ARRAY_ELEM
+                    (AST_VAR)
+                    (NULL)))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_UNARY_OP
+                    (AST_VAR)))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (SCALAR)
+                        (AST_ARRAY
+                            (AST_ARRAY_ELEM
+                                (AST_CLASS_CONST
+                                    (SCALAR))
+                                (NULL))
+                            (AST_ARRAY_ELEM
+                                (AST_CLOSURE
+                                    (NO_PARAM_TYPENO_PARAM_DEFAULT)
+                                    (NULL)
+                                    (
+                                        (AST_RETURN
+                                            (AST_BINARY_OP
+                                                (AST_VAR)
+                                                (SCALAR)))))
+                                (NULL))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_VAR)
+                    (AST_BINARY_OP
+                        (AST_METHOD_CALL
+                            (AST_VAR))
+                        (SCALAR)))
+                (AST_INSTANCEOF
+                    (AST_VAR)))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_VAR))
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_METHOD_CALL
+                        (AST_VAR)))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR))))
+                (AST_UNSET
+                    (AST_VAR)))))
+    (AST_RETURN
+        (AST_VAR)))

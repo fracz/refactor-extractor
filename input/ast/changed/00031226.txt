@@ -1,0 +1,1774 @@
+    public function run()
+    {
+        $websitesWithVisitsSinceLastRun =
+        $skippedPeriodsArchivesWebsite =
+        $skippedDayArchivesWebsites =
+        $skipped =
+        $processed =
+        $archivedPeriodsArchivesWebsite = 0;
+        $timer = new Piwik_Timer;
+
+        $this->logSection("START");
+        $this->log("Starting Piwik reports archiving...");
+
+        $this->websites = array_unique($this->websites);
+        foreach ($this->websites as $idsite) {
+            flush();
+            $requestsBefore = $this->requests;
+            if ($idsite <= 0) {
+                continue;
+            }
+
+            $timerWebsite = new Piwik_Timer;
+
+            $lastTimestampWebsiteProcessedPeriods = $lastTimestampWebsiteProcessedDay = false;
+            if (!$this->shouldResetState) {
+                $lastTimestampWebsiteProcessedPeriods = Piwik_GetOption($this->lastRunKey($idsite, "periods"));
+                $lastTimestampWebsiteProcessedDay = Piwik_GetOption($this->lastRunKey($idsite, "day"));
+            }
+
+            // For period other than days, we only re-process the reports at most
+            // 1) every $processPeriodsMaximumEverySeconds
+            $secondsSinceLastExecution = time() - $lastTimestampWebsiteProcessedPeriods;
+
+            // if timeout is more than 10 min, we account for a 5 min processing time, and allow trigger 1 min earlier
+            if ($this->processPeriodsMaximumEverySeconds > 10 * 60) {
+                $secondsSinceLastExecution += 5 * 60;
+            }
+            $shouldArchivePeriods = $secondsSinceLastExecution > $this->processPeriodsMaximumEverySeconds;
+            if (empty($lastTimestampWebsiteProcessedPeriods)) {
+                // 2) OR always if script never executed for this website before
+                $shouldArchivePeriods = true;
+            }
+
+
+            // (*) If the website is archived because it is a new day in its timezone
+            // We make sure all periods are archived, even if there is 0 visit today
+            $dayHasEndedMustReprocess = in_array($idsite, $this->websiteDayHasFinishedSinceLastRun);
+            if ($dayHasEndedMustReprocess) {
+                $shouldArchivePeriods = true;
+            }
+
+            // (*) If there was some old reports invalidated for this website
+            // we make sure all these old reports are triggered at least once
+            $websiteIsOldDataInvalidate = in_array($idsite, $this->idSitesInvalidatedOldReports);
+            if ($websiteIsOldDataInvalidate) {
+                $shouldArchivePeriods = true;
+            }
+
+            // Test if we should process this website at all
+            $elapsedSinceLastArchiving = time() - $lastTimestampWebsiteProcessedDay;
+            if (!$websiteIsOldDataInvalidate // Invalidate old website forces the archiving for this site
+                && !$dayHasEndedMustReprocess // Also reprocess when day has ended since last run
+                && $elapsedSinceLastArchiving < $this->todayArchiveTimeToLive
+            ) {
+                $this->log("Skipped website id $idsite, already processed today's report in recent run, "
+                    . Piwik::getPrettyTimeFromSeconds($elapsedSinceLastArchiving, true, $isHtml = false)
+                    . " ago, " . $timerWebsite->__toString());
+                $skippedDayArchivesWebsites++;
+                $skipped++;
+                continue;
+            }
+
+            // Fake that the request is already done, so that other archive.php
+            // running do not grab the same website from the queue
+            Piwik_SetOption($this->lastRunKey($idsite, "day"), time());
+
+            $url = $this->getVisitsRequestUrl($idsite, "day",
+                // when some data was purged from this website
+                // we make sure we query all previous days/weeks/months
+                ($websiteIsOldDataInvalidate
+                    // when --force-all-websites option,
+                    // also forces to archive last52 days to be safe
+                    || $this->shouldArchiveAllWebsites)
+                    ? false
+                    : $lastTimestampWebsiteProcessedDay
+            );
+            $content = $this->request($url);
+            $response = @unserialize($content);
+
+            if (empty($content)
+                || !is_array($response)
+                || count($response) == 0
+            ) {
+                // cancel the succesful run flag
+                Piwik_SetOption($this->lastRunKey($idsite, "day"), 0);
+
+                $this->log("WARNING: Empty or invalid response '$content' for website id $idsite, " . $timerWebsite->__toString() . ", skipping");
+                $skipped++;
+                continue;
+            }
+            $visitsToday = end($response);
+            $this->requests++;
+            $processed++;
+
+            // If there is no visit today and we don't need to process this website, we can skip remaining archives
+            if ($visitsToday <= 0
+                && !$shouldArchivePeriods
+            ) {
+                $this->log("Skipped website id $idsite, no visit today, " . $timerWebsite->__toString());
+                $skipped++;
+                continue;
+            }
+
+            $visitsAllDays = array_sum($response);
+            if ($visitsAllDays == 0
+                && !$shouldArchivePeriods
+                && $this->shouldArchiveAllWebsites
+            ) {
+                $this->log("Skipped website id $idsite, no visits in the last " . count($response) . " days, " . $timerWebsite->__toString());
+                $skipped++;
+                continue;
+            }
+            $this->visits += $visitsToday;
+            $websitesWithVisitsSinceLastRun++;
+            $this->archiveVisitsAndSegments($idsite, "day", $lastTimestampWebsiteProcessedDay, $timerWebsite);
+
+            if ($shouldArchivePeriods) {
+                $success = true;
+                foreach (array('week', 'month', 'year') as $period) {
+                    $success = $this->archiveVisitsAndSegments($idsite, $period, $lastTimestampWebsiteProcessedPeriods) && $success;
+                }
+                // Record succesful run of this website's periods archiving
+                if ($success) {
+                    Piwik_SetOption($this->lastRunKey($idsite, "periods"), time());
+
+                    // Remove this website from the list of websites to be invalidated
+                    // since it's now just been re-processing the reports, job is done!
+                    if ($websiteIsOldDataInvalidate) {
+                        $websiteIdsInvalidated = Piwik_CoreAdminHome_API::getWebsiteIdsToInvalidate();
+                        if (count($websiteIdsInvalidated)) {
+                            $found = array_search($idsite, $websiteIdsInvalidated);
+                            if ($found !== false) {
+                                unset($websiteIdsInvalidated[$found]);
+//								$this->log("Websites left to invalidate: " . implode(", ", $websiteIdsInvalidated));
+                                Piwik_SetOption(Piwik_CoreAdminHome_API::OPTION_INVALIDATED_IDSITES, serialize($websiteIdsInvalidated));
+                            }
+                        }
+                    }
+                }
+            }
+            $archivedPeriodsArchivesWebsite++;
+
+            $requestsWebsite = $this->requests - $requestsBefore;
+            $debug = $this->shouldArchiveAllWebsites ? ", last days = $visitsAllDays visits" : "";
+            Piwik::log("Archived website id = $idsite, today = $visitsToday visits"
+                . $debug . ", $requestsWebsite API requests, "
+                . $timerWebsite->__toString()
+                . " [" . ($websitesWithVisitsSinceLastRun + $skipped) . "/"
+                . count($this->websites)
+                . " done]");
+
+        }
+
+        $this->log("Done archiving!");
+
+        $this->logSection("SUMMARY");
+        $this->log("Total daily visits archived: " . $this->visits);
+
+        $totalWebsites = count($this->allWebsites);
+        $skipped = $totalWebsites - $websitesWithVisitsSinceLastRun;
+        $this->log("Archived today's reports for $websitesWithVisitsSinceLastRun websites");
+        $this->log("Archived week/month/year for $archivedPeriodsArchivesWebsite websites. ");
+        $this->log("Skipped $skipped websites: no new visit since the last script execution");
+        $this->log("Skipped $skippedDayArchivesWebsites websites day archiving: existing daily reports are less than {$this->todayArchiveTimeToLive} seconds old");
+        $this->log("Skipped $skippedPeriodsArchivesWebsite websites week/month/year archiving: existing periods reports are less than {$this->processPeriodsMaximumEverySeconds} seconds old");
+        $this->log("Total API requests: $this->requests");
+
+        //DONE: done/total, visits, wtoday, wperiods, reqs, time, errors[count]: first eg.
+        $percent = count($this->websites) == 0
+            ? ""
+            : " " . round($processed * 100 / count($this->websites), 0) . "%";
+        $otherInParallel = $skippedDayArchivesWebsites;
+        $this->log("done: " .
+                $processed . "/" . count($this->websites) . "" . $percent . ", " .
+                $this->visits . " v, $websitesWithVisitsSinceLastRun wtoday, $archivedPeriodsArchivesWebsite wperiods, " .
+                $this->requests . " req, " . round($timer->getTimeMs()) . " ms, " .
+                (empty($this->errors)
+                    ? "no error"
+                    : (count($this->errors) . " errors. eg. '" . reset($this->errors) . "'"))
+        );
+        $this->log($timer->__toString());
+        $this->logSection("SCHEDULED TASKS");
+        $this->log("Starting Scheduled tasks... ");
+
+        $tasksOutput = $this->request("?module=API&method=CoreAdminHome.runScheduledTasks&format=csv&convertToUnicode=0&token_auth=" . $this->token_auth);
+        if ($tasksOutput == "No data available") {
+            $tasksOutput = " No task to run";
+        }
+        $this->log($tasksOutput);
+        $this->log("done");
+    }
+
+
+||||||||    public function run()
+    {
+        $websitesWithVisitsSinceLastRun =
+        $skippedPeriodsArchivesWebsite =
+        $skippedDayArchivesWebsites =
+        $skipped =
+        $processed =
+        $archivedPeriodsArchivesWebsite = 0;
+        $timer = new Piwik_Timer;
+
+        $this->logSection("START");
+        $this->log("Starting Piwik reports archiving...");
+
+        $this->websites = array_unique($this->websites);
+        foreach ($this->websites as $idsite) {
+            flush();
+            $requestsBefore = $this->requests;
+            if ($idsite <= 0) {
+                continue;
+            }
+
+            $timerWebsite = new Piwik_Timer;
+
+            $lastTimestampWebsiteProcessedPeriods = $lastTimestampWebsiteProcessedDay = false;
+            if (!$this->shouldResetState) {
+                $lastTimestampWebsiteProcessedPeriods = Piwik_GetOption($this->lastRunKey($idsite, "periods"));
+                $lastTimestampWebsiteProcessedDay = Piwik_GetOption($this->lastRunKey($idsite, "day"));
+            }
+
+            // For period other than days, we only re-process the reports at most
+            // 1) every $processPeriodsMaximumEverySeconds
+            $secondsSinceLastExecution = time() - $lastTimestampWebsiteProcessedPeriods;
+
+            // if timeout is more than 10 min, we account for a 5 min processing time, and allow trigger 1 min earlier
+            if ($this->processPeriodsMaximumEverySeconds > 10 * 60) {
+                $secondsSinceLastExecution += 5 * 60;
+            }
+            $shouldArchivePeriods = $secondsSinceLastExecution > $this->processPeriodsMaximumEverySeconds;
+            if (empty($lastTimestampWebsiteProcessedPeriods)) {
+                // 2) OR always if script never executed for this website before
+                $shouldArchivePeriods = true;
+            }
+
+
+            // (*) If the website is archived because it is a new day in its timezone
+            // We make sure all periods are archived, even if there is 0 visit today
+            $dayHasEndedMustReprocess = in_array($idsite, $this->websiteDayHasFinishedSinceLastRun);
+            if ($dayHasEndedMustReprocess) {
+                $shouldArchivePeriods = true;
+            }
+
+            // (*) If there was some old reports invalidated for this website
+            // we make sure all these old reports are triggered at least once
+            $websiteIsOldDataInvalidate = in_array($idsite, $this->idSitesInvalidatedOldReports);
+            if ($websiteIsOldDataInvalidate) {
+                $shouldArchivePeriods = true;
+            }
+
+            // Test if we should process this website at all
+            $elapsedSinceLastArchiving = time() - $lastTimestampWebsiteProcessedDay;
+            if (!$websiteIsOldDataInvalidate // Invalidate old website forces the archiving for this site
+                && !$dayHasEndedMustReprocess // Also reprocess when day has ended since last run
+                && $elapsedSinceLastArchiving < $this->todayArchiveTimeToLive
+            ) {
+                $this->log("Skipped website id $idsite, already processed today's report in recent run, "
+                    . Piwik::getPrettyTimeFromSeconds($elapsedSinceLastArchiving, true, $isHtml = false)
+                    . " ago, " . $timerWebsite->__toString());
+                $skippedDayArchivesWebsites++;
+                $skipped++;
+                continue;
+            }
+
+            // Fake that the request is already done, so that other archive.php
+            // running do not grab the same website from the queue
+            Piwik_SetOption($this->lastRunKey($idsite, "day"), time());
+
+            $url = $this->getVisitsRequestUrl($idsite, "day",
+                // when some data was purged from this website
+                // we make sure we query all previous days/weeks/months
+                ($websiteIsOldDataInvalidate
+                    // when --force-all-websites option,
+                    // also forces to archive last52 days to be safe
+                    || $this->shouldArchiveAllWebsites)
+                    ? false
+                    : $lastTimestampWebsiteProcessedDay
+            );
+            $content = $this->request($url);
+            $response = @unserialize($content);
+
+            if (empty($content)
+                || !is_array($response)
+                || count($response) == 0
+            ) {
+                // cancel the succesful run flag
+                Piwik_SetOption($this->lastRunKey($idsite, "day"), 0);
+
+                $this->log("WARNING: Empty or invalid response '$content' for website id $idsite, " . $timerWebsite->__toString() . ", skipping");
+                $skipped++;
+                continue;
+            }
+            $visitsToday = end($response);
+            if(empty($visitsToday)) {
+                $visitsToday = 0;
+            }
+            $this->requests++;
+            $processed++;
+
+            // If there is no visit today and we don't need to process this website, we can skip remaining archives
+            if ($visitsToday == 0
+                && !$shouldArchivePeriods
+            ) {
+                $this->log("Skipped website id $idsite, no visit today, " . $timerWebsite->__toString());
+                $skipped++;
+                continue;
+            }
+
+            $visitsAllDays = array_sum($response);
+            if ($visitsAllDays == 0
+                && !$shouldArchivePeriods
+                && $this->shouldArchiveAllWebsites
+            ) {
+                $this->log("Skipped website id $idsite, no visits in the last " . count($response) . " days, " . $timerWebsite->__toString());
+                $skipped++;
+                continue;
+            }
+            $this->visits += $visitsToday;
+            $websitesWithVisitsSinceLastRun++;
+            $this->archiveVisitsAndSegments($idsite, "day", $lastTimestampWebsiteProcessedDay, $timerWebsite);
+
+            if ($shouldArchivePeriods) {
+                $success = true;
+                foreach (array('week', 'month', 'year') as $period) {
+                    $success = $this->archiveVisitsAndSegments($idsite, $period, $lastTimestampWebsiteProcessedPeriods) && $success;
+                }
+                // Record succesful run of this website's periods archiving
+                if ($success) {
+                    Piwik_SetOption($this->lastRunKey($idsite, "periods"), time());
+
+                    // Remove this website from the list of websites to be invalidated
+                    // since it's now just been re-processing the reports, job is done!
+                    if ($websiteIsOldDataInvalidate) {
+                        $websiteIdsInvalidated = Piwik_CoreAdminHome_API::getWebsiteIdsToInvalidate();
+                        if (count($websiteIdsInvalidated)) {
+                            $found = array_search($idsite, $websiteIdsInvalidated);
+                            if ($found !== false) {
+                                unset($websiteIdsInvalidated[$found]);
+//								$this->log("Websites left to invalidate: " . implode(", ", $websiteIdsInvalidated));
+                                Piwik_SetOption(Piwik_CoreAdminHome_API::OPTION_INVALIDATED_IDSITES, serialize($websiteIdsInvalidated));
+                            }
+                        }
+                    }
+                }
+            }
+            $archivedPeriodsArchivesWebsite++;
+
+            $requestsWebsite = $this->requests - $requestsBefore;
+            $debug = $this->shouldArchiveAllWebsites ? ", last days = $visitsAllDays visits" : "";
+            Piwik::log("Archived website id = $idsite, today = $visitsToday visits"
+                . $debug . ", $requestsWebsite API requests, "
+                . $timerWebsite->__toString()
+                . " [" . ($websitesWithVisitsSinceLastRun + $skipped) . "/"
+                . count($this->websites)
+                . " done]");
+
+        }
+
+        $this->log("Done archiving!");
+
+        $this->logSection("SUMMARY");
+        $this->log("Total daily visits archived: " . $this->visits);
+
+        $totalWebsites = count($this->allWebsites);
+        $skipped = $totalWebsites - $websitesWithVisitsSinceLastRun;
+        $this->log("Archived today's reports for $websitesWithVisitsSinceLastRun websites");
+        $this->log("Archived week/month/year for $archivedPeriodsArchivesWebsite websites. ");
+        $this->log("Skipped $skipped websites: no new visit since the last script execution");
+        $this->log("Skipped $skippedDayArchivesWebsites websites day archiving: existing daily reports are less than {$this->todayArchiveTimeToLive} seconds old");
+        $this->log("Skipped $skippedPeriodsArchivesWebsite websites week/month/year archiving: existing periods reports are less than {$this->processPeriodsMaximumEverySeconds} seconds old");
+        $this->log("Total API requests: $this->requests");
+
+        //DONE: done/total, visits, wtoday, wperiods, reqs, time, errors[count]: first eg.
+        $percent = count($this->websites) == 0
+            ? ""
+            : " " . round($processed * 100 / count($this->websites), 0) . "%";
+        $otherInParallel = $skippedDayArchivesWebsites;
+        $this->log("done: " .
+                $processed . "/" . count($this->websites) . "" . $percent . ", " .
+                $this->visits . " v, $websitesWithVisitsSinceLastRun wtoday, $archivedPeriodsArchivesWebsite wperiods, " .
+                $this->requests . " req, " . round($timer->getTimeMs()) . " ms, " .
+                (empty($this->errors)
+                    ? "no error"
+                    : (count($this->errors) . " errors. eg. '" . reset($this->errors) . "'"))
+        );
+        $this->log($timer->__toString());
+        $this->logSection("SCHEDULED TASKS");
+        $this->log("Starting Scheduled tasks... ");
+
+        $tasksOutput = $this->request("?module=API&method=CoreAdminHome.runScheduledTasks&format=csv&convertToUnicode=0&token_auth=" . $this->token_auth);
+        if ($tasksOutput == "No data available") {
+            $tasksOutput = " No task to run";
+        }
+        $this->log($tasksOutput);
+        $this->log("done");
+    }
+
+
+||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ASSIGN
+            (AST_VAR)
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_NEW))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CALL
+            (
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_FOREACH
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_CALL)
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_VAR)
+                        (SCALAR))
+                    (
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_NEW))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_UNARY_OP
+                        (AST_PROP
+                            (AST_VAR)))
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR)
+                                            (SCALAR))))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR)
+                                            (SCALAR)))))))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_BINARY_OP
+                    (AST_CALL)
+                    (AST_VAR)))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_PROP
+                            (AST_VAR))
+                        (AST_BINARY_OP
+                            (SCALAR)
+                            (SCALAR)))
+                    (
+                        (AST_ASSIGN_OP
+                            (AST_VAR)
+                            (AST_BINARY_OP
+                                (SCALAR)
+                                (SCALAR))))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_BINARY_OP
+                    (AST_VAR)
+                    (AST_PROP
+                        (AST_VAR))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_EMPTY
+                        (AST_VAR))
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CONST)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_VAR)
+                        (AST_PROP
+                            (AST_VAR)))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_VAR)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CONST)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_VAR)
+                        (AST_PROP
+                            (AST_VAR)))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_VAR)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CONST)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_BINARY_OP
+                    (AST_CALL)
+                    (AST_VAR)))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_UNARY_OP
+                                (AST_VAR))
+                            (AST_UNARY_OP
+                                (AST_VAR)))
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR))))
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_BINARY_OP
+                                            (AST_ENCAPS_LIST
+                                                (SCALAR)
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (AST_STATIC_CALL
+                                                (
+                                                    (AST_VAR)
+                                                    (AST_CONST)
+                                                    (AST_ASSIGN
+                                                        (AST_VAR)
+                                                        (AST_CONST)))))
+                                        (SCALAR))
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)))))
+                        (AST_POST_INC
+                            (AST_VAR))
+                        (AST_POST_INC
+                            (AST_VAR))
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_CALL
+                (
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (SCALAR)))
+                    (AST_CALL)))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (SCALAR)
+                        (AST_CONDITIONAL
+                            (AST_BINARY_OP
+                                (AST_VAR)
+                                (AST_PROP
+                                    (AST_VAR)))
+                            (AST_CONST)
+                            (AST_VAR)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_UNARY_OP
+                    (AST_CALL
+                        (
+                            (AST_VAR)))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_EMPTY
+                                (AST_VAR))
+                            (AST_UNARY_OP
+                                (AST_CALL
+                                    (
+                                        (AST_VAR)))))
+                        (AST_BINARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_VAR)))
+                            (SCALAR)))
+                    (
+                        (AST_CALL
+                            (
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR)
+                                        (SCALAR)))
+                                (SCALAR)))
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_ENCAPS_LIST
+                                            (SCALAR)
+                                            (AST_VAR)
+                                            (SCALAR)
+                                            (AST_VAR)
+                                            (SCALAR))
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)))
+                                    (SCALAR))))
+                        (AST_POST_INC
+                            (AST_VAR))
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_VAR))))
+            (AST_POST_INC
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_POST_INC
+                (AST_VAR))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (SCALAR))
+                        (AST_UNARY_OP
+                            (AST_VAR)))
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_BINARY_OP
+                                    (AST_ENCAPS_LIST
+                                        (SCALAR)
+                                        (AST_VAR)
+                                        (SCALAR))
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)))))
+                        (AST_POST_INC
+                            (AST_VAR))
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_VAR))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_VAR)
+                                (SCALAR))
+                            (AST_UNARY_OP
+                                (AST_VAR)))
+                        (AST_PROP
+                            (AST_VAR)))
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_BINARY_OP
+                                            (AST_ENCAPS_LIST
+                                                (SCALAR)
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (AST_CALL
+                                                (
+                                                    (AST_VAR))))
+                                        (SCALAR))
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)))))
+                        (AST_POST_INC
+                            (AST_VAR))
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_ASSIGN_OP
+                (AST_PROP
+                    (AST_VAR))
+                (AST_VAR))
+            (AST_POST_INC
+                (AST_VAR))
+            (AST_METHOD_CALL
+                (AST_VAR)
+                (
+                    (AST_VAR)
+                    (SCALAR)
+                    (AST_VAR)
+                    (AST_VAR)))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_VAR)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CONST))
+                        (AST_FOREACH
+                            (AST_ARRAY
+                                (AST_ARRAY_ELEM
+                                    (SCALAR)
+                                    (NULL))
+                                (AST_ARRAY_ELEM
+                                    (SCALAR)
+                                    (NULL))
+                                (AST_ARRAY_ELEM
+                                    (SCALAR)
+                                    (NULL)))
+                            (AST_VAR)
+                            (NULL)
+                            (
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_BINARY_OP
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR)
+                                                (AST_VAR)
+                                                (AST_VAR)))
+                                        (AST_VAR)))))
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_VAR)
+                                (
+                                    (AST_CALL
+                                        (
+                                            (AST_METHOD_CALL
+                                                (AST_VAR)
+                                                (
+                                                    (AST_VAR)
+                                                    (SCALAR)))
+                                            (AST_CALL)))
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_VAR)
+                                            (
+                                                (AST_ASSIGN
+                                                    (AST_VAR)
+                                                    (AST_STATIC_CALL))
+                                                (AST_IF
+                                                    (AST_IF_ELEM
+                                                        (AST_CALL
+                                                            (
+                                                                (AST_VAR)))
+                                                        (
+                                                            (AST_ASSIGN
+                                                                (AST_VAR)
+                                                                (AST_CALL
+                                                                    (
+                                                                        (AST_VAR)
+                                                                        (AST_VAR))))
+                                                            (AST_IF
+                                                                (AST_IF_ELEM
+                                                                    (AST_BINARY_OP
+                                                                        (AST_VAR)
+                                                                        (AST_CONST))
+                                                                    (
+                                                                        (AST_UNSET
+                                                                            (AST_DIM
+                                                                                (AST_VAR)
+                                                                                (AST_VAR)))
+                                                                        (AST_CALL
+                                                                            (
+                                                                                (AST_CLASS_CONST
+                                                                                    (SCALAR))
+                                                                                (AST_CALL
+                                                                                    (
+                                                                                        (AST_VAR))))))))))))))))))))
+            (AST_POST_INC
+                (AST_VAR))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_BINARY_OP
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_CONDITIONAL
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_ENCAPS_LIST
+                        (SCALAR)
+                        (AST_VAR)
+                        (SCALAR))
+                    (SCALAR)))
+            (AST_STATIC_CALL
+                (
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_BINARY_OP
+                                            (AST_BINARY_OP
+                                                (AST_BINARY_OP
+                                                    (AST_ENCAPS_LIST
+                                                        (SCALAR)
+                                                        (AST_VAR)
+                                                        (SCALAR)
+                                                        (AST_VAR)
+                                                        (SCALAR))
+                                                    (AST_VAR))
+                                                (AST_ENCAPS_LIST
+                                                    (SCALAR)
+                                                    (AST_VAR)
+                                                    (SCALAR)))
+                                            (AST_METHOD_CALL
+                                                (AST_VAR)))
+                                        (SCALAR))
+                                    (AST_BINARY_OP
+                                        (AST_VAR)
+                                        (AST_VAR)))
+                                (SCALAR))
+                            (AST_CALL
+                                (
+                                    (AST_PROP
+                                        (AST_VAR)))))
+                        (SCALAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_BINARY_OP
+                (SCALAR)
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_BINARY_OP
+            (AST_VAR)
+            (AST_VAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_ENCAPS_LIST
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_ENCAPS_LIST
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_ENCAPS_LIST
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_ENCAPS_LIST
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR)
+                (AST_PROP
+                    (AST_VAR))
+                (SCALAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_ENCAPS_LIST
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR)
+                (AST_PROP
+                    (AST_VAR))
+                (SCALAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_ENCAPS_LIST
+                (SCALAR)
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONDITIONAL
+            (AST_BINARY_OP
+                (AST_CALL
+                    (
+                        (AST_PROP
+                            (AST_VAR))))
+                (SCALAR))
+            (SCALAR)
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (SCALAR)
+                    (AST_CALL
+                        (
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_VAR)
+                                    (SCALAR))
+                                (AST_CALL
+                                    (
+                                        (AST_PROP
+                                            (AST_VAR)))))
+                            (SCALAR))))
+                (SCALAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_BINARY_OP
+                                            (AST_BINARY_OP
+                                                (AST_BINARY_OP
+                                                    (AST_BINARY_OP
+                                                        (AST_BINARY_OP
+                                                            (AST_BINARY_OP
+                                                                (SCALAR)
+                                                                (AST_VAR))
+                                                            (SCALAR))
+                                                        (AST_CALL
+                                                            (
+                                                                (AST_PROP
+                                                                    (AST_VAR)))))
+                                                    (SCALAR))
+                                                (AST_VAR))
+                                            (SCALAR))
+                                        (AST_PROP
+                                            (AST_VAR)))
+                                    (AST_ENCAPS_LIST
+                                        (SCALAR)
+                                        (AST_VAR)
+                                        (SCALAR)
+                                        (AST_VAR)
+                                        (SCALAR)))
+                                (AST_PROP
+                                    (AST_VAR)))
+                            (SCALAR))
+                        (AST_CALL
+                            (
+                                (AST_METHOD_CALL
+                                    (AST_VAR)))))
+                    (SCALAR))
+                (AST_CONDITIONAL
+                    (AST_EMPTY
+                        (AST_PROP
+                            (AST_VAR)))
+                    (SCALAR)
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_CALL
+                                    (
+                                        (AST_PROP
+                                            (AST_VAR))))
+                                (SCALAR))
+                            (AST_CALL
+                                (
+                                    (AST_PROP
+                                        (AST_VAR)))))
+                        (SCALAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_METHOD_CALL
+                (AST_VAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_BINARY_OP
+                    (SCALAR)
+                    (AST_PROP
+                        (AST_VAR))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (SCALAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR))))||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_ASSIGN
+            (AST_VAR)
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_ASSIGN
+                        (AST_VAR)
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_NEW))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_CALL
+            (
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_FOREACH
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR)
+        (NULL)
+        (
+            (AST_CALL)
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_VAR)
+                        (SCALAR))
+                    (
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_NEW))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CONST)))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_UNARY_OP
+                        (AST_PROP
+                            (AST_VAR)))
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR)
+                                            (SCALAR))))))
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR)
+                                            (SCALAR)))))))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_BINARY_OP
+                    (AST_CALL)
+                    (AST_VAR)))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_PROP
+                            (AST_VAR))
+                        (AST_BINARY_OP
+                            (SCALAR)
+                            (SCALAR)))
+                    (
+                        (AST_ASSIGN_OP
+                            (AST_VAR)
+                            (AST_BINARY_OP
+                                (SCALAR)
+                                (SCALAR))))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_BINARY_OP
+                    (AST_VAR)
+                    (AST_PROP
+                        (AST_VAR))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_EMPTY
+                        (AST_VAR))
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CONST)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_VAR)
+                        (AST_PROP
+                            (AST_VAR)))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_VAR)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CONST)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_VAR)
+                        (AST_PROP
+                            (AST_VAR)))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_VAR)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CONST)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_BINARY_OP
+                    (AST_CALL)
+                    (AST_VAR)))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_UNARY_OP
+                                (AST_VAR))
+                            (AST_UNARY_OP
+                                (AST_VAR)))
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (AST_PROP
+                                (AST_VAR))))
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_BINARY_OP
+                                            (AST_ENCAPS_LIST
+                                                (SCALAR)
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (AST_STATIC_CALL
+                                                (
+                                                    (AST_VAR)
+                                                    (AST_CONST)
+                                                    (AST_ASSIGN
+                                                        (AST_VAR)
+                                                        (AST_CONST)))))
+                                        (SCALAR))
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)))))
+                        (AST_POST_INC
+                            (AST_VAR))
+                        (AST_POST_INC
+                            (AST_VAR))
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_CALL
+                (
+                    (AST_METHOD_CALL
+                        (AST_VAR)
+                        (
+                            (AST_VAR)
+                            (SCALAR)))
+                    (AST_CALL)))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (SCALAR)
+                        (AST_CONDITIONAL
+                            (AST_BINARY_OP
+                                (AST_VAR)
+                                (AST_PROP
+                                    (AST_VAR)))
+                            (AST_CONST)
+                            (AST_VAR)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_UNARY_OP
+                    (AST_CALL
+                        (
+                            (AST_VAR)))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_EMPTY
+                                (AST_VAR))
+                            (AST_UNARY_OP
+                                (AST_CALL
+                                    (
+                                        (AST_VAR)))))
+                        (AST_BINARY_OP
+                            (AST_CALL
+                                (
+                                    (AST_VAR)))
+                            (SCALAR)))
+                    (
+                        (AST_CALL
+                            (
+                                (AST_METHOD_CALL
+                                    (AST_VAR)
+                                    (
+                                        (AST_VAR)
+                                        (SCALAR)))
+                                (SCALAR)))
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_ENCAPS_LIST
+                                            (SCALAR)
+                                            (AST_VAR)
+                                            (SCALAR)
+                                            (AST_VAR)
+                                            (SCALAR))
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)))
+                                    (SCALAR))))
+                        (AST_POST_INC
+                            (AST_VAR))
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_VAR))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_EMPTY
+                        (AST_VAR))
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (SCALAR)))))
+            (AST_POST_INC
+                (AST_PROP
+                    (AST_VAR)))
+            (AST_POST_INC
+                (AST_VAR))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (SCALAR))
+                        (AST_UNARY_OP
+                            (AST_VAR)))
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_BINARY_OP
+                                    (AST_ENCAPS_LIST
+                                        (SCALAR)
+                                        (AST_VAR)
+                                        (SCALAR))
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)))))
+                        (AST_POST_INC
+                            (AST_VAR))
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_VAR))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_VAR)
+                                (SCALAR))
+                            (AST_UNARY_OP
+                                (AST_VAR)))
+                        (AST_PROP
+                            (AST_VAR)))
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_BINARY_OP
+                                            (AST_ENCAPS_LIST
+                                                (SCALAR)
+                                                (AST_VAR)
+                                                (SCALAR))
+                                            (AST_CALL
+                                                (
+                                                    (AST_VAR))))
+                                        (SCALAR))
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)))))
+                        (AST_POST_INC
+                            (AST_VAR))
+                        (AST_CONTINUE
+                            (NULL)))))
+            (AST_ASSIGN_OP
+                (AST_PROP
+                    (AST_VAR))
+                (AST_VAR))
+            (AST_POST_INC
+                (AST_VAR))
+            (AST_METHOD_CALL
+                (AST_VAR)
+                (
+                    (AST_VAR)
+                    (SCALAR)
+                    (AST_VAR)
+                    (AST_VAR)))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_VAR)
+                    (
+                        (AST_ASSIGN
+                            (AST_VAR)
+                            (AST_CONST))
+                        (AST_FOREACH
+                            (AST_ARRAY
+                                (AST_ARRAY_ELEM
+                                    (SCALAR)
+                                    (NULL))
+                                (AST_ARRAY_ELEM
+                                    (SCALAR)
+                                    (NULL))
+                                (AST_ARRAY_ELEM
+                                    (SCALAR)
+                                    (NULL)))
+                            (AST_VAR)
+                            (NULL)
+                            (
+                                (AST_ASSIGN
+                                    (AST_VAR)
+                                    (AST_BINARY_OP
+                                        (AST_METHOD_CALL
+                                            (AST_VAR)
+                                            (
+                                                (AST_VAR)
+                                                (AST_VAR)
+                                                (AST_VAR)))
+                                        (AST_VAR)))))
+                        (AST_IF
+                            (AST_IF_ELEM
+                                (AST_VAR)
+                                (
+                                    (AST_CALL
+                                        (
+                                            (AST_METHOD_CALL
+                                                (AST_VAR)
+                                                (
+                                                    (AST_VAR)
+                                                    (SCALAR)))
+                                            (AST_CALL)))
+                                    (AST_IF
+                                        (AST_IF_ELEM
+                                            (AST_VAR)
+                                            (
+                                                (AST_ASSIGN
+                                                    (AST_VAR)
+                                                    (AST_STATIC_CALL))
+                                                (AST_IF
+                                                    (AST_IF_ELEM
+                                                        (AST_CALL
+                                                            (
+                                                                (AST_VAR)))
+                                                        (
+                                                            (AST_ASSIGN
+                                                                (AST_VAR)
+                                                                (AST_CALL
+                                                                    (
+                                                                        (AST_VAR)
+                                                                        (AST_VAR))))
+                                                            (AST_IF
+                                                                (AST_IF_ELEM
+                                                                    (AST_BINARY_OP
+                                                                        (AST_VAR)
+                                                                        (AST_CONST))
+                                                                    (
+                                                                        (AST_UNSET
+                                                                            (AST_DIM
+                                                                                (AST_VAR)
+                                                                                (AST_VAR)))
+                                                                        (AST_CALL
+                                                                            (
+                                                                                (AST_CLASS_CONST
+                                                                                    (SCALAR))
+                                                                                (AST_CALL
+                                                                                    (
+                                                                                        (AST_VAR))))))))))))))))))))
+            (AST_POST_INC
+                (AST_VAR))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_BINARY_OP
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_VAR)))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_CONDITIONAL
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_ENCAPS_LIST
+                        (SCALAR)
+                        (AST_VAR)
+                        (SCALAR))
+                    (SCALAR)))
+            (AST_STATIC_CALL
+                (
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_BINARY_OP
+                                            (AST_BINARY_OP
+                                                (AST_BINARY_OP
+                                                    (AST_ENCAPS_LIST
+                                                        (SCALAR)
+                                                        (AST_VAR)
+                                                        (SCALAR)
+                                                        (AST_VAR)
+                                                        (SCALAR))
+                                                    (AST_VAR))
+                                                (AST_ENCAPS_LIST
+                                                    (SCALAR)
+                                                    (AST_VAR)
+                                                    (SCALAR)))
+                                            (AST_METHOD_CALL
+                                                (AST_VAR)))
+                                        (SCALAR))
+                                    (AST_BINARY_OP
+                                        (AST_VAR)
+                                        (AST_VAR)))
+                                (SCALAR))
+                            (AST_CALL
+                                (
+                                    (AST_PROP
+                                        (AST_VAR)))))
+                        (SCALAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_BINARY_OP
+                (SCALAR)
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CALL
+            (
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_BINARY_OP
+            (AST_VAR)
+            (AST_VAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_ENCAPS_LIST
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_ENCAPS_LIST
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_ENCAPS_LIST
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_ENCAPS_LIST
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR)
+                (AST_PROP
+                    (AST_VAR))
+                (SCALAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_ENCAPS_LIST
+                (SCALAR)
+                (AST_VAR)
+                (SCALAR)
+                (AST_PROP
+                    (AST_VAR))
+                (SCALAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_ENCAPS_LIST
+                (SCALAR)
+                (AST_PROP
+                    (AST_VAR)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CONDITIONAL
+            (AST_BINARY_OP
+                (AST_CALL
+                    (
+                        (AST_PROP
+                            (AST_VAR))))
+                (SCALAR))
+            (SCALAR)
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (SCALAR)
+                    (AST_CALL
+                        (
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_VAR)
+                                    (SCALAR))
+                                (AST_CALL
+                                    (
+                                        (AST_PROP
+                                            (AST_VAR)))))
+                            (SCALAR))))
+                (SCALAR))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_VAR))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (AST_BINARY_OP
+                                            (AST_BINARY_OP
+                                                (AST_BINARY_OP
+                                                    (AST_BINARY_OP
+                                                        (AST_BINARY_OP
+                                                            (AST_BINARY_OP
+                                                                (SCALAR)
+                                                                (AST_VAR))
+                                                            (SCALAR))
+                                                        (AST_CALL
+                                                            (
+                                                                (AST_PROP
+                                                                    (AST_VAR)))))
+                                                    (SCALAR))
+                                                (AST_VAR))
+                                            (SCALAR))
+                                        (AST_PROP
+                                            (AST_VAR)))
+                                    (AST_ENCAPS_LIST
+                                        (SCALAR)
+                                        (AST_VAR)
+                                        (SCALAR)
+                                        (AST_VAR)
+                                        (SCALAR)))
+                                (AST_PROP
+                                    (AST_VAR)))
+                            (SCALAR))
+                        (AST_CALL
+                            (
+                                (AST_METHOD_CALL
+                                    (AST_VAR)))))
+                    (SCALAR))
+                (AST_CONDITIONAL
+                    (AST_EMPTY
+                        (AST_PROP
+                            (AST_VAR)))
+                    (SCALAR)
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_CALL
+                                    (
+                                        (AST_PROP
+                                            (AST_VAR))))
+                                (SCALAR))
+                            (AST_CALL
+                                (
+                                    (AST_PROP
+                                        (AST_VAR)))))
+                        (SCALAR))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_METHOD_CALL
+                (AST_VAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_BINARY_OP
+                    (SCALAR)
+                    (AST_PROP
+                        (AST_VAR))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (SCALAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (SCALAR))))

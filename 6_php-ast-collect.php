@@ -6,7 +6,14 @@ const ADDED_METHODS = RESULT_DIR . '/added.txt';
 const DELETED_METHODS = RESULT_DIR . '/deleted.txt';
 const CHANGED_METHODS_BEFORE = RESULT_DIR . '/changed-before.txt';
 const CHANGED_METHODS_AFTER = RESULT_DIR . '/changed-after.txt';
+const CHANGED_DIR = RESULT_DIR . '/changed/';
+const ADDED_DIR = RESULT_DIR . '/added/';
+const DELETED_DIR = RESULT_DIR . '/deleted/';
 const DIFF_SEPARATOR = '||||||||';
+
+mkdir(CHANGED_DIR);
+mkdir(ADDED_DIR);
+mkdir(DELETED_DIR);
 
 file_put_contents(ADDED_METHODS, '');
 file_put_contents(DELETED_METHODS, '');
@@ -35,6 +42,10 @@ $tokens = array_map(function ($token) {
 $tokenLengths = array_map('strlen', array_keys($tokens));
 array_multisort($tokenLengths, SORT_DESC, $tokens);
 
+$changedCounter = 0;
+$addedCounter = 0;
+$deletedCounter = 0;
+
 foreach ($projects as $project) {
     $projectDir = $projectsDir . $project;
     if (!is_dir($projectDir)) {
@@ -55,11 +66,15 @@ foreach ($projects as $project) {
                 if ($astBefore && $astAfter) {
                     file_put_contents(CHANGED_METHODS_BEFORE, $astBefore . PHP_EOL, FILE_APPEND);
                     file_put_contents(CHANGED_METHODS_AFTER, $astAfter . PHP_EOL, FILE_APPEND);
-                } elseif ($astBefore) {
-                    file_put_contents(DELETED_METHODS, $astBefore . PHP_EOL, FILE_APPEND);
-                } else {
-                    file_put_contents(ADDED_METHODS, $astAfter . PHP_EOL, FILE_APPEND);
+                    file_put_contents(CHANGED_DIR . sprintf("%08d", ++$changedCounter) . '.txt', $diffFile);
                 }
+//                elseif ($astBefore) {
+//                    file_put_contents(DELETED_METHODS, $astBefore . PHP_EOL, FILE_APPEND);
+//                    file_put_contents(DELETED_DIR . sprintf("%08d", ++$deletedCounter) . '.txt', $diffFile);
+//                } else {
+//                    file_put_contents(ADDED_METHODS, $astAfter . PHP_EOL, FILE_APPEND);
+//                    file_put_contents(ADDED_DIR . sprintf("%08d", ++$addedCounter) . '.txt', $diffFile);
+//                }
             }
         }
     }

@@ -1,0 +1,653 @@
+    public function execute_query($filters, $usercontexts) {
+        global $USER;
+
+        // Let's keep these changes internal.
+        $data = clone $filters;
+
+        // If there is any problem we trigger the exception as soon as possible.
+        $client = $this->get_search_client();
+
+        $serverstatus = $this->is_server_ready();
+        if ($serverstatus !== true) {
+            throw new \core_search\engine_exception('engineserverstatus', 'search');
+        }
+
+        $query = new \SolrDisMaxQuery();
+        $maxrows = \core_search\manager::MAX_RESULTS;
+        if ($this->file_indexing_enabled()) {
+            // When using file indexing and grouping, we are going to collapse results, so we want extra results.
+            $maxrows *= 2;
+        }
+        $this->set_query($query, $data->q, $maxrows);
+        $this->add_fields($query);
+
+        // Search filters applied, we don't cache these filters as we don't want to pollute the cache with tmp filters
+        // we are really interested in caching contexts filters instead.
+        if (!empty($data->title)) {
+            $query->addFilterQuery('{!field cache=false f=title}' . $data->title);
+        }
+        if (!empty($data->areaid)) {
+            // Even if it is only supposed to contain PARAM_ALPHANUMEXT, better to prevent.
+            $query->addFilterQuery('{!field cache=false f=areaid}' . $data->areaid);
+        }
+
+        if (!empty($data->timestart) or !empty($data->timeend)) {
+            if (empty($data->timestart)) {
+                $data->timestart = '*';
+            } else {
+                $data->timestart = \search_solr\document::format_time_for_engine($data->timestart);
+            }
+            if (empty($data->timeend)) {
+                $data->timeend = '*';
+            } else {
+                $data->timeend = \search_solr\document::format_time_for_engine($data->timeend);
+            }
+
+            // No cache.
+            $query->addFilterQuery('{!cache=false}modified:[' . $data->timestart . ' TO ' . $data->timeend . ']');
+        }
+
+        // Restrict to users who are supposed to be able to see a particular result.
+        $query->addFilterQuery('owneruserid:(' . \core_search\manager::NO_OWNER_ID . ' OR ' . $USER->id . ')');
+
+        // And finally restrict it to the context where the user can access, we want this one cached.
+        // If the user can access all contexts $usercontexts value is just true, we don't need to filter
+        // in that case.
+        if ($usercontexts && is_array($usercontexts)) {
+            if (!empty($data->areaid)) {
+                $query->addFilterQuery('contextid:(' . implode(' OR ', $usercontexts[$data->areaid]) . ')');
+            } else {
+                // Join all area contexts into a single array and implode.
+                $allcontexts = array();
+                foreach ($usercontexts as $areacontexts) {
+                    foreach ($areacontexts as $contextid) {
+                        // Ensure they are unique.
+                        $allcontexts[$contextid] = $contextid;
+                    }
+                }
+                $query->addFilterQuery('contextid:(' . implode(' OR ', $allcontexts) . ')');
+            }
+        }
+
+        try {
+            if ($this->file_indexing_enabled()) {
+                // Now group records by solr_filegroupingid. Limit to 3 results per group.
+                $query->setGroup(true);
+                $query->setGroupLimit(3);
+                $query->addGroupField('solr_filegroupingid');
+                return $this->grouped_files_query_response($client->query($query));
+            } else {
+                return $this->query_response($client->query($query));
+            }
+        } catch (\SolrClientException $ex) {
+            debugging('Error executing the provided query: ' . $ex->getMessage(), DEBUG_DEVELOPER);
+            $this->queryerror = $ex->getMessage();
+            return array();
+        } catch (\SolrServerException $ex) {
+            debugging('Error executing the provided query: ' . $ex->getMessage(), DEBUG_DEVELOPER);
+            $this->queryerror = $ex->getMessage();
+            return array();
+        }
+
+    }
+
+    /**
+     * Prepares a new query by setting the query, start offset and rows to return.
+     *
+     * @param SolrQuery $query
+     * @param object    $q Containing query and filters.
+     * @param null|int  $maxresults The number of results to limit. manager::MAX_RESULTS if not set.
+     */
+||||||||    public function execute_query($filters, $usercontexts, $limit = 0) {
+        global $USER;
+
+        if (empty($limit)) {
+            $limit = \core_search\manager::MAX_RESULTS;
+        }
+
+        // If there is any problem we trigger the exception as soon as possible.
+        $client = $this->get_search_client();
+        $serverstatus = $this->is_server_ready();
+        if ($serverstatus !== true) {
+            throw new \core_search\engine_exception('engineserverstatus', 'search');
+        }
+
+        // Create the query object.
+        $query = $this->create_user_query($filters, $usercontexts);
+
+        // We expect good match rates, so for our first get, we will get a small number of records.
+        // This significantly speeds solr response time for first few pages.
+        $query->setRows(min($limit * 3, static::QUERY_SIZE));
+        $response = $this->get_query_response($query);
+
+        // Get count data out of the response, and reset our counters.
+        list($included, $found) = $this->get_response_counts($response);
+        $this->totalenginedocs = $found;
+        $this->processeddocs = 0;
+        $this->skippeddocs = 0;
+        if ($included == 0 || $this->totalenginedocs == 0) {
+            // No results.
+            return array();
+        }
+
+        // Get valid documents out of the response.
+        $results = $this->process_response($response, $limit);
+
+        // We have processed all the docs in the response at this point.
+        $this->processeddocs += $included;
+
+        // If we haven't reached the limit, and there are more docs left in Solr, lets keep trying.
+        while (count($results) < $limit && ($this->totalenginedocs - $this->processeddocs) > 0) {
+            // Offset the start of the query, and since we are making another call, get more per call.
+            $query->setStart($this->processeddocs);
+            $query->setRows(static::QUERY_SIZE);
+
+            $response = $this->get_query_response($query);
+            list($included, $found) = $this->get_response_counts($response);
+            if ($included == 0 || $found == 0) {
+                // No new results were found. Found being empty would be weird, so we will just return.
+                return $results;
+            }
+            $this->totalenginedocs = $found;
+
+            // Get the new response docs, limiting to remaining we need, then add it to the end of the results array.
+            $newdocs = $this->process_response($response, $limit - count($results));
+            $results = array_merge($results, $newdocs);
+
+            // Add to our processed docs count.
+            $this->processeddocs += $included;
+        }
+
+        return $results;
+    }
+
+    /**
+     * Takes a query and returns the response in SolrObject format.
+     *
+     * @param  SolrQuery  $query Solr query object.
+     * @return SolrObject|false Response document or false on error.
+     */
+||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_GLOBAL
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CLONE
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_CONST))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_NEW))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_CLASS_CONST
+            (SCALAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_METHOD_CALL
+                (AST_VAR))
+            (
+                (AST_ASSIGN_OP
+                    (AST_VAR)
+                    (SCALAR)))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)
+            (AST_PROP
+                (AST_VAR))
+            (AST_VAR)))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_EMPTY
+                    (AST_PROP
+                        (AST_VAR))))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_BINARY_OP
+                            (SCALAR)
+                            (AST_PROP
+                                (AST_VAR))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_UNARY_OP
+                (AST_EMPTY
+                    (AST_PROP
+                        (AST_VAR))))
+            (
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_BINARY_OP
+                            (SCALAR)
+                            (AST_PROP
+                                (AST_VAR))))))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_UNARY_OP
+                    (AST_EMPTY
+                        (AST_PROP
+                            (AST_VAR))))
+                (AST_UNARY_OP
+                    (AST_EMPTY
+                        (AST_PROP
+                            (AST_VAR)))))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_EMPTY
+                            (AST_PROP
+                                (AST_VAR)))
+                        (
+                            (AST_ASSIGN
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR))))
+                    (AST_IF_ELEM
+                        (NULL)
+                        (
+                            (AST_ASSIGN
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_STATIC_CALL
+                                    (
+                                        (AST_PROP
+                                            (AST_VAR))))))))
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_EMPTY
+                            (AST_PROP
+                                (AST_VAR)))
+                        (
+                            (AST_ASSIGN
+                                (AST_PROP
+                                    (AST_VAR))
+                                (SCALAR))))
+                    (AST_IF_ELEM
+                        (NULL)
+                        (
+                            (AST_ASSIGN
+                                (AST_PROP
+                                    (AST_VAR))
+                                (AST_STATIC_CALL
+                                    (
+                                        (AST_PROP
+                                            (AST_VAR))))))))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_BINARY_OP
+                            (AST_BINARY_OP
+                                (AST_BINARY_OP
+                                    (AST_BINARY_OP
+                                        (SCALAR)
+                                        (AST_PROP
+                                            (AST_VAR)))
+                                    (SCALAR))
+                                (AST_PROP
+                                    (AST_VAR)))
+                            (SCALAR)))))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (SCALAR)
+                            (AST_CLASS_CONST
+                                (SCALAR)))
+                        (SCALAR))
+                    (AST_PROP
+                        (AST_VAR)))
+                (SCALAR))))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_VAR))))
+            (
+                (AST_IF
+                    (AST_IF_ELEM
+                        (AST_UNARY_OP
+                            (AST_EMPTY
+                                (AST_PROP
+                                    (AST_VAR))))
+                        (
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_BINARY_OP
+                                        (AST_BINARY_OP
+                                            (SCALAR)
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (AST_DIM
+                                                        (AST_VAR)
+                                                        (AST_PROP
+                                                            (AST_VAR))))))
+                                        (SCALAR))))))
+                    (AST_IF_ELEM
+                        (NULL)
+                        (
+                            (AST_ASSIGN
+                                (AST_VAR)
+                                (AST_ARRAY))
+                            (AST_FOREACH
+                                (AST_VAR)
+                                (AST_VAR)
+                                (NULL)
+                                (
+                                    (AST_FOREACH
+                                        (AST_VAR)
+                                        (AST_VAR)
+                                        (NULL)
+                                        (
+                                            (AST_ASSIGN
+                                                (AST_DIM
+                                                    (AST_VAR)
+                                                    (AST_VAR))
+                                                (AST_VAR))))))
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_BINARY_OP
+                                        (AST_BINARY_OP
+                                            (SCALAR)
+                                            (AST_CALL
+                                                (
+                                                    (SCALAR)
+                                                    (AST_VAR))))
+                                        (SCALAR))))))))))
+    (AST_TRY
+        (
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_METHOD_CALL
+                        (AST_VAR))
+                    (
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (AST_CONST)))
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (SCALAR)))
+                        (AST_METHOD_CALL
+                            (AST_VAR)
+                            (
+                                (SCALAR)))
+                        (AST_RETURN
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR))))))))
+                (AST_IF_ELEM
+                    (NULL)
+                    (
+                        (AST_RETURN
+                            (AST_METHOD_CALL
+                                (AST_VAR)
+                                (
+                                    (AST_METHOD_CALL
+                                        (AST_VAR)
+                                        (
+                                            (AST_VAR))))))))))
+        (AST_CATCH_LIST
+            (AST_CATCH
+                (AST_NAME_LIST)
+                (AST_VAR)
+                (
+                    (AST_CALL
+                        (
+                            (AST_BINARY_OP
+                                (SCALAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)))
+                            (AST_CONST)))
+                    (AST_ASSIGN
+                        (AST_PROP
+                            (AST_VAR))
+                        (AST_METHOD_CALL
+                            (AST_VAR)))
+                    (AST_RETURN
+                        (AST_ARRAY))))
+            (AST_CATCH
+                (AST_NAME_LIST)
+                (AST_VAR)
+                (
+                    (AST_CALL
+                        (
+                            (AST_BINARY_OP
+                                (SCALAR)
+                                (AST_METHOD_CALL
+                                    (AST_VAR)))
+                            (AST_CONST)))
+                    (AST_ASSIGN
+                        (AST_PROP
+                            (AST_VAR))
+                        (AST_METHOD_CALL
+                            (AST_VAR)))
+                    (AST_RETURN
+                        (AST_ARRAY)))))
+        (NULL)))||||||||HAS_DOC_COMMENTNO_RETURN_TYPE
+(NO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULTNO_PARAM_TYPENO_PARAM_DEFAULT)
+(
+    (AST_GLOBAL
+        (AST_VAR))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_EMPTY
+                (AST_VAR))
+            (
+                (AST_ASSIGN
+                    (AST_VAR)
+                    (AST_CLASS_CONST
+                        (SCALAR))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_VAR)
+                (AST_CONST))
+            (
+                (AST_THROW
+                    (AST_NEW
+                        (
+                            (SCALAR)
+                            (SCALAR)))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_METHOD_CALL
+        (AST_VAR)
+        (
+            (AST_CALL
+                (
+                    (AST_BINARY_OP
+                        (AST_VAR)
+                        (SCALAR))
+                    (AST_CLASS_CONST
+                        (SCALAR))))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_ARRAY
+            (AST_ARRAY_ELEM
+                (AST_VAR)
+                (NULL))
+            (AST_ARRAY_ELEM
+                (AST_VAR)
+                (NULL)))
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR))))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (SCALAR))
+    (AST_ASSIGN
+        (AST_PROP
+            (AST_VAR))
+        (SCALAR))
+    (AST_IF
+        (AST_IF_ELEM
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_VAR)
+                    (SCALAR))
+                (AST_BINARY_OP
+                    (AST_PROP
+                        (AST_VAR))
+                    (SCALAR)))
+            (
+                (AST_RETURN
+                    (AST_ARRAY)))))
+    (AST_ASSIGN
+        (AST_VAR)
+        (AST_METHOD_CALL
+            (AST_VAR)
+            (
+                (AST_VAR)
+                (AST_VAR))))
+    (AST_ASSIGN_OP
+        (AST_PROP
+            (AST_VAR))
+        (AST_VAR))
+    (AST_WHILE
+        (AST_BINARY_OP
+            (AST_BINARY_OP
+                (AST_CALL
+                    (
+                        (AST_VAR)))
+                (AST_VAR))
+            (AST_BINARY_OP
+                (AST_BINARY_OP
+                    (AST_PROP
+                        (AST_VAR))
+                    (AST_PROP
+                        (AST_VAR)))
+                (SCALAR)))
+        (
+            (AST_METHOD_CALL
+                (AST_VAR)
+                (
+                    (AST_PROP
+                        (AST_VAR))))
+            (AST_METHOD_CALL
+                (AST_VAR)
+                (
+                    (AST_CLASS_CONST
+                        (SCALAR))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR))))
+            (AST_ASSIGN
+                (AST_ARRAY
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (NULL))
+                    (AST_ARRAY_ELEM
+                        (AST_VAR)
+                        (NULL)))
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR))))
+            (AST_IF
+                (AST_IF_ELEM
+                    (AST_BINARY_OP
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (SCALAR))
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (SCALAR)))
+                    (
+                        (AST_RETURN
+                            (AST_VAR)))))
+            (AST_ASSIGN
+                (AST_PROP
+                    (AST_VAR))
+                (AST_VAR))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_METHOD_CALL
+                    (AST_VAR)
+                    (
+                        (AST_VAR)
+                        (AST_BINARY_OP
+                            (AST_VAR)
+                            (AST_CALL
+                                (
+                                    (AST_VAR)))))))
+            (AST_ASSIGN
+                (AST_VAR)
+                (AST_CALL
+                    (
+                        (AST_VAR)
+                        (AST_VAR))))
+            (AST_ASSIGN_OP
+                (AST_PROP
+                    (AST_VAR))
+                (AST_VAR))))
+    (AST_RETURN
+        (AST_VAR)))
