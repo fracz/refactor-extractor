@@ -5,7 +5,7 @@ $project = $argc == 2 ? $argv[1] : 'domnikl/DesignPatternsPHP';
 
 $REPO_DIR = __DIR__ . '/repos/' . $project;
 const REFACTOR_KEYWORDS = ['refactor', 'improve', 'reorganize', 'readability'];
-const EXTENSION_FILTER = ['php']; //['java', 'js', 'ts', 'php', 'cs'];
+const EXTENSION_FILTER = ['java']; //['java', 'js', 'ts', 'php', 'cs'];
 
 chdir($REPO_DIR);
 
