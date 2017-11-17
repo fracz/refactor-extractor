@@ -4,11 +4,12 @@ require 'class.Diff.php';
 
 ini_set('memory_limit', '2G');
 
-$maxLength = 10;
+$maxLength = 100;
 $tokensTreatedAsBad = ['AST_IF', 'ZEND_AST_IF', 'AST_IF_ELEM'];
 $astDir = __DIR__ . '/input/ast/';
 
-$tokens = array_flip(array_map('trim', file(__DIR__ . '/tokens.txt')));
+$tokensByNumber = array_map('trim', file(__DIR__ . '/tokens.txt'));
+$tokens = array_flip($tokensByNumber);
 
 $badCostsByName = [
     'AST_IF' => 2,
@@ -42,7 +43,7 @@ function calculateCost(array $tokens): int
     }, $tokens));
 }
 
-$readDataset = function ($fileBefore, $fileAfter) use ($maxLength, $astDir, $tokensTreatedAsBad) {
+$readDataset = function ($fileBefore, $fileAfter) use ($tokensByNumber, $maxLength, $astDir, $tokensTreatedAsBad) {
 
 
     $rowsBefore = explode(PHP_EOL, file_get_contents($astDir . $fileBefore));
@@ -59,13 +60,24 @@ $readDataset = function ($fileBefore, $fileAfter) use ($maxLength, $astDir, $tok
             unset($rowsBefore[$i]);
             unset($rowsAfter[$i]);
         } else {
-            $diff = Diff::compare(str_replace(',', PHP_EOL, $rowsBefore[$i]), str_replace(',', PHP_EOL, $rowsAfter[$i]));
+            $beforeForDiff = str_replace(',', PHP_EOL, $rowsBefore[$i]);
+            $afterForDiff = str_replace(',', PHP_EOL, $rowsAfter[$i]);
+//            $beforeForDiff = implode(PHP_EOL, array_map(function ($int) use ($tokensByNumber) {
+//                return $tokensByNumber[$int];
+//            }, explode(',', $rowsBefore[$i])));
+//            $afterForDiff = implode(PHP_EOL, array_map(function ($int) use ($tokensByNumber) {
+//                return $tokensByNumber[$int];
+//            }, explode(',', $rowsAfter[$i])));
+            $diff = Diff::compare($beforeForDiff, $afterForDiff);
             $changed = array_filter($diff, function ($d) {
                 return $d[1] != Diff::UNMODIFIED;
             });
-            if (count($changed) < 3) {
+            if (count($changed) < 10) {
                 unset($rowsBefore[$i]);
                 unset($rowsAfter[$i]);
+            } else {
+//                $change = implode(' ', array_map(function($c) { return $c[0]; }, $changed));
+//                time();
             }
         }
     }
