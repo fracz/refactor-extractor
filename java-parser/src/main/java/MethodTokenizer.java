@@ -2,6 +2,7 @@ import com.github.javaparser.JavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.comments.LineComment;
 import com.github.javaparser.ast.expr.*;
 import com.github.javaparser.ast.visitor.VoidVisitor;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
@@ -25,7 +26,8 @@ public class MethodTokenizer {
             NameExpr.class.getSimpleName(),
             StringLiteralExpr.class.getSimpleName(),
             NullLiteralExpr.class.getSimpleName(),
-            Name.class.getSimpleName()
+            Name.class.getSimpleName(),
+            LineComment.class.getSimpleName()
     );
 
     public static Map<String, Pair<MethodDeclaration, String>> tokenize(String filePath) {
