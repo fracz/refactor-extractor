@@ -1,0 +1,11 @@
+commit 2b384af7d7c63afa06cf684c24867757d7e54969
+Author: cpovirk <cpovirk@google.com>
+Date:   Tue Mar 1 10:36:25 2016 -0800
+
+    Encourage users to use framworks instead of chaining things together manually.
+
+    As part of that, I tried to clarify the significance of using ListenableFuture "as an input to another Future." I don't love what I've ended up with, but I'm not optimistic that I'll do better anytime soon.
+    One part of *that* was switching part of the doc to the second person simply because I couldn't find a good way to make it flow otherwise. I ended up propogating this to more of the doc, and I think it's probably a small net improvement.
+    -------------
+    Created by MOE: https://github.com/google/moe
+    MOE_MIGRATED_REVID=116019725

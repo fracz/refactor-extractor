@@ -1,0 +1,51 @@
+package com.airbnb.lottie.animatable;
+
+import android.graphics.PointF;
+
+import com.airbnb.lottie.model.LottieComposition;
+import com.airbnb.lottie.utils.JsonUtils;
+import com.airbnb.lottie.animation.KeyframeAnimation;
+import com.airbnb.lottie.animation.PointKeyframeAnimation;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+public class AnimatablePointValue extends BaseAnimatableValue<PointF, PointF> {
+
+    public AnimatablePointValue(JSONObject pointValues, int frameRate, LottieComposition composition) {
+        super(pointValues, frameRate, composition, true);
+    }
+
+    @Override
+    protected PointF valueFromObject(Object object, float scale) throws JSONException {
+        if (object instanceof JSONArray) {
+            return JsonUtils.pointFromJsonArray((JSONArray) object, scale);
+        } else if (object instanceof JSONObject) {
+            return JsonUtils.pointValueFromJsonObject((JSONObject) object, scale);
+        }
+        throw new IllegalArgumentException("Unable to parse point from " + object);
+    }
+
+    @Override
+    public KeyframeAnimation<PointF> animationForKeyPath() {
+        if (!hasAnimation()) {
+            return null;
+        }
+
+        KeyframeAnimation<PointF> animation = new PointKeyframeAnimation(duration, composition, keyTimes, keyValues, interpolators);
+        animation.setStartDelay(delay);
+        animation.addUpdateListener(new KeyframeAnimation.AnimationListener<PointF>() {
+            @Override
+            public void onValueChanged(PointF progress) {
+                observable.setValue(progress);
+            }
+        });
+        return animation;
+    }
+
+    @Override
+    public boolean hasAnimation() {
+        return !keyValues.isEmpty();
+    }
+}

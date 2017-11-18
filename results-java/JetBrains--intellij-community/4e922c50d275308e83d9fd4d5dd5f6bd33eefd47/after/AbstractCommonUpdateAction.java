@@ -1,0 +1,423 @@
+/*
+ * Copyright (c) 2004 JetBrains s.r.o. All  Rights Reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * -Redistributions of source code must retain the above copyright
+ *  notice, this list of conditions and the following disclaimer.
+ *
+ * -Redistribution in binary form must reproduct the above copyright
+ *  notice, this list of conditions and the following disclaimer in
+ *  the documentation and/or other materials provided with the distribution.
+ *
+ * Neither the name of JetBrains or IntelliJ IDEA
+ * may be used to endorse or promote products derived from this software
+ * without specific prior written permission.
+ *
+ * This software is provided "AS IS," without a warranty of any kind. ALL
+ * EXPRESS OR IMPLIED CONDITIONS, REPRESENTATIONS AND WARRANTIES, INCLUDING
+ * ANY IMPLIED WARRANTY OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE
+ * OR NON-INFRINGEMENT, ARE HEREBY EXCLUDED. JETBRAINS AND ITS LICENSORS SHALL NOT
+ * BE LIABLE FOR ANY DAMAGES OR LIABILITIES SUFFERED BY LICENSEE AS A RESULT
+ * OF OR RELATING TO USE, MODIFICATION OR DISTRIBUTION OF THE SOFTWARE OR ITS
+ * DERIVATIVES. IN NO EVENT WILL JETBRAINS OR ITS LICENSORS BE LIABLE FOR ANY LOST
+ * REVENUE, PROFIT OR DATA, OR FOR DIRECT, INDIRECT, SPECIAL, CONSEQUENTIAL,
+ * INCIDENTAL OR PUNITIVE DAMAGES, HOWEVER CAUSED AND REGARDLESS OF THE THEORY
+ * OF LIABILITY, ARISING OUT OF THE USE OF OR INABILITY TO USE SOFTWARE, EVEN
+ * IF JETBRAINS HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+ *
+ */
+package com.intellij.openapi.vcs.update;
+
+import com.intellij.history.LocalHistoryAction;
+import com.intellij.openapi.actionSystem.AnActionEvent;
+import com.intellij.openapi.actionSystem.Presentation;
+import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.options.Configurable;
+import com.intellij.openapi.progress.ProcessCanceledException;
+import com.intellij.openapi.progress.ProgressIndicator;
+import com.intellij.openapi.progress.ProgressManager;
+import com.intellij.openapi.progress.Task;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.project.ex.ProjectManagerEx;
+import com.intellij.openapi.ui.Messages;
+import com.intellij.openapi.vcs.*;
+import com.intellij.openapi.vcs.actions.AbstractVcsAction;
+import com.intellij.openapi.vcs.actions.VcsContext;
+import com.intellij.openapi.vcs.changes.committed.CommittedChangesAdapter;
+import com.intellij.openapi.vcs.changes.committed.CommittedChangesCache;
+import com.intellij.openapi.vcs.ex.ProjectLevelVcsManagerEx;
+import com.intellij.openapi.vcs.versionBrowser.CommittedChangeList;
+import com.intellij.openapi.vfs.VfsUtil;
+import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.util.concurrency.Semaphore;
+import com.intellij.util.messages.MessageBusConnection;
+import com.intellij.util.ui.OptionsDialog;
+import com.intellij.vcsUtil.VcsUtil;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import java.util.*;
+
+public abstract class AbstractCommonUpdateAction extends AbstractVcsAction {
+
+  private final ActionInfo myActionInfo;
+  private final ScopeInfo myScopeInfo;
+
+  protected AbstractCommonUpdateAction(ActionInfo actionInfo, ScopeInfo scopeInfo) {
+    myActionInfo = actionInfo;
+    myScopeInfo = scopeInfo;
+  }
+
+  private String getCompleteActionName(VcsContext dataContext) {
+    return myActionInfo.getActionName(myScopeInfo.getScopeName(dataContext, myActionInfo));
+  }
+
+  protected void actionPerformed(final VcsContext context) {
+    final Project project = context.getProject();
+    final ProjectLevelVcsManagerEx projectLevelVcsManager = ProjectLevelVcsManagerEx.getInstanceEx(project);
+
+    boolean showUpdateOptions = myActionInfo.showOptions(project);
+
+    final UpdatedFiles updatedFiles = UpdatedFiles.create();
+    if (project != null) {
+      try {
+        if (ApplicationManager.getApplication().isDispatchThread()) {
+          ApplicationManager.getApplication().saveAll();
+        }
+
+        final FilePath[] filePaths = myScopeInfo.getRoots(context, myActionInfo);
+        final FilePath[] roots = filterDescindingFiles(filterRoots(filePaths, context), project);
+        if (roots.length == 0) {
+          return;
+        }
+
+        final Map<AbstractVcs, Collection<FilePath>> vcsToVirtualFiles = createVcsToFilesMap(roots, project);
+
+
+        if (showUpdateOptions || OptionsDialog.shiftIsPressed(context.getModifiers())) {
+          showOptionsDialog(vcsToVirtualFiles, project, context);
+        }
+        final ArrayList<VcsException> vcsExceptions = new ArrayList<VcsException>();
+        final List<UpdateSession> updateSessions = new ArrayList<UpdateSession>();
+
+        Task.Backgroundable task = new Task.Backgroundable(project, getTemplatePresentation().getText(), true,
+                                                           VcsConfiguration.getInstance(project).getUpdateOption()) {
+          public void run(final ProgressIndicator indicator) {
+            ProjectManagerEx.getInstanceEx().blockReloadingProjectOnExternalChanges();
+            projectLevelVcsManager.startBackgroundVcsOperation();
+            ProgressIndicator progressIndicator = ProgressManager.getInstance().getProgressIndicator();
+            int toBeProcessed = vcsToVirtualFiles.size();
+            int processed = 0;
+            for (AbstractVcs vcs : vcsToVirtualFiles.keySet()) {
+              final UpdateEnvironment updateEnvironment = myActionInfo.getEnvironment(vcs);
+              updateEnvironment.fillGroups(updatedFiles);
+              Collection<FilePath> files = vcsToVirtualFiles.get(vcs);
+              UpdateSession updateSession =
+                updateEnvironment.updateDirectories(files.toArray(new FilePath[files.size()]), updatedFiles, progressIndicator);
+              processed++;
+              if (progressIndicator != null) {
+                progressIndicator.setFraction((double)processed / (double)toBeProcessed);
+              }
+              vcsExceptions.addAll(updateSession.getExceptions());
+              updateSessions.add(updateSession);
+            }
+
+            if (progressIndicator != null) {
+              progressIndicator.setText(VcsBundle.message("progress.text.synchronizing.files"));
+              progressIndicator.setText2("");
+            }
+
+            final LocalHistoryAction action = AbstractVcsHelper.getInstance(project).startLocalHistoryAction(VcsBundle.message(
+              "local.history.update.from.vcs"));
+            try {
+              final Semaphore semaphore = new Semaphore();
+              semaphore.down();
+
+              ApplicationManager.getApplication().invokeLater(new Runnable() {
+                public void run() {
+                  VcsUtil.refreshFiles(roots, new Runnable() {
+                    public void run() {
+                      semaphore.up();
+                    }
+                  });
+                }
+              });
+              semaphore.waitFor();
+            }
+            finally {
+              action.finish();
+            }
+          }
+
+          @Nullable
+          public NotificationInfo getNotificationInfo() {
+            StringBuffer text = new StringBuffer();
+            final List<FileGroup> groups = updatedFiles.getTopLevelGroups();
+            for (FileGroup group : groups) {
+              appendGroup(text, group);
+            }
+
+            return new NotificationInfo("VCS Update", "VCS Update Finished", text.toString(), true);
+          }
+
+          private void appendGroup(final StringBuffer text, final FileGroup group) {
+            final int s = group.getFiles().size();
+            if (s > 0) {
+              if (text.length() > 0) text.append("\n");
+              text.append(s + " Files " + group.getUpdateName());
+            }
+
+            final List<FileGroup> list = group.getChildren();
+            for (FileGroup g : list) {
+              appendGroup(text, g);
+            }
+          }
+
+          public void onSuccess() {
+            if (!someSessionWasCanceled(updateSessions)) {
+              for (final UpdateSession updateSession : updateSessions) {
+                updateSession.onRefreshFilesCompleted();
+              }
+            }
+
+            if (!someSessionWasCanceled(updateSessions)) {
+
+              ApplicationManager.getApplication().invokeLater(new Runnable() {
+                public void run() {
+                  if (!vcsExceptions.isEmpty()) {
+                    AbstractVcsHelper.getInstance(project).showErrors(vcsExceptions, VcsBundle.message("message.title.vcs.update.errors",
+                                                                                                       getTemplatePresentation().getText()));
+                  }
+                  else {
+                    final ProgressIndicator indicator = ProgressManager.getInstance().getProgressIndicator();
+                    if (indicator != null) {
+                      indicator.setText(VcsBundle.message("progress.text.updating.done"));
+                    }
+                  }
+
+                  if (updatedFiles.isEmpty() && vcsExceptions.isEmpty()) {
+                    Messages.showMessageDialog(getAllFilesAreUpToDateMessage(roots),
+                                               getTemplatePresentation().getText(),
+                                               Messages.getInformationIcon());
+
+                  }
+                  else if (!updatedFiles.isEmpty()) {
+                    RestoreUpdateTree restoreUpdateTree = RestoreUpdateTree.getInstance(project);
+                    restoreUpdateTree.registerUpdateInformation(updatedFiles, myActionInfo);
+                    final UpdateInfoTree updateInfoTree = projectLevelVcsManager.showUpdateProjectInfo(updatedFiles,
+                                                                                                       getTemplatePresentation().getText(),
+                                                                                                       myActionInfo);
+                    updateInfoTree.setCanGroupByChangeList(canGroupByChangelist(vcsToVirtualFiles.keySet()));
+                    final MessageBusConnection messageBusConnection = project.getMessageBus().connect();
+                    messageBusConnection.subscribe(CommittedChangesCache.COMMITTED_TOPIC, new CommittedChangesAdapter() {
+                      public void incomingChangesUpdated(final List<CommittedChangeList> receivedChanges) {
+                        if (receivedChanges != null) {
+                          ApplicationManager.getApplication().invokeLater(new Runnable() {
+                            public void run() {
+                              updateInfoTree.setChangeLists(receivedChanges);
+                            }
+                          }, myProject.getDisposed());
+                          messageBusConnection.disconnect();
+                        }
+                      }
+                    });
+                    final CommittedChangesCache cache = CommittedChangesCache.getInstance(project);
+                    cache.processUpdatedFiles(updatedFiles);
+                  }
+
+                  ProjectManagerEx.getInstanceEx().unblockReloadingProjectOnExternalChanges();
+                }
+              });
+            }
+            projectLevelVcsManager.stopBackgroundVcsOperation();
+          }
+
+          public void onCancel() {
+            onSuccess();
+          }
+        };
+
+        ProgressManager.getInstance().run(task);
+      }
+      catch (ProcessCanceledException e1) {
+        //ignore
+      }
+    }
+  }
+
+  private boolean canGroupByChangelist(final Set<AbstractVcs> abstractVcses) {
+    if (myActionInfo.canGroupByChangelist()) {
+      for(AbstractVcs vcs: abstractVcses) {
+        if (vcs.getCachingCommittedChangesProvider() != null) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private static boolean someSessionWasCanceled(List<UpdateSession> updateSessions) {
+    for (UpdateSession updateSession : updateSessions) {
+      if (updateSession.isCanceled()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static String getAllFilesAreUpToDateMessage(FilePath[] roots) {
+    if (roots.length == 1 && !roots[0].isDirectory()) {
+      return VcsBundle.message("message.text.file.is.up.to.date");
+    }
+    else {
+      return VcsBundle.message("message.text.all.files.are.up.to.date");
+    }
+  }
+
+  private void showOptionsDialog(final Map<AbstractVcs, Collection<FilePath>> updateEnvToVirtualFiles, final Project project,
+                                 final VcsContext dataContext) {
+    LinkedHashMap<Configurable, AbstractVcs> envToConfMap = createConfigurableToEnvMap(updateEnvToVirtualFiles);
+    if (!envToConfMap.isEmpty()) {
+      UpdateOrStatusOptionsDialog dialogOrStatus = myActionInfo.createOptionsDialog(project, envToConfMap,
+                                                                                    myScopeInfo.getScopeName(dataContext,
+                                                                                                             myActionInfo));
+      dialogOrStatus.show();
+      if (!dialogOrStatus.isOK()) {
+        throw new ProcessCanceledException();
+      }
+    }
+  }
+
+  private LinkedHashMap<Configurable, AbstractVcs> createConfigurableToEnvMap(Map<AbstractVcs, Collection<FilePath>> updateEnvToVirtualFiles) {
+    LinkedHashMap<Configurable, AbstractVcs> envToConfMap = new LinkedHashMap<Configurable, AbstractVcs>();
+    for (AbstractVcs vcs : updateEnvToVirtualFiles.keySet()) {
+      Configurable configurable = myActionInfo.getEnvironment(vcs).createConfigurable(updateEnvToVirtualFiles.get(vcs));
+      if (configurable != null) {
+        envToConfMap.put(configurable, vcs);
+      }
+    }
+    return envToConfMap;
+  }
+
+  private Map<AbstractVcs,Collection<FilePath>> createVcsToFilesMap(FilePath[] roots, Project project) {
+    HashMap<AbstractVcs, Collection<FilePath>> result = new HashMap<AbstractVcs, Collection<FilePath>>();
+
+    for (FilePath file : roots) {
+      AbstractVcs vcs = VcsUtil.getVcsFor(project, file);
+      if (vcs != null) {
+        UpdateEnvironment updateEnvironment = myActionInfo.getEnvironment(vcs);
+        if (updateEnvironment != null) {
+          if (!result.containsKey(vcs)) result.put(vcs, new HashSet<FilePath>());
+          result.get(vcs).add(file);
+        }
+      }
+    }
+
+    for (final Collection<FilePath> filePaths : result.values()) {
+      filterSubDirectories(filePaths);
+    }
+
+    return result;
+  }
+
+  private static void filterSubDirectories(Collection<FilePath> virtualFiles) {
+    FilePath[] array = virtualFiles.toArray(new FilePath[virtualFiles.size()]);
+    for (FilePath file : array) {
+      if (containsParent(array, file)) {
+        virtualFiles.remove(file);
+      }
+    }
+  }
+
+  private static boolean containsParent(FilePath[] array, FilePath file) {
+    for (FilePath virtualFile : array) {
+      if (virtualFile == file) continue;
+      if (VfsUtil.isAncestor(virtualFile.getIOFile(), file.getIOFile(), false)) return true;
+    }
+    return false;
+  }
+
+  @NotNull
+  private FilePath[] filterRoots(FilePath[] roots, VcsContext vcsContext) {
+    final ArrayList<FilePath> result = new ArrayList<FilePath>();
+    for (FilePath file : roots) {
+      AbstractVcs vcs = VcsUtil.getVcsFor(vcsContext.getProject(), file);
+      if (vcs != null) {
+        if (!myScopeInfo.filterExistsInVcs() || vcs.fileExistsInVcs(file)) {
+          UpdateEnvironment updateEnvironment = myActionInfo.getEnvironment(vcs);
+          if (updateEnvironment != null) {
+            result.add(file);
+          }
+        }
+        else {
+          final VirtualFile virtualFile = file.getVirtualFile();
+          if (virtualFile != null && virtualFile.isDirectory()) {
+            final VirtualFile[] vcsRoots = ProjectLevelVcsManager.getInstance(vcsContext.getProject()).getAllVersionedRoots();
+            for(VirtualFile vcsRoot: vcsRoots) {
+              if (VfsUtil.isAncestor(virtualFile, vcsRoot, false)) {
+                result.add(file);
+              }
+            }
+          }
+        }
+      }
+    }
+    return result.toArray(new FilePath[result.size()]);
+  }
+
+  protected abstract boolean filterRootsBeforeAction();
+
+  protected void update(VcsContext vcsContext, Presentation presentation) {
+    Project project = vcsContext.getProject();
+
+    if (project != null) {
+
+      String actionName = getCompleteActionName(vcsContext);
+      if (myActionInfo.showOptions(project) || OptionsDialog.shiftIsPressed(vcsContext.getModifiers())) {
+        actionName += "...";
+      }
+
+      presentation.setText(actionName);
+
+      presentation.setVisible(true);
+      presentation.setEnabled(true);
+
+      if (supportingVcsesAreEmpty(vcsContext.getProject(), myActionInfo)) {
+        presentation.setVisible(false);
+        presentation.setEnabled(false);
+      }
+
+      if (filterRootsBeforeAction()) {
+        FilePath[] roots = filterRoots(myScopeInfo.getRoots(vcsContext, myActionInfo), vcsContext);
+        if (roots.length == 0) {
+          presentation.setVisible(false);
+          presentation.setEnabled(false);
+        }
+      }
+
+      if (presentation.isVisible() && presentation.isEnabled() &&
+          ProjectLevelVcsManager.getInstance(project).isBackgroundVcsOperationRunning()) {
+        presentation.setEnabled(false);
+      }
+    } else {
+      presentation.setVisible(false);
+      presentation.setEnabled(false);
+    }
+ }
+
+  protected boolean forceSyncUpdate(final AnActionEvent e) {
+    return true;
+  }
+
+  private static boolean supportingVcsesAreEmpty(final Project project, final ActionInfo actionInfo) {
+    if (project == null) return true;
+    final AbstractVcs[] allActiveVcss = ProjectLevelVcsManager.getInstance(project).getAllActiveVcss();
+    for (AbstractVcs activeVcs : allActiveVcss) {
+      if (actionInfo.getEnvironment(activeVcs) != null) return false;
+    }
+    return true;
+  }
+}

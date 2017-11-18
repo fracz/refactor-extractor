@@ -1,0 +1,195 @@
+/*
+ * Copyright 2007 Google Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.zxing.client.j2me;
+
+import javax.microedition.io.ConnectionNotFoundException;
+import javax.microedition.lcdui.Alert;
+import javax.microedition.lcdui.AlertType;
+import javax.microedition.lcdui.Canvas;
+import javax.microedition.lcdui.Command;
+import javax.microedition.lcdui.CommandListener;
+import javax.microedition.lcdui.Display;
+import javax.microedition.lcdui.Displayable;
+import javax.microedition.media.Manager;
+import javax.microedition.media.MediaException;
+import javax.microedition.media.Player;
+import javax.microedition.media.control.VideoControl;
+import javax.microedition.midlet.MIDlet;
+import javax.microedition.midlet.MIDletStateChangeException;
+import java.io.IOException;
+
+/**
+ * <p>The actual reader application {@link MIDlet}.</p>
+ *
+ * @author Sean Owen (srowen@google.com)
+ */
+public final class ZXingMIDlet extends MIDlet {
+
+  private Canvas canvas;
+  private Player player;
+  private VideoControl videoControl;
+
+  Player getPlayer() {
+    return player;
+  }
+
+  VideoControl getVideoControl() {
+    return videoControl;
+  }
+
+  protected void startApp() throws MIDletStateChangeException {
+    try {
+      player = Manager.createPlayer("capture://video");
+      player.realize();
+      AdvancedMultimediaManager.setZoom(player);
+      videoControl = (VideoControl) player.getControl("VideoControl");
+      canvas = new VideoCanvas(this);
+      canvas.setFullScreenMode(true);
+      videoControl.initDisplayMode(VideoControl.USE_DIRECT_VIDEO, canvas);
+      videoControl.setDisplayLocation(0, 0);
+      videoControl.setDisplaySize(canvas.getWidth(), canvas.getHeight());
+      videoControl.setVisible(true);
+      player.start();
+      Display.getDisplay(this).setCurrent(canvas);
+    } catch (IOException ioe) {
+      throw new MIDletStateChangeException(ioe.toString());
+    } catch (MediaException me) {
+      throw new MIDletStateChangeException(me.toString());
+    }
+  }
+
+  protected void pauseApp() {
+    if (player != null) {
+      try {
+        player.stop();
+      } catch (MediaException me) {
+        // continue?
+        showError(me);
+      }
+    }
+  }
+
+  protected void destroyApp(boolean unconditional) {
+    if (player != null) {
+      videoControl = null;
+      try {
+        player.stop();
+      } catch (MediaException me) {
+        // continue
+      }
+      player.deallocate();
+      player.close();
+      player = null;
+    }
+  }
+
+  void stop() {
+    destroyApp(false);
+    notifyDestroyed();
+  }
+
+  // Convenience methods to show dialogs
+
+  private void showOpenURL(final String text) {
+    Alert alert = new Alert("Open web page?", text, null, AlertType.CONFIRMATION);
+    alert.setTimeout(Alert.FOREVER);
+    final Command cancel = new Command("Cancel", Command.CANCEL, 1);
+    alert.addCommand(cancel);
+    CommandListener listener = new CommandListener() {
+      public void commandAction(Command command, Displayable displayable) {
+        if (command.getCommandType() == Command.OK) {
+          try {
+            platformRequest(text);
+          } catch (ConnectionNotFoundException cnfe) {
+            showError(cnfe);
+          } finally {
+            stop();
+          }
+        } else {
+          // cancel
+          Display.getDisplay(ZXingMIDlet.this).setCurrent(canvas);
+        }
+      }
+    };
+    alert.setCommandListener(listener);
+    showAlert(alert);
+  }
+
+  private void showAlert(String title, String text) {
+    Alert alert = new Alert(title, text, null, AlertType.INFO);
+    alert.setTimeout(Alert.FOREVER);
+    showAlert(alert);
+  }
+
+  void showError(Throwable t) {
+    showAlert(new Alert("Error", t.getMessage(), null, AlertType.ERROR));
+  }
+
+  private void showAlert(Alert alert) {
+    Display display = Display.getDisplay(this);
+    display.setCurrent(alert, canvas);
+  }
+
+  /// TODO this whole bit needs to be merged with the code in core-ext -- this is messy and duplicative
+
+  void handleDecodedText(String text) {
+    // This is a crude imitation of the code found in module core-ext, which handles the contents
+    // in a more sophisticated way. It can't be accessed from JavaME just yet because it relies
+    // on URL parsing routines in java.net. This should be somehow worked around: TODO
+    // For now, detect URLs in a simple way, and treat everything else as text
+    if (text.startsWith("http://") || text.startsWith("https://")) {
+      showOpenURL(text);
+    } else if (text.startsWith("HTTP://") || text.startsWith("HTTPS://")) {
+      showOpenURL(decapitalizeProtocol(text));
+    } else if (text.startsWith("URL:")) {
+      showOpenURL(decapitalizeProtocol(text.substring(4)));
+    } else if (text.startsWith("MEBKM:")) {
+      int urlIndex = text.indexOf("URL:", 6);
+      if (urlIndex >= 6) {
+        String url = text.substring( urlIndex + 4);
+        int semicolon = url.indexOf((int) ';');
+        if (semicolon >= 0) {
+          url = url.substring(0, semicolon);
+        }
+        showOpenURL(decapitalizeProtocol(url));
+      } else {
+        showAlert("Barcode detected", text);
+      }
+    } else if (maybeURLWithoutScheme(text)) {
+      showOpenURL("http://" + text);
+    } else {
+      showAlert("Barcode detected", text);
+    }
+  }
+
+  private static String decapitalizeProtocol(String url) {
+    int protocolEnd = url.indexOf("://");
+    if (protocolEnd >= 0) {
+      return url.substring(0, protocolEnd).toLowerCase() + url.substring(protocolEnd);
+    } else {
+      return url;
+    }
+  }
+
+  /**
+   * Crudely guesses that a string may represent a URL if it has a '.' and no spaces.
+   */
+  private static boolean maybeURLWithoutScheme(String text) {
+    return text.indexOf((int) '.') >= 0 && text.indexOf((int) ' ') < 0;
+  }
+
+}

@@ -1,0 +1,11 @@
+commit 8671371c59e4cb6f31a10652c0fd192c3abb23ac
+Author: dswitkin <dswitkin@59b500cc-1b3d-0410-9834-0bbf25fbcc57>
+Date:   Thu Oct 30 18:44:10 2008 +0000
+
+    Did a big refactoring on the MonochromeBitmapSource. I removed all the caching luminance calls and converted them to getting luminance data on demand. This saved another 33,000 function calls per rejected scan, good for another 15 ms savings. I also moved the luminance calls to BaseMonochromeBitmapSource and made them protected, to indicate that the decoders shouldn't use them.
+
+    Overall the recent optimizations took one rejected scan from 307 to 135 ms, which is definitely noticeable.
+
+    WARNING: I am not able to build the Bug or J2ME clients, but I believe they are correct.
+
+    git-svn-id: https://zxing.googlecode.com/svn/trunk@656 59b500cc-1b3d-0410-9834-0bbf25fbcc57

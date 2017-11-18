@@ -1,0 +1,36 @@
+commit 7ce09488d186e4f085046fb8d60578726ec429de
+Author: kevinb@google.com <kevinb@google.com@8138a162-5c33-11de-8abc-d1c337b90d21>
+Date:   Fri Apr 23 20:13:16 2010 +0000
+
+    Big code drop in prep for cutting r04 next week.
+
+    Brand new MapMaker implementation (expiration works way, way better).
+
+     Initial @Beta release:
+      Itera*s.get(3-arg)
+      Files.createParentDirs
+      ForwardingListenableFuture
+      ThreadFactoryBuilder
+
+     Initial release skipping @Beta:
+      Sets.powerSet
+      ForwardingBlockingQueue
+
+     Exiting @Beta:
+      Charsets
+      Objects.toStringHelper
+      Objects.firstNonNull
+      Strings
+      Suppliers.memoizeWithExpiration
+      Throwables (except 2 methods)
+      ComparisonChain
+      ByteArrayData{In,Out}put
+      {In,Out}putSupplier
+      ForwardingFuture
+      UncheckedTimeoutException
+
+    Various miscellaneous improvements.
+
+
+
+    git-svn-id: https://guava-libraries.googlecode.com/svn/trunk@25 8138a162-5c33-11de-8abc-d1c337b90d21

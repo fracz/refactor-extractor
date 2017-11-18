@@ -1,0 +1,20 @@
+commit 26304fc503be158226f1af31e06173a8d158fb62
+Author: jrtom <jrtom@google.com>
+Date:   Wed Jun 29 19:08:20 2016 -0700
+
+    Automated g4 rollback of changelist 125826869.
+
+    *** Reason for rollback ***
+
+    The class-level Javadoc for the top-level interfaces is going to be refactored soon, and I don't want to lose these comments in the process.
+
+    *** Original change description ***
+
+    I was reading through the class-level javadoc (which could use some cleaning up, but I think jrtom said he's working on that), and this passage struck me. The latter two options don't seem like something that would actually happen. For example, we allow nodes of any type, so an impl where the nodes store the topology and cannot be shared across graphs doesn't really make sense.
+
+    Even beyond that, this just seems like low-level implementation stuff that users of the Graph/Network interfaces shoul...
+
+    ***
+    -------------
+    Created by MOE: https://github.com/google/moe
+    MOE_MIGRATED_REVID=126258496

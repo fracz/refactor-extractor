@@ -1,0 +1,18 @@
+commit b1929feeb03a96c2ad420f0965e8f3bda530b365
+Author: cpovirk <cpovirk@google.com>
+Date:   Sun Sep 25 10:40:46 2016 -0700
+
+    Assorted cleanup of cancellation:
+    - Eliminate our overrides of interruptTask() (other than one in a test of interruptTask()).
+    - Make cancel() final under GWT.
+    - Simplify a few tests.
+    - Add or improve boilerplate comments about visibility of fields.
+
+    We will likely not be able to make cancel() final in general (even if it weren't for our backward-compatiblity guarantees), thanks to certain usages.
+    I had hoped that maybe we could in FluentFuture. I suppose that we still could, since we'll offer FluentFuture.from(ListenableFuture), and anyone who needs to override cancel() could override it in the delegate.
+
+    https://github.com/google/guava/issues/1905
+    https://github.com/google/guava/issues/2075
+    -------------
+    Created by MOE: https://github.com/google/moe
+    MOE_MIGRATED_REVID=134216985

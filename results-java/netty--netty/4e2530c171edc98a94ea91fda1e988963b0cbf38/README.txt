@@ -1,0 +1,27 @@
+commit 4e2530c171edc98a94ea91fda1e988963b0cbf38
+Author: radai-rosenblatt <radai.rosenblatt@gmail.com>
+Date:   Thu Sep 29 12:32:26 2016 -0700
+
+    fix 5868 -fix DefaultHostsFileEntriesResolverTest to pass on windows 7
+
+    Motivation:
+
+    Windows 7 hosts file is empty by default (at least on my machine? see
+    http://serverfault.com/questions/4689/windows-7-localhost-name-resolution-is-handled-within-dns-itself-why
+    for details and reasoning.
+
+    the test relies on the file containing an entry for localhost.
+
+    Modifications:
+
+    refactor class code to 1st normalize the input host name and then look it up, change the test to verify
+    that hostnames are normalized in a case-insensitive way before being looked up (which was the intent
+    of the original test)
+
+    Result:
+
+    test should pass on vanilla windows 7 (and any other machine with no
+    localhost in the hosts file). no effect anywhere else or on actual netty
+    code.
+
+    Signed-off-by: radai-rosenblatt <radai.rosenblatt@gmail.com>

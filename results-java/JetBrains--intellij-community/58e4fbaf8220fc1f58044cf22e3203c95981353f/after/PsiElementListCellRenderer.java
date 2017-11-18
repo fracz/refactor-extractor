@@ -1,0 +1,172 @@
+package com.intellij.ide.util;
+
+import com.intellij.ide.ui.UISettings;
+import com.intellij.navigation.ItemPresentation;
+import com.intellij.navigation.NavigationItem;
+import com.intellij.openapi.editor.colors.EditorColorsManager;
+import com.intellij.openapi.editor.colors.TextAttributesKey;
+import com.intellij.openapi.editor.markup.EffectType;
+import com.intellij.openapi.editor.markup.TextAttributes;
+import com.intellij.openapi.vcs.FileStatus;
+import com.intellij.openapi.vcs.FileStatusManager;
+import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.problems.WolfTheProblemSolver;
+import com.intellij.psi.PsiElement;
+import com.intellij.psi.PsiFile;
+import com.intellij.ui.ColoredListCellRenderer;
+import com.intellij.ui.ListSpeedSearch;
+import com.intellij.ui.SimpleTextAttributes;
+import com.intellij.util.IconUtil;
+import com.intellij.util.ui.UIUtil;
+import org.jetbrains.annotations.Nullable;
+
+import javax.swing.*;
+import java.awt.*;
+import java.util.Comparator;
+
+public abstract class PsiElementListCellRenderer<T extends PsiElement> extends JPanel implements ListCellRenderer {
+  protected PsiElementListCellRenderer() {
+    super(new BorderLayout());
+  }
+
+  private class LeftRenderer extends ColoredListCellRenderer {
+    private String myModuleName;
+
+    public LeftRenderer(final String moduleName) {
+      myModuleName = moduleName;
+    }
+
+    protected void customizeCellRenderer(
+      JList list,
+      Object value,
+      int index,
+      boolean selected,
+      boolean hasFocus
+      ) {
+      if (value instanceof PsiElement) {
+        PsiElement element = (PsiElement)value;
+        String name = getElementText((T)element);
+        Color color = list.getForeground();
+        PsiFile psiFile = element.getContainingFile();
+        boolean isProblemFile = false;
+
+        if (psiFile != null) {
+          VirtualFile vFile = psiFile.getVirtualFile();
+          if (vFile != null) {
+            if (WolfTheProblemSolver.getInstance(psiFile.getProject()).isProblemFile(vFile)) {
+              isProblemFile = true;
+            }
+            FileStatus status = FileStatusManager.getInstance(psiFile.getProject()).getStatus(vFile);
+            color = status.getColor();
+          }
+        }
+
+        TextAttributes attributes = null;
+
+        if (value instanceof NavigationItem) {
+          TextAttributesKey attributesKey = null;
+          final ItemPresentation presentation = ((NavigationItem)value).getPresentation();
+          if (presentation != null) attributesKey = presentation.getTextAttributesKey();
+
+          if (attributesKey != null) {
+            attributes = EditorColorsManager.getInstance().getGlobalScheme().getAttributes(attributesKey);
+          }
+        }
+
+        SimpleTextAttributes nameAttributes;
+        if (isProblemFile) {
+          attributes = TextAttributes.merge(new TextAttributes(color, null, Color.red, EffectType.WAVE_UNDERSCORE, Font.PLAIN),attributes);
+        }
+
+        nameAttributes = attributes != null ? SimpleTextAttributes.fromTextAttributes(attributes):null;
+
+        if (nameAttributes == null)  nameAttributes = new SimpleTextAttributes(Font.PLAIN, color);
+
+        append(name, nameAttributes);
+        setIcon(PsiElementListCellRenderer.this.getIcon(element));
+
+        String containerText = getContainerText(element, name + (myModuleName != null ? myModuleName + "        " : ""));
+        if (containerText != null) {
+          append(" " + containerText, new SimpleTextAttributes(Font.PLAIN, Color.GRAY));
+        }
+      }
+      else {
+        setIcon(IconUtil.getEmptyIcon(false));
+        append(value == null ? "" : value.toString(), new SimpleTextAttributes(Font.PLAIN, list.getForeground()));
+      }
+      setPaintFocusBorder(false);
+      setBackground(selected ? UIUtil.getListSelectionBackground() : UIUtil.getListBackground());
+    }
+  }
+
+  public Component getListCellRendererComponent(JList list,
+                                                Object value,
+                                                int index,
+                                                boolean isSelected,
+                                                boolean cellHasFocus) {
+    removeAll();
+    String moduleName = null;
+    DefaultListCellRenderer rightRenderer = getRightCellRenderer();
+    if (rightRenderer != null) {
+      final Component rightCellRendererComponent =
+        rightRenderer.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+      add(rightCellRendererComponent, BorderLayout.EAST);
+      moduleName = rightRenderer.getText();
+      final JPanel spacer = new JPanel();
+      spacer.setBorder(BorderFactory.createEmptyBorder(0, 2, 0, 2));
+      spacer.setBackground(isSelected ? UIUtil.getListSelectionBackground() : UIUtil.getListBackground());
+      add(spacer, BorderLayout.CENTER);
+    }
+    final Component leftCellRendererComponent =
+      new LeftRenderer(moduleName).getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+    add(leftCellRendererComponent, BorderLayout.WEST);
+    setBackground(isSelected ? UIUtil.getListSelectionBackground() : UIUtil.getListBackground());
+    return this;
+  }
+
+  @Nullable
+  protected DefaultListCellRenderer getRightCellRenderer() {
+    if (UISettings.getInstance().SHOW_ICONS_IN_QUICK_NAVIGATION) {
+      return ModuleRendererFactory.getInstance().getModuleRenderer();
+    }
+    return null;
+  }
+
+  public abstract String getElementText(T element);
+
+  @Nullable
+  protected abstract String getContainerText(PsiElement element, final String name);
+
+  protected abstract int getIconFlags();
+
+  protected Icon getIcon(PsiElement element) {
+    return element.getIcon(getIconFlags());
+  }
+
+  public Comparator<T> getComparator() {
+    return new Comparator<T>() {
+      public int compare(T o1, T o2) {
+        return getText(o1).compareTo(getText(o2));
+      }
+
+      private String getText(T element) {
+        String elementText = getElementText(element);
+        String containerText = getContainerText(element, elementText);
+        return containerText != null ? elementText + " " + containerText : elementText;
+      }
+    };
+  }
+
+  public void installSpeedSearch(JList list) {
+    new ListSpeedSearch(list) {
+      protected String getElementText(Object o) {
+        if (o instanceof PsiElement) {
+          return PsiElementListCellRenderer.this.getElementText((T)o);
+        }
+        else {
+          return o.toString();
+        }
+      }
+    };
+  }
+}

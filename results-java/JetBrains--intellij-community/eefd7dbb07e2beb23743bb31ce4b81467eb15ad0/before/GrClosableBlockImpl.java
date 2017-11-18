@@ -1,0 +1,70 @@
+/*
+ * Copyright 2000-2007 JetBrains s.r.o.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.jetbrains.plugins.groovy.lang.psi.impl.statements.blocks;
+
+import com.intellij.lang.ASTNode;
+import com.intellij.psi.scope.PsiScopeProcessor;
+import com.intellij.psi.PsiSubstitutor;
+import com.intellij.psi.PsiElement;
+import com.intellij.psi.PsiType;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.blocks.GrClosableBlock;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.GrStatement;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.params.GrParameter;
+import org.jetbrains.plugins.groovy.lang.psi.impl.GroovyPsiElementImpl;
+import org.jetbrains.plugins.groovy.lang.psi.impl.statements.params.GrParameterListImpl;
+import org.jetbrains.plugins.groovy.lang.resolve.ResolveUtil;
+
+/**
+ * @author ilyas
+ */
+public class GrClosableBlockImpl extends GrBlockImpl implements GrClosableBlock {
+
+  public GrClosableBlockImpl(@NotNull ASTNode node) {
+    super(node);
+  }
+
+  public boolean processDeclarations(@NotNull PsiScopeProcessor processor, @NotNull PsiSubstitutor substitutor, PsiElement lastParent, @NotNull PsiElement place) {
+    if (!super.processDeclarations(processor, substitutor, lastParent, place)) return false;
+
+    for (final GrParameter parameter : getParameters()) {
+      if (!ResolveUtil.processElement(processor, parameter)) return false;
+    }
+
+    return true;
+  }
+
+  public String toString() {
+    return "Closable block";
+  }
+
+  public GrParameter[] getParameters() {
+    GrParameterListImpl parameterList = getParameterList();
+    if (parameterList != null) {
+      return parameterList.getParameters();
+    }
+
+    return GrParameter.EMPTY_ARRAY;
+  }
+
+  public GrParameterListImpl getParameterList() {
+    return findChildByClass(GrParameterListImpl.class);
+  }
+
+  public PsiType getType() {
+    return null;
+  }
+}

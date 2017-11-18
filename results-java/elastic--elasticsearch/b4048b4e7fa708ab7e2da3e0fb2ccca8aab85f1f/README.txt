@@ -1,0 +1,27 @@
+commit b4048b4e7fa708ab7e2da3e0fb2ccca8aab85f1f
+Author: Martijn van Groningen <martijn.v.groningen@gmail.com>
+Date:   Sun Nov 5 10:39:02 2017 +0100
+
+    Use CoveringQuery to select percolate candidate matches and
+    extract all clauses from a conjunction query.
+
+    When clauses from a conjunction are extracted the number of clauses is
+    also stored in an internal doc values field (minimum_should_match field).
+    This field is used by the CoveringQuery and allows the percolator to
+    reduce the number of false positives when selecting candidate matches and
+    in certain cases be absolutely sure that a conjunction candidate match
+    will match and then skip MemoryIndex validation. This can greatly improve
+    performance.
+
+    Before this change only a single clause was extracted from a conjunction
+    query. The percolator tried to extract the clauses that was rarest in order
+    (based on term length) to attempt less candidate queries to be selected
+    in the first place. However this still method there is still a very high
+    chance that candidate query matches are false positives.
+
+    This change also removes the influencing query extraction added via #26081
+    as this is no longer needed because now all conjunction clauses are extracted.
+
+    https://www.elastic.co/guide/en/elasticsearch/reference/6.x/percolator.html#_influencing_query_extraction
+
+    Closes #26307

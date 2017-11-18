@@ -1,0 +1,118 @@
+package com.intellij.codeInsight.highlighting;
+
+import com.intellij.codeInsight.CodeInsightBundle;
+import com.intellij.featureStatistics.FeatureUsageTracker;
+import com.intellij.openapi.editor.Editor;
+import com.intellij.openapi.project.Project;
+import com.intellij.psi.*;
+import com.intellij.psi.controlFlow.*;
+import com.intellij.psi.util.PsiTreeUtil;
+import com.intellij.util.Consumer;
+import com.intellij.util.containers.IntArrayList;
+import org.jetbrains.annotations.Nullable;
+
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+
+public class HighlightExitPointsHandler extends HighlightUsagesHandlerBase<PsiElement> {
+  private PsiElement myTarget;
+
+  public HighlightExitPointsHandler(final Editor editor, final PsiFile file, final PsiElement target) {
+    super(editor, file);
+    myTarget = target;
+  }
+
+  protected List<PsiElement> getTargets() {
+    return Collections.singletonList(myTarget);
+  }
+
+  protected void selectTargets(final List<PsiElement> targets, final Consumer<List<PsiElement>> selectionConsumer) {
+    selectionConsumer.consume(targets);
+  }
+
+  protected void computeUsages(final List<PsiElement> targets) {
+    FeatureUsageTracker.getInstance().triggerFeatureUsed("codeassists.highlight.return");
+
+    PsiElement parent = myTarget.getParent();
+    if (!(parent instanceof PsiReturnStatement) && !(parent instanceof PsiThrowStatement)) return;
+
+    PsiMethod method = PsiTreeUtil.getParentOfType(myTarget, PsiMethod.class);
+    if (method == null) return;
+
+    PsiCodeBlock body = method.getBody();
+    try {
+      highlightExitPoints((PsiStatement)parent, body);
+    }
+    catch (AnalysisCanceledException e) {
+      // ignore
+    }
+  }
+
+  @Nullable
+  private static PsiElement getExitTarget(PsiStatement exitStatement) {
+    if (exitStatement instanceof PsiReturnStatement) {
+      return PsiTreeUtil.getParentOfType(exitStatement, PsiMethod.class);
+    }
+    else if (exitStatement instanceof PsiBreakStatement) {
+      return ((PsiBreakStatement)exitStatement).findExitedStatement();
+    }
+    else if (exitStatement instanceof PsiContinueStatement) {
+      return ((PsiContinueStatement)exitStatement).findContinuedStatement();
+    }
+    else if (exitStatement instanceof PsiThrowStatement) {
+      final PsiExpression expr = ((PsiThrowStatement)exitStatement).getException();
+      if (expr == null) return null;
+      final PsiType exceptionType = expr.getType();
+      if (!(exceptionType instanceof PsiClassType)) return null;
+
+      PsiElement target = exitStatement;
+      while (!(target instanceof PsiMethod || target == null || target instanceof PsiClass || target instanceof PsiFile)) {
+        if (target instanceof PsiTryStatement) {
+          final PsiTryStatement tryStatement = (PsiTryStatement)target;
+          final PsiParameter[] params = tryStatement.getCatchBlockParameters();
+          for (PsiParameter param : params) {
+            if (param.getType().isAssignableFrom(exceptionType)) {
+              break;
+            }
+          }
+
+        }
+        target = target.getParent();
+      }
+      if (target instanceof PsiMethod || target instanceof PsiTryStatement) {
+        return target;
+      }
+      return null;
+    }
+
+    return null;
+  }
+
+  private void highlightExitPoints(final PsiStatement parent, final PsiCodeBlock body) throws AnalysisCanceledException {
+    final Project project = myTarget.getProject();
+    ControlFlow flow = ControlFlowFactory.getInstance(project).getControlFlow(body, LocalsOrMyInstanceFieldsControlFlowPolicy.getInstance(), false);
+
+    Collection<PsiStatement> exitStatements = ControlFlowUtil.findExitPointsAndStatements(flow, 0, flow.getSize(), new IntArrayList(),
+                                                                                          PsiReturnStatement.class, PsiBreakStatement.class,
+                                                                                          PsiContinueStatement.class, PsiThrowStatement.class);
+    if (!exitStatements.contains(parent)) return;
+
+    PsiElement originalTarget = getExitTarget(parent);
+
+    final Iterator<PsiStatement> it = exitStatements.iterator();
+    while (it.hasNext()) {
+      PsiStatement psiStatement = it.next();
+      if (getExitTarget(psiStatement) != originalTarget) {
+        it.remove();
+      }
+    }
+
+    for (PsiElement e : exitStatements) {
+      addOccurrence(e);
+    }
+    myStatusText = CodeInsightBundle.message("status.bar.exit.points.highlighted.message", exitStatements.size(),
+                                                                      HighlightUsagesHandler.getShortcutText());
+  }
+}

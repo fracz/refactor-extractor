@@ -1,0 +1,22 @@
+commit 794808b6b8d36222db8e63ecf37144ffc3faae95
+Author: Phillip Webb <pwebb@gopivotal.com>
+Date:   Thu May 22 17:38:19 2014 +0100
+
+    Various improvements to the Gradle plugin
+
+    Refactor and rework several areas of the Gradle plugin:
+
+    - Refactor package structure into functional areas and configure each
+      area separately via a new PluginFeatures interface.
+    - Convert BootRunTask to extend RunTask rather than attempting to
+      find existing RunTasks.
+    - Simplify agent integration by no longer needing specific BootRunTask
+      code.
+    - Update the repackage task to consider the `mainClassName` property
+      in addition to `springBoot.mainClass`.
+    - Automatically set `mainClassName` when calling `run` or `runBoot`
+      from `springBoot.mainClass` if there is one.
+    - Ensure that explicitly defined `main` options on JavaExec tasks always
+      take precedence.
+
+    Fixes gh-547, gh-820, gh-886, gh-912

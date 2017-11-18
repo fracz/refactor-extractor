@@ -1,0 +1,11 @@
+commit dbc7e938c8cf243e70b4e66eb67dfa95f43f3688
+Author: Phillip Webb <pwebb@pivotal.io>
+Date:   Mon Apr 17 11:41:53 2017 -0700
+
+    Restructor and improve Origin support
+
+    Move the `Origin` and related classes from `o.s.boot.env` to
+    `o.s.boot.orgin` and extend support. The concept of an origin can now
+    be used outside of just the Spring Environment abstraction.
+
+    Closes gh-9001

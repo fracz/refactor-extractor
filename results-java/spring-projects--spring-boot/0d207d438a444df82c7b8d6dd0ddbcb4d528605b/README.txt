@@ -1,0 +1,19 @@
+commit 0d207d438a444df82c7b8d6dd0ddbcb4d528605b
+Author: Andy Wilkinson <awilkinson@pivotal.io>
+Date:   Fri Jun 24 16:14:06 2016 +0100
+
+    Improve the performance of JarURLConnection
+
+    This commit improves the performance of JarURLConnection. There are two
+    main changes:
+
+    Firstly, the way in which the spec is determined has been changed so
+    that it’s no longer necessary to create an absolute file. Instead,
+    the JarFile’s pathFromRoot is used to extract the spec from the URL
+    relative to the JarFile.
+
+    Secondly, the number of temporary Objects that are created has been
+    reduced, for example by tracking an index as we process a String
+    rather than creating a new substring for each iteration.
+
+    See gh-6215

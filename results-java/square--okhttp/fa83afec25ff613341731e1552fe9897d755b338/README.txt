@@ -1,0 +1,16 @@
+commit fa83afec25ff613341731e1552fe9897d755b338
+Author: jwilson <jwilson@squareup.com>
+Date:   Wed Nov 23 20:40:59 2016 -0500
+
+    Automatically ping the peer on a user-specified interval.
+
+    This changes RealWebSocket from using a shared ThreadPoolExecutor to
+    using a private ScheduledExecutorService. This make some of the code
+    simpler but it means that applications will hold 1 writer thread for
+    each websocket, even if it is mostly not writing.
+
+    Testing automatic pings is awkward. This refactors much of
+    RealWebSocketTest to make it more natural to reinitialize the
+    configuration.
+
+    Closes: https://github.com/square/okhttp/issues/2993

@@ -1,0 +1,224 @@
+/*
+ * Copyright 2000-2007 JetBrains s.r.o.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.jetbrains.plugins.groovy;
+
+import com.intellij.codeHighlighting.Pass;
+import com.intellij.codeHighlighting.TextEditorHighlightingPassRegistrar;
+import com.intellij.codeInsight.completion.CompletionUtil;
+import com.intellij.codeInsight.completion.CompositeCompletionData;
+import com.intellij.codeInsight.editorActions.SelectWordUtil;
+import com.intellij.codeInsight.editorActions.TypedHandler;
+import com.intellij.debugger.DebuggerManager;
+import com.intellij.debugger.PositionManager;
+import com.intellij.debugger.engine.DebugProcess;
+import com.intellij.ide.IconProvider;
+import com.intellij.openapi.compiler.CompilerManager;
+import com.intellij.openapi.components.ApplicationComponent;
+import com.intellij.openapi.fileTypes.FileTypeManager;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.project.ProjectManager;
+import com.intellij.openapi.project.ProjectManagerAdapter;
+import com.intellij.openapi.startup.StartupManager;
+import com.intellij.openapi.util.Condition;
+import com.intellij.openapi.util.IconLoader;
+import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.openapi.wm.ToolWindow;
+import com.intellij.openapi.wm.ToolWindowAnchor;
+import com.intellij.openapi.wm.ToolWindowManager;
+import com.intellij.problems.WolfTheProblemSolver;
+import com.intellij.psi.PsiElement;
+import com.intellij.psi.impl.source.resolve.reference.ReferenceProvidersRegistry;
+import com.intellij.psi.impl.source.tree.Factory;
+import com.intellij.psi.search.searches.MethodReferencesSearch;
+import com.intellij.psi.search.searches.ReferencesSearch;
+import com.intellij.util.Function;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.plugins.grails.GrailsLoader;
+import org.jetbrains.plugins.grails.lang.gsp.psi.GspElementFactory;
+import org.jetbrains.plugins.groovy.annotator.intentions.dynamic.DynamicPropertiesReferenceProvider;
+import org.jetbrains.plugins.groovy.annotator.intentions.dynamic.DynamicToolWindowWrapper;
+import org.jetbrains.plugins.groovy.codeInspection.local.GroovyUnusedImportsPassFactory;
+import org.jetbrains.plugins.groovy.compiler.GroovyCompiler;
+import org.jetbrains.plugins.groovy.compiler.generator.GroovyToJavaGenerator;
+import org.jetbrains.plugins.groovy.debugger.GroovyPositionManager;
+import org.jetbrains.plugins.groovy.editor.selection.GroovyDocParamsSelectioner;
+import org.jetbrains.plugins.groovy.editor.selection.GroovyLiteralSelectioner;
+import org.jetbrains.plugins.groovy.editor.selection.GroovyTypeCastSelectioner;
+import org.jetbrains.plugins.groovy.editor.selection.GroovyArgListSelectioner;
+import org.jetbrains.plugins.groovy.findUsages.*;
+import org.jetbrains.plugins.groovy.lang.completion.GroovyCompletionData;
+import org.jetbrains.plugins.groovy.lang.completion.InsertHandlerRegistry;
+import org.jetbrains.plugins.groovy.lang.editor.GroovyQuoteHandler;
+import org.jetbrains.plugins.groovy.lang.editor.actions.GroovyEditorActionsManager;
+import org.jetbrains.plugins.groovy.lang.groovydoc.completion.GroovyDocCompletionData;
+import org.jetbrains.plugins.groovy.lang.groovydoc.completion.handlers.GroovyDocMethodHandler;
+import org.jetbrains.plugins.groovy.lang.groovydoc.psi.api.GroovyDocPsiElement;
+import org.jetbrains.plugins.groovy.lang.groovydoc.references.GroovyDocReferenceProvider;
+import org.jetbrains.plugins.groovy.lang.psi.GroovyFile;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.expressions.GrReferenceExpression;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.expressions.literals.GrLiteral;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.typedef.GrTypeDefinition;
+import org.jetbrains.plugins.groovy.lang.resolve.providers.PropertiesReferenceProvider;
+
+import javax.swing.*;
+import java.util.HashSet;
+import java.util.Set;
+
+/**
+ * Main application component, that loads Groovy language support
+ *
+ * @author ilyas
+ */
+public class GroovyLoader implements ApplicationComponent, IconProvider {
+
+  @NotNull
+  public static final String GROOVY_EXTENSION = "groovy";
+
+  @NotNull
+  public static final String GVY_EXTENSION = "gvy";
+
+  @NotNull
+  public static final String GY_EXTENSION = "gy";
+
+  @NotNull
+  public static final String GROOVY_SCRIPT_EXTENSION = "gsh";
+
+  @NotNull
+  public static final Set<String> GROOVY_EXTENSIONS = new HashSet<String>();
+
+  static {
+    GROOVY_EXTENSIONS.add(GROOVY_EXTENSION);
+    GROOVY_EXTENSIONS.add(GVY_EXTENSION);
+    GROOVY_EXTENSIONS.add(GY_EXTENSION);
+    GROOVY_EXTENSIONS.add(GROOVY_SCRIPT_EXTENSION);
+  }
+
+  public GroovyLoader(GrailsLoader loader) {
+  }
+
+  public void initComponent() {
+    loadGroovy();
+  }
+
+  private static void loadGroovy() {
+    //Register factory for special Groovy elements
+    Factory.addElementFactory(new GspElementFactory());
+
+    //register editor actions
+    GroovyEditorActionsManager.registerGroovyEditorActions();
+
+    //Register Keyword completion
+    setupCompletion();
+
+    registerSelectioners();
+
+    MethodReferencesSearch.INSTANCE.registerExecutor(new AccessorReferencesSearcher());
+    MethodReferencesSearch.INSTANCE.registerExecutor(new MethodLateBoundReferencesSearcher());
+    ReferencesSearch.INSTANCE.registerExecutor(new ConstructorReferencesSearcher());
+    ReferencesSearch.INSTANCE.registerExecutor(new PropertyReferencesSearcher());
+    ReferencesSearch.INSTANCE.registerExecutor(new TypeAliasReferenceSearcher());
+    ReferencesSearch.INSTANCE.registerExecutor(new LateBoundReferencesSearcher());
+
+    TypedHandler.registerQuoteHandler(GroovyFileType.GROOVY_FILE_TYPE, new GroovyQuoteHandler());
+
+    ProjectManager.getInstance().addProjectManagerListener(new ProjectManagerAdapter() {
+      public void projectOpened(final Project project) {
+        TextEditorHighlightingPassRegistrar registrar = TextEditorHighlightingPassRegistrar.getInstance(project);
+        GroovyUnusedImportsPassFactory unusedImportsPassFactory = project.getComponent(GroovyUnusedImportsPassFactory.class);
+        registrar.registerTextEditorHighlightingPass(unusedImportsPassFactory, new int[]{Pass.UPDATE_ALL}, null, true, -1);
+
+        WolfTheProblemSolver.getInstance(project).registerFileHighlightFilter(new Condition<VirtualFile>() {
+          public boolean value(VirtualFile virtualFile) {
+            return FileTypeManager.getInstance().getFileTypeByFile(virtualFile) == GroovyFileType.GROOVY_FILE_TYPE;
+          }
+        }, project);
+
+        CompilerManager compilerManager = CompilerManager.getInstance(project);
+        GroovyToJavaGenerator generator = new GroovyToJavaGenerator(project);
+        compilerManager.addCompiler(generator);
+        compilerManager.addCompilationStatusListener(generator);
+
+        compilerManager.addCompiler(new GroovyCompiler(project));
+        compilerManager.addCompilableFileType(GroovyFileType.GROOVY_FILE_TYPE);
+
+        DebuggerManager.getInstance(project).registerPositionManagerFactory(new Function<DebugProcess, PositionManager>() {
+          public PositionManager fun(DebugProcess debugProcess) {
+            return new GroovyPositionManager(debugProcess);
+          }
+        });
+
+        //Register Groovydoc reference provider
+        ReferenceProvidersRegistry registry = ReferenceProvidersRegistry.getInstance(project);
+
+        registry.registerReferenceProvider(GroovyDocPsiElement.class, new GroovyDocReferenceProvider());
+        registry.registerReferenceProvider(GrLiteral.class, new PropertiesReferenceProvider());
+        registry.registerReferenceProvider(GrReferenceExpression.class, new DynamicPropertiesReferenceProvider());
+
+        StartupManager.getInstance(project).registerPostStartupActivity(new Runnable() {
+          public void run() {
+            final ToolWindow dynamicToolWindow = ToolWindowManager.getInstance(project).registerToolWindow(DynamicToolWindowWrapper.DYNAMIC_TOOLWINDOW_ID, true, ToolWindowAnchor.RIGHT);
+            dynamicToolWindow.setIcon(IconLoader.getIcon("/org/jetbrains/plugins/groovy/images/dynamicProperty.png"));
+            dynamicToolWindow.setTitle(GroovyBundle.message("dynamic.window"));
+
+            DynamicToolWindowWrapper.configureWindow(project, dynamicToolWindow);
+          }
+        });
+
+      }
+    });
+  }
+
+  private static void registerSelectioners() {
+    SelectWordUtil.registerSelectioner(new GroovyLiteralSelectioner());
+    SelectWordUtil.registerSelectioner(new GroovyTypeCastSelectioner());
+    SelectWordUtil.registerSelectioner(new GroovyDocParamsSelectioner());
+    SelectWordUtil.registerSelectioner(new GroovyArgListSelectioner());
+  }
+
+  private static void setupCompletion() {
+    InsertHandlerRegistry handlerRegistry = InsertHandlerRegistry.getInstance();
+    handlerRegistry.registerSpecificInsertHandler(new GroovyDocMethodHandler());
+
+    CompositeCompletionData compositeCompletionData = new CompositeCompletionData(new GroovyCompletionData(), new GroovyDocCompletionData());
+    CompletionUtil.registerCompletionData(GroovyFileType.GROOVY_FILE_TYPE, compositeCompletionData);
+  }
+
+  public void disposeComponent() {
+  }
+
+  @NotNull
+  public String getComponentName() {
+    return "groovy.support.loader";
+  }
+
+  @Nullable
+  public Icon getIcon(@NotNull PsiElement element, int flags) {
+    if (element instanceof GroovyFile) {
+      GroovyFile file = (GroovyFile) element;
+      if (!file.isScript()) {
+        GrTypeDefinition[] typeDefinitions = file.getTypeDefinitions();
+        if (typeDefinitions.length > 0) {
+          return typeDefinitions[0].getIcon(flags);
+        }
+      }
+
+      return GroovyFileType.GROOVY_LOGO;
+    }
+
+    return null;
+  }
+}

@@ -1,0 +1,189 @@
+/**
+ * Copyright (C) 2006 Google Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.inject;
+
+import com.google.inject.util.StackTraceElements;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Member;
+import java.lang.reflect.Method;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+
+/**
+ * Error message templates.
+ *
+ * @author crazybob@google.com (Bob Lee)
+ */
+class ErrorMessages {
+
+  private static final String MISSING_BINDING =
+      "Binding to %s not found. No bindings to that"
+          + " type were found.";
+
+  private static final String MISSING_BINDING_BUT_OTHERS_EXIST =
+      "Binding to %s not found. Annotations on other"
+          + " bindings to that type include: %s";
+
+  static void handleMissingBinding(ErrorHandler errorHandler, Member member,
+      Key<?> key, List<String> otherNames) {
+    if (otherNames.isEmpty()) {
+      errorHandler.handle(StackTraceElements.forMember(member),
+          MISSING_BINDING, key);
+    }
+    else {
+      errorHandler.handle(StackTraceElements.forMember(member),
+          MISSING_BINDING_BUT_OTHERS_EXIST, key, otherNames);
+    }
+  }
+
+  static final String OPTIONAL_CONSTRUCTOR = "@Inject(optional=true) is"
+      + " not allowed on constructors.";
+
+  static final String CONSTANT_CONVERSION_ERROR = "Error converting String"
+      + " constant bound at %s to %s: %s";
+
+  static final String CANNOT_BIND_TO_LOCATOR = "Binding to Locator<?> is not"
+      + " allowed.";
+
+  static final String SCOPE_NOT_FOUND = "No scope is bound to %s.";
+
+  static final String SINGLE_INSTANCE_AND_SCOPE = "Setting the scope is not"
+      + " permitted when binding to a single instance.";
+
+  static final String CONSTRUCTOR_RULES = "Classes must have either one (and"
+      + " only one) constructor annotated with @Inject or a zero-argument"
+      + " constructor.";
+
+  static final String MISSING_CONSTRUCTOR = "Could not find a suitable"
+      + " constructor in %s. " + CONSTRUCTOR_RULES;
+
+  static final String TOO_MANY_CONSTRUCTORS = "Found more than one constructor"
+      + " annotated with @Inject. " + CONSTRUCTOR_RULES;
+
+  static final String DUPLICATE_SCOPES = "Scope %s is already bound to %s."
+      + " Cannot bind %s.";
+
+  static final String MISSING_CONSTANT_VALUE = "Missing constant value. Please"
+      + " call to(...).";
+
+  static final String MISSING_LINK_DESTINATION = "Missing link destination."
+      + " Please call to(Key<?>).";
+
+  static final String LINK_DESTINATION_NOT_FOUND = "Binding to %s not found.";
+
+  static final String CANNOT_INJECT_INTERFACE = "Injecting into interfaces is"
+      + " not supported. Please use a concrete type instead of %s.";
+
+  static final String ANNOTATION_ALREADY_SPECIFIED =
+      "More than one annotation type is specified for this binding.";
+
+  static final String IMPLEMENTATION_ALREADY_SET = "Implementation is set more"
+      + " than once.";
+
+  static final String SCOPE_ALREADY_SET = "Scope is set more than once.";
+
+  static final String DUPLICATE_ANNOTATIONS = "Found more than one annotation"
+      + " annotated with @BindingAnnotation: %s and %s";
+
+  public static final String DUPLICATE_SCOPE_ANNOTATIONS = "More than one scope"
+      + " annotation was found: %s and %s";
+
+  static final String CONSTANT_VALUE_ALREADY_SET = "Constant value is set more"
+      + " than once.";
+
+  static final String LINK_DESTINATION_ALREADY_SET = "Link destination is"
+      + " set more than once.";
+
+  static final String BINDING_ALREADY_SET = "A binding to %s was already"
+      + " configured at %s.";
+
+  static final String NAME_ON_MEMBER_WITH_MULTIPLE_PARAMS = "Member-level"
+      + " @Inject name is not allowed when the member has more than one"
+      + " parameter: %s";
+
+  static final String NAME_ON_MEMBER_AND_PARAMETER = "Ambiguous binding name"
+      + " between @Inject on member and parameter: %s. Please remove the name"
+      + " from the member-level @Inject or remove @Inject from the parameter.";
+
+  static final String PRELOAD_NOT_ALLOWED = "Preloading is only supported for"
+      + " container-scoped bindings.";
+
+  static final String EXCEPTION_WHILE_CREATING = "Error while locating"
+      + " instance%n  bound to %s%n  for member at %s";
+
+  static Object convert(Object o) {
+    for (Converter<?> converter : converters) {
+      if (converter.appliesTo(o)) {
+        return converter.convert(o);
+      }
+    }
+    return o;
+  }
+
+  @SuppressWarnings("unchecked")
+  static final Collection<Converter<?>> converters = Arrays.asList(
+      new Converter<Method>(Method.class) {
+        public String toString(Method m) {
+          return "method " + m.getDeclaringClass().getName() + "."
+              + m.getName() + "()";
+        }
+      },
+      new Converter<Constructor>(Constructor.class) {
+        public String toString(Constructor c) {
+          return "constructor " + c.getDeclaringClass().getName() + "()";
+        }
+      },
+      new Converter<Field>(Field.class) {
+        public String toString(Field f) {
+          return "field " + f.getDeclaringClass().getName() + "." + f.getName();
+        }
+      },
+      new Converter<Class>(Class.class) {
+        public String toString(Class c) {
+          return c.getName();
+        }
+      },
+      new Converter<Key>(Key.class) {
+        public String toString(Key k) {
+          return k.hasAnnotationType()
+              ? k.getType() + " annotated with " + k.getAnnotationName()
+              : k.getType().toString();
+        }
+      }
+  );
+
+  static abstract class Converter<T> {
+
+    final Class<T> type;
+
+    Converter(Class<T> type) {
+      this.type = type;
+    }
+
+    boolean appliesTo(Object o) {
+      return type.isAssignableFrom(o.getClass());
+    }
+
+    String convert(Object o) {
+      return toString(type.cast(o));
+    }
+
+    abstract String toString(T t);
+  }
+}

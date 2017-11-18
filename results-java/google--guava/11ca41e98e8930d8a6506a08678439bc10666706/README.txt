@@ -1,0 +1,20 @@
+commit 11ca41e98e8930d8a6506a08678439bc10666706
+Author: Chris Povirk <cpovirk@google.com>
+Date:   Tue Mar 27 15:32:45 2012 -0400
+
+    Changed NullPointerTester to test inherited methods.
+
+    We only cover inherited methods from superclasses of the same package. This is
+    because we don't want to step into classes the author doesn't own.
+
+    For example, one may inherit from AbstractList, even though
+    AbstractList#equals() doesn't use @Nullable.
+
+    While for classes of the same package, we consider moving a method from subclass
+    to superclass a refactoring with no behavioral change. We don't want to silently
+    lose coverage just because of a "extract to superclass" refactoring.
+
+    Also, remove @GoogleInternal from getPackageName.
+    -------------
+    Created by MOE: http://code.google.com/p/moe-java
+    MOE_MIGRATED_REVID=28743194

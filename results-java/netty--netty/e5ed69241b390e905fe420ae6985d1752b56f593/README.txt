@@ -1,0 +1,25 @@
+commit e5ed69241b390e905fe420ae6985d1752b56f593
+Author: Trustin Lee <t@motd.kr>
+Date:   Fri May 30 10:45:28 2014 +0900
+
+    Optimize PooledByteBufAllocator
+
+    Motivation:
+
+    We still have a room for improvement in PoolChunk.allocateRun() and
+    Subpage.allocate().
+
+    Modifications:
+
+    - Unroll the recursion in PoolChunk.allocateRun()
+    - Subpage.allocate() makes use of the 'nextAvail' value set by previous
+      free().
+
+    Result:
+
+    - PoolChunk.allocateRun() optimization yields 10%+ improvements in
+      allocation throughput for non-subpage allocations.
+    - Subpage.allocate() optimization makes the subpage allocations for
+      tiny buffers as fast as non-tiny buffers even when the pageSize is
+      huge (e.g. 1048576) because it doesn't need to perform a linear search
+      in most cases.

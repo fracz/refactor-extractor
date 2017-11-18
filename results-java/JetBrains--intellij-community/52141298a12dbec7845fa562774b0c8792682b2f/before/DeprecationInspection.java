@@ -1,0 +1,126 @@
+package com.intellij.codeInspection.deprecation;
+
+import com.intellij.codeInsight.daemon.JavaErrorMessages;
+import com.intellij.codeInsight.daemon.impl.analysis.HighlightMessageUtil;
+import com.intellij.codeInspection.*;
+import com.intellij.psi.*;
+import com.intellij.psi.infos.MethodCandidateInfo;
+import com.intellij.psi.util.MethodSignatureBackedByPsiMethod;
+import org.jetbrains.annotations.NonNls;
+import org.jetbrains.annotations.Nullable;
+
+import java.util.List;
+
+/**
+ * @author max
+ */
+public class DeprecationInspection extends LocalInspectionTool {
+  @NonNls public static final String SHORT_NAME = "Deprecation";
+  public static final String DISPLAY_NAME = InspectionsBundle.message("inspection.deprecated.display.name");
+
+
+  @Nullable
+  public PsiElementVisitor buildVisitor(final ProblemsHolder holder, boolean isOnTheFly) {
+    return new PsiRecursiveElementVisitor(){
+      public void visitReferenceElement(PsiJavaCodeReferenceElement reference) {
+        super.visitReferenceElement(reference);
+        JavaResolveResult result = reference.advancedResolve(true);
+        PsiElement resolved = result.getElement();
+        checkDeprecated(resolved, reference.getReferenceNameElement(), holder);
+      }
+
+      public void visitNewExpression(PsiNewExpression expression) {
+        super.visitNewExpression(expression);
+        PsiType type = expression.getType();
+        PsiExpressionList list = expression.getArgumentList();
+        if (!(type instanceof PsiClassType)) return;
+        PsiClassType.ClassResolveResult typeResult = ((PsiClassType)type).resolveGenerics();
+        PsiClass aClass = typeResult.getElement();
+        if (aClass == null) return;
+        if (aClass instanceof PsiAnonymousClass) {
+          type = ((PsiAnonymousClass)aClass).getBaseClassType();
+          typeResult = ((PsiClassType)type).resolveGenerics();
+          aClass = typeResult.getElement();
+          if (aClass == null) return;
+        }
+        final PsiResolveHelper resolveHelper = expression.getManager().getResolveHelper();
+        final PsiMethod[] constructors = aClass.getConstructors();
+        if (constructors.length > 0 && list != null) {
+          JavaResolveResult[] results = resolveHelper.multiResolveConstructor((PsiClassType)type, list, list);
+          MethodCandidateInfo result = null;
+          if (results.length == 1) result = (MethodCandidateInfo)results[0];
+
+          PsiMethod constructor = result == null ? null : result.getElement();
+          if (constructor != null && expression.getClassReference() != null) {
+            checkDeprecated(constructor, expression.getClassReference(), holder);
+          }
+        }
+      }
+
+      public void visitMethodCallExpression(PsiMethodCallExpression methodCall) {
+        super.visitMethodCallExpression(methodCall);
+        PsiReferenceExpression referenceToMethod = methodCall.getMethodExpression();
+        JavaResolveResult resolveResult = referenceToMethod.advancedResolve(true);
+        PsiElement element = resolveResult.getElement();
+        checkDeprecated(element, referenceToMethod.getReferenceNameElement(), holder);
+      }
+
+      public void visitMethod(PsiMethod method){
+        super.visitMethod(method);
+        MethodSignatureBackedByPsiMethod methodSignature = MethodSignatureBackedByPsiMethod.create(method, PsiSubstitutor.EMPTY);
+        if (!method.isConstructor()) {
+          List<MethodSignatureBackedByPsiMethod> superMethodSignatures = method.findSuperMethodSignaturesIncludingStatic(true);
+          checkMethodOverridesDeprecated(methodSignature, superMethodSignatures, holder);
+        }
+      }
+    };
+  }
+
+  public String getDisplayName() {
+    return DISPLAY_NAME;
+  }
+
+  public String getGroupDisplayName() {
+    return "";
+  }
+
+  public String getShortName() {
+    return SHORT_NAME;
+  }
+
+  public boolean isEnabledByDefault() {
+    return true;
+  }
+
+  //@top
+  static void checkMethodOverridesDeprecated(MethodSignatureBackedByPsiMethod methodSignature,
+                                                          List<MethodSignatureBackedByPsiMethod> superMethodSignatures,
+                                                          ProblemsHolder holder) {
+    PsiMethod method = methodSignature.getMethod();
+    PsiElement methodName = method.getNameIdentifier();
+    for (MethodSignatureBackedByPsiMethod superMethodSignature : superMethodSignatures) {
+      PsiMethod superMethod = superMethodSignature.getMethod();
+      PsiClass aClass = superMethod.getContainingClass();
+      if (aClass == null) continue;
+      // do not show deprecated warning for class implementing deprecated methods
+      if (!aClass.isDeprecated() && superMethod.hasModifierProperty(PsiModifier.ABSTRACT)) continue;
+      if (superMethod.isDeprecated()) {
+        String description = JavaErrorMessages.message("overrides.deprecated.method",
+                                                       HighlightMessageUtil.getSymbolName(aClass, PsiSubstitutor.EMPTY));
+        holder.registerProblem(methodName, description, ProblemHighlightType.LIKE_DEPRECATED, (LocalQuickFix [])null);
+      }
+    }
+  }
+
+  static void checkDeprecated(PsiElement refElement,
+                                                  PsiElement elementToHighlight,
+                                                  ProblemsHolder holder) {
+    if (!(refElement instanceof PsiDocCommentOwner)) return;
+    if (!((PsiDocCommentOwner)refElement).isDeprecated()) return;
+
+    String description = JavaErrorMessages.message("deprecated.symbol",
+                                                   HighlightMessageUtil.getSymbolName(refElement, PsiSubstitutor.EMPTY));
+
+    holder.registerProblem(elementToHighlight, description, ProblemHighlightType.LIKE_DEPRECATED, (LocalQuickFix[])null);
+  }
+}

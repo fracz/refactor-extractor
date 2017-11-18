@@ -1,0 +1,337 @@
+package com.intellij.util.containers;
+
+import java.util.EventListener;
+import java.util.Iterator;
+
+/**
+ * @author lvo
+ */
+public class IntObjectCache<T> implements Iterable<T> {
+
+  public static final int DEFAULT_SIZE = 8192;
+  public static final int MIN_SIZE = 4;
+
+  private int myTop;
+  private int myBack;
+  private CacheEntry<T>[] myCache;
+  private int[] myHashTable;
+  private int myHashTableSize;
+  private int myCount;
+  private int myFirstFree;
+  private DeletedPairsListener[] myListeners;
+  private int myAttempts;
+  private int myHits;
+
+  private static final int[] HASHTABLE_SIZES = new int[]{5, 11, 23, 47, 101, 199, 397, 797, 1597, 3191, 6397, 12799, 25589, 51199, 102397,
+    204793, 409579, 819157, 2295859, 4591721, 9183457, 18366923, 36733847, 73467739, 146935499, 293871013, 587742049, 1175484103};
+
+  protected static class CacheEntry<T> {
+    public int key;
+    public T value;
+    public int prev;
+    public int next;
+    public int hash_next;
+  }
+
+  public IntObjectCache() {
+    this(DEFAULT_SIZE);
+  }
+
+  public IntObjectCache(int cacheSize) {
+    if (cacheSize < MIN_SIZE) {
+      cacheSize = MIN_SIZE;
+    }
+    myTop = myBack = 0;
+    myCache = new CacheEntry[cacheSize + 1];
+    for (int i = 0; i < myCache.length; ++i) {
+      myCache[i] = new CacheEntry<T>();
+    }
+    myHashTableSize = cacheSize;
+    int i = 0;
+    while (myHashTableSize > HASHTABLE_SIZES[i]) ++i;
+    myHashTableSize = HASHTABLE_SIZES[i];
+    myHashTable = new int[myHashTableSize];
+    myAttempts = 0;
+    myHits = 0;
+    myCount = myFirstFree = 0;
+  }
+
+  // Some AbstractMap functions started
+
+  public boolean isEmpty() {
+    return count() == 0;
+  }
+
+  public boolean containsKey(int key) {
+    return isCached(key);
+  }
+
+  public T get(int key) {
+    return tryKey(key);
+  }
+
+  public T put(int key, T value) {
+    T oldValue = tryKey(key);
+    if (oldValue != null) {
+      remove(key);
+    }
+    cacheObject(key, value);
+    return oldValue;
+  }
+
+  public void remove(int key) {
+    int index = searchForCacheEntry(key);
+    if (index != 0) {
+      removeEntry(index);
+      removeEntryFromHashTable(index);
+      myCache[index].hash_next = myFirstFree;
+      myFirstFree = index;
+      fireListenersAboutDeletion(index);
+      myCache[index].value = null;
+    }
+  }
+
+  public void removeAll() {
+    final IntArrayList keys = new IntArrayList(count());
+    int current = myTop;
+    while (current > 0) {
+      if (myCache[current].value != null) {
+        keys.add(myCache[current].key);
+      }
+      current = myCache[current].next;
+    }
+    for (int i = 0; i < keys.size(); ++ i) {
+      remove(keys.get(i));
+    }
+  }
+
+  // Some AbstractMap functions finished
+
+  final public void cacheObject(int key, T x) {
+    int index = myFirstFree;
+    if (myCount < myCache.length - 1) {
+      if (index == 0) {
+        index = myCount;
+        ++index;
+      }
+      else {
+        myFirstFree = myCache[index].hash_next;
+      }
+      if (myCount == 0) {
+        myBack = index;
+      }
+    }
+    else {
+      index = myBack;
+      removeEntryFromHashTable(index);
+      fireListenersAboutDeletion(index);
+      myCache[myBack = myCache[index].prev].next = 0;
+    }
+    myCache[index].key = key;
+    myCache[index].value = x;
+    addEntry2HashTable(index);
+    add2Top(index);
+  }
+
+  final public T tryKey(int key) {
+    ++myAttempts;
+    final int index = searchForCacheEntry(key);
+    if (index == 0) {
+      return null;
+    }
+    ++myHits;
+    final CacheEntry<T> cacheEntry = myCache[index];
+    final int top = myTop;
+    if (index != top) {
+      final int prev = cacheEntry.prev;
+      final int next = cacheEntry.next;
+      if (index == myBack) {
+        myBack = prev;
+      }
+      else {
+        myCache[next].prev = prev;
+      }
+      myCache[prev].next = next;
+      cacheEntry.next = top;
+      cacheEntry.prev = 0;
+      myCache[top].prev = index;
+      myTop = index;
+    }
+    return cacheEntry.value;
+  }
+
+  final public boolean isCached(int key) {
+    return searchForCacheEntry(key) != 0;
+  }
+
+  public int count() {
+    return myCount;
+  }
+
+  public int size() {
+    return myCache.length - 1;
+  }
+
+  public void resize(int newSize) {
+    IntObjectCache<T> newCache = new IntObjectCache<T>(newSize);
+    for (DeletedPairsListener listener : myListeners) {
+      newCache.addDeletedPairsListener(listener);
+    }
+    final CacheEntry<T>[] cache = myCache;
+    int back = myBack;
+    while (back != 0) {
+      final CacheEntry<T> cacheEntry = cache[back];
+      newCache.cacheObject(cacheEntry.key, cacheEntry.value);
+      back = cacheEntry.prev;
+    }
+    myTop = newCache.myTop;
+    myBack = newCache.myBack;
+    myCache = newCache.myCache;
+    myHashTable = newCache.myHashTable;
+    myCount = newCache.myCount;
+    myFirstFree = newCache.myFirstFree;
+  }
+
+  public double hitRate() {
+    return myAttempts > 0 ? (double)myHits / (double)myAttempts : 0;
+  }
+
+  private void add2Top(int index) {
+    myCache[index].next = myTop;
+    myCache[index].prev = 0;
+    myCache[myTop].prev = index;
+    myTop = index;
+  }
+
+  private void removeEntry(int index) {
+    if (index == myBack) {
+      myBack = myCache[index].prev;
+    }
+    else {
+      myCache[myCache[index].next].prev = myCache[index].prev;
+    }
+    if (index == myTop) {
+      myTop = myCache[index].next;
+    }
+    else {
+      myCache[myCache[index].prev].next = myCache[index].next;
+    }
+  }
+
+  private void addEntry2HashTable(int index) {
+    int hash_index = (myCache[index].key & 0x7fffffff) % myHashTableSize;
+    myCache[index].hash_next = myHashTable[hash_index];
+    myHashTable[hash_index] = index;
+    ++myCount;
+  }
+
+  private void removeEntryFromHashTable(int index) {
+    final int hash_index = (myCache[index].key & 0x7fffffff) % myHashTableSize;
+    int current = myHashTable[hash_index];
+    int previous = 0;
+    while (current != 0) {
+      int next = myCache[current].hash_next;
+      if (current == index) {
+        if (previous != 0) {
+          myCache[previous].hash_next = next;
+        }
+        else {
+          myHashTable[hash_index] = next;
+        }
+        --myCount;
+        break;
+      }
+      previous = current;
+      current = next;
+    }
+  }
+
+  private int searchForCacheEntry(int key) {
+    myCache[0].key = key;
+    int current = myHashTable[((key & 0x7fffffff) % myHashTableSize)];
+    while (true) {
+      final CacheEntry<T> cacheEntry = myCache[current];
+      if (key == cacheEntry.key) {
+        break;
+      }
+      current = cacheEntry.hash_next;
+    }
+    return current;
+  }
+
+  // start of Iterable implementation
+
+  public Iterator<T> iterator() {
+    return new IntObjectCacheIterator(this);
+  }
+
+  protected class IntObjectCacheIterator implements Iterator<T> {
+    private int myCurrentEntry;
+
+    public IntObjectCacheIterator(IntObjectCache cache) {
+      myCurrentEntry = 0;
+      cache.myCache[0].next = cache.myTop;
+    }
+
+    public boolean hasNext() {
+      return (myCurrentEntry = myCache[myCurrentEntry].next) != 0;
+    }
+
+    public T next() {
+      return myCache[myCurrentEntry].value;
+    }
+
+    public void remove() {
+      removeEntry(myCache[myCurrentEntry].key);
+    }
+  }
+
+  // end of Iterable implementation
+
+  // start of listening features
+
+  public interface DeletedPairsListener extends EventListener {
+    void objectRemoved(int key, Object value);
+  }
+
+  public void addDeletedPairsListener(DeletedPairsListener listener) {
+    if (myListeners == null) {
+      myListeners = new DeletedPairsListener[1];
+    }
+    else {
+      DeletedPairsListener[] newListeners = new DeletedPairsListener[myListeners.length + 1];
+      System.arraycopy(myListeners, 0, newListeners, 0, myListeners.length);
+      myListeners = newListeners;
+    }
+    myListeners[myListeners.length - 1] = listener;
+  }
+
+  public void removeDeletedPairsListener(DeletedPairsListener listener) {
+    if (myListeners != null) {
+      if (myListeners.length == 1) {
+        myListeners = null;
+      }
+      else {
+        DeletedPairsListener[] newListeners = new DeletedPairsListener[myListeners.length - 1];
+        int i = 0;
+        for (DeletedPairsListener myListener : myListeners) {
+          if (myListener != listener) {
+            newListeners[i++] = myListener;
+          }
+        }
+        myListeners = newListeners;
+      }
+    }
+  }
+
+  private void fireListenersAboutDeletion(int index) {
+    if (myListeners != null) {
+      final CacheEntry cacheEntry = myCache[index];
+      for (DeletedPairsListener myListener : myListeners) {
+        myListener.objectRemoved(cacheEntry.key, cacheEntry.value);
+      }
+    }
+  }
+
+  // end of listening features
+}

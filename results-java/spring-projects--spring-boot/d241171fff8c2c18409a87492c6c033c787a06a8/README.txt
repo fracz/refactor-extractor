@@ -1,0 +1,25 @@
+commit d241171fff8c2c18409a87492c6c033c787a06a8
+Author: Andy Wilkinson <awilkinson@pivotal.io>
+Date:   Mon Aug 3 15:39:56 2015 +0100
+
+    Use fast exceptions in hasMoreElements in LaunchedURLClassLoader
+
+    When nested jars are being used, hasMoreElements requires opening a
+    connection for an entry in every nested jar. If that entry doesn't
+    exist, a FileNotFoundException is thrown to indicate that a particular
+    jar doesn't contain the requested entry. This exception is used to
+    indicate the lack of an entry and is then swallowed, i.e. its stack
+    trace is of no importance. This means that the performance of
+    hasMoreElements can be improved by switching on fast exceptions while
+    it's being called. When fast exceptions are switched on a general
+    purpose pre-initialized FileNotFoundException is thrown rather than
+    creating a new FileNotFoundException instance each time.
+
+    In certain situations, the use of fast exceptions as described above
+    can improve performance fairly significantly. The JRE's default SAAJ
+    implementation uses META-INF/services-based discovery for _every_
+    request that's handled by Spring Web Services. Each discovery attempt
+    results in hasMoreElements being called making its performance
+    critical to throughput.
+
+    See gh-3640

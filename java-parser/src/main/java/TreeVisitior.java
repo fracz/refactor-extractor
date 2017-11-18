@@ -576,7 +576,9 @@ public abstract class TreeVisitior implements VoidVisitor<Integer> {
     @Override
     @Generated("com.github.javaparser.generator.core.visitor.VoidVisitorAdapterGenerator")
     public void visit(final SimpleName n, final Integer arg) {
+        in(n, arg);
         n.getComment().ifPresent(l -> l.accept(this, arg + 1));
+        out(n, arg);
     }
 
     @Override

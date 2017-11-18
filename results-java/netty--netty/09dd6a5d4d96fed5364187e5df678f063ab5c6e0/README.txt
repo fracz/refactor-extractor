@@ -1,0 +1,18 @@
+commit 09dd6a5d4d96fed5364187e5df678f063ab5c6e0
+Author: Nikolay Fedorovskikh <fenik17@gmail.com>
+Date:   Sat Oct 14 00:17:55 2017 +0500
+
+    Minor improvements in ByteBufOutputStream
+
+    Motivation:
+    In the `ByteBufOutputStream` we can use an appropriate methods of `ByteBuf`
+    to reduce calls of virtual methods and do not copying converting logic.
+
+    Modifications:
+    - Use an appropriate methods of `ByteBuf`
+    - Remove redundant conversions (int -> byte, int -> char).
+    - Use `ByteBuf#writeCharSequence` in the `writeBytes(String)'.
+
+    Result:
+    Less code duplication. A `writeBytes(String)` method is faster.
+    No unnecessary conversions. More consistent and cleaner code.

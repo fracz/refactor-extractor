@@ -1,0 +1,5 @@
+commit 5ae3a636d34aa48e02f6eb9678c307520cf69d1f
+Author: Szczepan Faber <szczepiq@gmail.com>
+Date:   Wed Aug 24 13:25:16 2011 +0200
+
+    GRADLE-1758 Improvements in the parallel builds feature after exposing some issues when running full daemon suite. The current strategy is as follows: connector.connect() does not guarantee to return an idle daemon (although there's a great chance for that). The daemon server itself controls what type of jobs he can do. He can do max 2 parallel jobs. One for the Build request. Second for eventual Stop request. If the build command is currently running and some unlucky client sends a build request to that daemon, the client receives Busy response and can try to connect to a different daemon.  There're number of refactorings I want to do with this code yet. I need this commit to regroup after a bloody battle with with the daemon paralellization.

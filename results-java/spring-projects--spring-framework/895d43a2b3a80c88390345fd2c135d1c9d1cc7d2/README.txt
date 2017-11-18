@@ -1,0 +1,30 @@
+commit 895d43a2b3a80c88390345fd2c135d1c9d1cc7d2
+Author: Sam Brannen <sam@sambrannen.com>
+Date:   Sat Jun 27 02:50:07 2015 +0200
+
+    Print cookies in human-readable form in Spring MVC Test
+
+    Prior to this commit, when rendering cookies via `andDo(print())` in
+    Spring MVC Test, the output for the `MockHttpServletResponse` would
+    look something like the following:
+
+      Cookies = [javax.servlet.http.Cookie@25084a1e]
+
+    The reason is that the Cookie class in javax.servlet-api-3.0.1.jar does
+    not implement toString(). Consequently, nothing about the cookie's
+    name, value, etc., is displayed, thereby making the debug output for
+    cookies next to useless.
+
+    This commit improves on this by implementing custom toString() logic
+    for cookies in debug output in Spring MVC Test. For example, the output
+    now looks like this (without the newlines):
+
+      Cookies = [[Cookie@47faa49c name = 'enigma', value = '42', \\
+                comment = [null], domain = [null], maxAge = -1, \\
+                path = [null], secure = false, version = 0, \\
+                httpOnly = false]]
+
+    In addition, this commit fixes a minor bug for FlashMap debug output if
+    the FlashMap is empty.
+
+    Issue: SPR-13168

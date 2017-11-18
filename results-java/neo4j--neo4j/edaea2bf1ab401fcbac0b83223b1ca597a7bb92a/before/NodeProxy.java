@@ -1,0 +1,599 @@
+/**
+ * Copyright (c) 2002-2013 "Neo Technology,"
+ * Network Engine for Objects in Lund AB [http://neotechnology.com]
+ *
+ * This file is part of Neo4j.
+ *
+ * Neo4j is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package org.neo4j.kernel.impl.core;
+
+import java.util.Iterator;
+
+import org.neo4j.graphdb.ConstraintViolationException;
+import org.neo4j.graphdb.Direction;
+import org.neo4j.graphdb.GraphDatabaseService;
+import org.neo4j.graphdb.Label;
+import org.neo4j.graphdb.Node;
+import org.neo4j.graphdb.NotFoundException;
+import org.neo4j.graphdb.Relationship;
+import org.neo4j.graphdb.RelationshipType;
+import org.neo4j.graphdb.ResourceIterable;
+import org.neo4j.graphdb.ResourceIterator;
+import org.neo4j.graphdb.ReturnableEvaluator;
+import org.neo4j.graphdb.StopEvaluator;
+import org.neo4j.graphdb.Traverser;
+import org.neo4j.graphdb.Traverser.Order;
+import org.neo4j.helpers.Function;
+import org.neo4j.helpers.ThisShouldNotHappenError;
+import org.neo4j.kernel.ThreadToStatementContextBridge;
+import org.neo4j.kernel.api.StatementOperations;
+import org.neo4j.kernel.api.exceptions.EntityNotFoundException;
+import org.neo4j.kernel.api.exceptions.LabelNotFoundKernelException;
+import org.neo4j.kernel.api.exceptions.PropertyKeyIdNotFoundException;
+import org.neo4j.kernel.api.exceptions.PropertyKeyNotFoundException;
+import org.neo4j.kernel.api.exceptions.PropertyNotFoundException;
+import org.neo4j.kernel.api.exceptions.schema.SchemaKernelException;
+import org.neo4j.kernel.api.operations.StatementState;
+import org.neo4j.kernel.api.properties.Property;
+import org.neo4j.kernel.impl.cleanup.CleanupService;
+import org.neo4j.kernel.impl.transaction.LockType;
+import org.neo4j.kernel.impl.traversal.OldTraverserWrapper;
+
+import static org.neo4j.graphdb.DynamicLabel.label;
+import static org.neo4j.helpers.collection.Iterables.map;
+import static org.neo4j.helpers.collection.IteratorUtil.asSet;
+
+public class NodeProxy implements Node
+{
+    public interface NodeLookup
+    {
+        NodeImpl lookup( long nodeId );
+
+        GraphDatabaseService getGraphDatabase();
+
+        NodeManager getNodeManager();
+
+        CleanupService getCleanupService();
+
+        NodeImpl lookup( long nodeId, LockType lock );
+    }
+
+    private final NodeLookup nodeLookup;
+    private final ThreadToStatementContextBridge statementCtxProvider;
+    private final long nodeId;
+
+    NodeProxy( long nodeId, NodeLookup nodeLookup, ThreadToStatementContextBridge statementCtxProvider )
+    {
+        this.nodeId = nodeId;
+        this.nodeLookup = nodeLookup;
+        this.statementCtxProvider = statementCtxProvider;
+    }
+
+    @Override
+    public long getId()
+    {
+        return nodeId;
+    }
+
+    @Override
+    public GraphDatabaseService getGraphDatabase()
+    {
+        return nodeLookup.getGraphDatabase();
+    }
+
+    @Override
+    public void delete()
+    {
+        StatementOperations context = statementCtxProvider.getCtxForWriting();
+        StatementState state = statementCtxProvider.statementForWriting();
+        try
+        {
+            context.nodeDelete( state, getId() );
+        }
+        finally
+        {
+            context.close( state );
+        }
+    }
+
+    @Override
+    public Iterable<Relationship> getRelationships()
+    {
+        return nodeLookup.lookup( nodeId ).getRelationships( nodeLookup.getNodeManager() );
+    }
+
+    @Override
+    public boolean hasRelationship()
+    {
+        return nodeLookup.lookup( nodeId ).hasRelationship( nodeLookup.getNodeManager() );
+    }
+
+    @Override
+    public Iterable<Relationship> getRelationships( Direction dir )
+    {
+        return nodeLookup.lookup( nodeId ).getRelationships( nodeLookup.getNodeManager(), dir );
+    }
+
+    @Override
+    public boolean hasRelationship( Direction dir )
+    {
+        return nodeLookup.lookup( nodeId ).hasRelationship( nodeLookup.getNodeManager(), dir );
+    }
+
+    @Override
+    public Iterable<Relationship> getRelationships( RelationshipType... types )
+    {
+        return nodeLookup.lookup( nodeId ).getRelationships( nodeLookup.getNodeManager(), types );
+    }
+
+    @Override
+    public Iterable<Relationship> getRelationships( Direction direction, RelationshipType... types )
+    {
+        return nodeLookup.lookup( nodeId ).getRelationships( nodeLookup.getNodeManager(), direction, types );
+    }
+
+    @Override
+    public boolean hasRelationship( RelationshipType... types )
+    {
+        return nodeLookup.lookup( nodeId ).hasRelationship( nodeLookup.getNodeManager(), types );
+    }
+
+    @Override
+    public boolean hasRelationship( Direction direction, RelationshipType... types )
+    {
+        return nodeLookup.lookup( nodeId ).hasRelationship( nodeLookup.getNodeManager(), direction, types );
+    }
+
+    @Override
+    public Iterable<Relationship> getRelationships( RelationshipType type,
+                                                    Direction dir )
+    {
+        return nodeLookup.lookup( nodeId ).getRelationships( nodeLookup.getNodeManager(), type, dir );
+    }
+
+    @Override
+    public boolean hasRelationship( RelationshipType type, Direction dir )
+    {
+        return nodeLookup.lookup( nodeId ).hasRelationship( nodeLookup.getNodeManager(), type, dir );
+    }
+
+    @Override
+    public Relationship getSingleRelationship( RelationshipType type,
+                                               Direction dir )
+    {
+        return nodeLookup.lookup( nodeId ).getSingleRelationship( nodeLookup.getNodeManager(), type, dir );
+    }
+
+    @Override
+    public void setProperty( String key, Object value )
+    {
+        StatementOperations context = statementCtxProvider.getCtxForWriting();
+        StatementState state = statementCtxProvider.statementForWriting();
+        boolean success = false;
+        try
+        {
+            long propertyKeyId = context.propertyKeyGetOrCreateForName( state, key );
+            context.nodeSetProperty( state, nodeId, Property.property( propertyKeyId, value ) );
+            success = true;
+        }
+        catch ( PropertyKeyIdNotFoundException e )
+        {
+            throw new ThisShouldNotHappenError( "Stefan/Jake", "A property key id disappeared under our feet" );
+        }
+        catch ( EntityNotFoundException e )
+        {
+            throw new NotFoundException( e );
+        }
+        catch ( SchemaKernelException e )
+        {
+            // TODO: Maybe throw more context-specific error than just IllegalArgument
+            throw new IllegalArgumentException( e );
+        }
+        finally
+        {
+            context.close( state );
+            if ( !success )
+            {
+                nodeLookup.getNodeManager().setRollbackOnly();
+            }
+        }
+    }
+
+    @Override
+    public Object removeProperty( String key ) throws NotFoundException
+    {
+        StatementOperations context = statementCtxProvider.getCtxForWriting();
+        StatementState state = statementCtxProvider.statementForWriting();
+        try
+        {
+            long propertyKeyId = context.propertyKeyGetOrCreateForName( state, key );
+            return context.nodeRemoveProperty( state, nodeId, propertyKeyId ).value( null );
+        }
+        catch ( PropertyKeyIdNotFoundException e )
+        {
+            throw new ThisShouldNotHappenError( "Stefan/Jake", "A property key id disappeared under our feet" );
+        }
+        catch ( EntityNotFoundException e )
+        {
+            throw new NotFoundException( e );
+        }
+        catch ( SchemaKernelException e )
+        {
+            // TODO: Maybe throw more context-specific error than just IllegalArgument
+            throw new IllegalArgumentException( e );
+        }
+        finally
+        {
+            context.close( state );
+        }
+    }
+
+    @Override
+    public Object getProperty( String key, Object defaultValue )
+    {
+        // TODO: Push this check to getPropertyKeyId
+        // ^^^^^ actually, if the key is null, we could fail before getting the statement context...
+        if ( null == key )
+            throw new IllegalArgumentException( "(null) property key is not allowed" );
+
+        StatementOperations context = statementCtxProvider.getCtxForReading();
+        StatementState state = statementCtxProvider.statementForReading();
+        try
+        {
+            long propertyKeyId = context.propertyKeyGetForName( state, key );
+            return context.nodeGetProperty( state, nodeId, propertyKeyId ).value(defaultValue);
+        }
+        catch ( EntityNotFoundException e )
+        {
+            throw new NotFoundException( e );
+        }
+        catch ( PropertyKeyIdNotFoundException e )
+        {
+            return defaultValue;
+        }
+        catch ( PropertyKeyNotFoundException e )
+        {
+            return defaultValue;
+        }
+        finally
+        {
+            context.close( state );
+        }
+    }
+
+    @Override
+    public Iterable<Object> getPropertyValues()
+    {
+        final StatementOperations context = statementCtxProvider.getCtxForReading();
+        StatementState state = statementCtxProvider.statementForReading();
+        try
+        {
+            return asSet( map( new Function<Property,Object>() {
+                @Override
+                public Object apply( Property prop )
+                {
+                    try
+                    {
+                        return prop.value();
+                    }
+                    catch ( PropertyNotFoundException e )
+                    {
+                        throw new ThisShouldNotHappenError( "Jake",
+                                "Property key retrieved through kernel API should exist." );
+                    }
+                }
+            }, context.nodeGetAllProperties( state, getId() )));
+        }
+        catch ( EntityNotFoundException e )
+        {
+            throw new NotFoundException( "Node not found", e );
+        }
+        finally
+        {
+            context.close( state );
+        }
+    }
+
+    @Override
+    public Iterable<String> getPropertyKeys()
+    {
+        final StatementOperations context = statementCtxProvider.getCtxForReading();
+        final StatementState state = statementCtxProvider.statementForReading();
+        try
+        {
+            return asSet( map( new Function<Long, String>() {
+                @Override
+                public String apply( Long propertyKeyId )
+                {
+                    try
+                    {
+                        return context.propertyKeyGetName( state, propertyKeyId );
+                    }
+                    catch ( PropertyKeyIdNotFoundException e )
+                    {
+                        throw new ThisShouldNotHappenError( "Jake",
+                                "Property key retrieved through kernel API should exist." );
+                    }
+                }
+            }, context.nodeGetPropertyKeys( state, getId() )));
+        }
+        catch ( EntityNotFoundException e )
+        {
+            throw new NotFoundException( "Node not found", e );
+        }
+        finally
+        {
+            context.close( state );
+        }
+    }
+
+    @Override
+    public Object getProperty( String key ) throws NotFoundException
+    {
+        // TODO: Push this check to getPropertyKeyId
+        // ^^^^^ actually, if the key is null, we could fail before getting the statement context...
+        if ( null == key )
+            throw new IllegalArgumentException( "(null) property key is not allowed" );
+
+        StatementOperations context = statementCtxProvider.getCtxForReading();
+        StatementState state = statementCtxProvider.statementForReading();
+        try
+        {
+            long propertyKeyId = context.propertyKeyGetForName( state, key );
+            return context.nodeGetProperty( state, nodeId, propertyKeyId ).value();
+        }
+        catch ( EntityNotFoundException e )
+        {
+            throw new NotFoundException( e );
+        }
+        catch ( PropertyKeyIdNotFoundException e )
+        {
+            throw new NotFoundException( e );
+        }
+        catch ( PropertyKeyNotFoundException e )
+        {
+            throw new NotFoundException( e );
+        }
+        catch ( PropertyNotFoundException e )
+        {
+            throw new NotFoundException( e );
+        }
+        finally
+        {
+            context.close( state );
+        }
+    }
+
+    @Override
+    public boolean hasProperty( String key )
+    {
+        if ( null == key )
+            return false;
+
+        StatementOperations context = statementCtxProvider.getCtxForReading();
+        StatementState state = statementCtxProvider.statementForReading();
+        try
+        {
+            long propertyKeyId = context.propertyKeyGetForName( state, key );
+            return context.nodeHasProperty( state, nodeId, propertyKeyId );
+        }
+        catch ( EntityNotFoundException e )
+        {
+            throw new NotFoundException( e );
+        }
+        catch ( PropertyKeyIdNotFoundException e )
+        {
+            return false;
+        }
+        catch ( PropertyKeyNotFoundException e )
+        {
+            return false;
+        }
+        finally
+        {
+            context.close( state );
+        }
+    }
+
+    public int compareTo( Object node )
+    {
+        Node n = (Node) node;
+        long ourId = this.getId(), theirId = n.getId();
+
+        if ( ourId < theirId )
+        {
+            return -1;
+        }
+        else if ( ourId > theirId )
+        {
+            return 1;
+        }
+        else
+        {
+            return 0;
+        }
+    }
+
+    @Override
+    public boolean equals( Object o )
+    {
+        return o instanceof Node && this.getId() == ((Node) o).getId();
+    }
+
+    @Override
+    public int hashCode()
+    {
+        return (int) ((nodeId >>> 32) ^ nodeId);
+    }
+
+    @Override
+    public String toString()
+    {
+        return "Node[" + this.getId() + "]";
+    }
+
+    @Override
+    public Relationship createRelationshipTo( Node otherNode,
+                                              RelationshipType type )
+    {
+        return nodeLookup.lookup( nodeId, LockType.WRITE ).createRelationshipTo( nodeLookup.getNodeManager(), this,
+                otherNode, type );
+    }
+
+    @Override
+    public Traverser traverse( Order traversalOrder,
+                               StopEvaluator stopEvaluator, ReturnableEvaluator returnableEvaluator,
+                               RelationshipType relationshipType, Direction direction )
+    {
+        return OldTraverserWrapper.traverse( this,
+                traversalOrder, stopEvaluator,
+                returnableEvaluator, relationshipType, direction );
+    }
+
+    @Override
+    public Traverser traverse( Order traversalOrder,
+                               StopEvaluator stopEvaluator, ReturnableEvaluator returnableEvaluator,
+                               RelationshipType firstRelationshipType, Direction firstDirection,
+                               RelationshipType secondRelationshipType, Direction secondDirection )
+    {
+        return OldTraverserWrapper.traverse( this,
+                traversalOrder, stopEvaluator,
+                returnableEvaluator, firstRelationshipType, firstDirection,
+                secondRelationshipType, secondDirection );
+    }
+
+    @Override
+    public Traverser traverse( Order traversalOrder,
+                               StopEvaluator stopEvaluator, ReturnableEvaluator returnableEvaluator,
+                               Object... relationshipTypesAndDirections )
+    {
+        return OldTraverserWrapper.traverse( this,
+                traversalOrder, stopEvaluator,
+                returnableEvaluator, relationshipTypesAndDirections );
+    }
+
+    @Override
+    public void addLabel( Label label )
+    {
+        StatementOperations context = statementCtxProvider.getCtxForWriting();
+        StatementState state = statementCtxProvider.statementForWriting();
+        try
+        {
+            context.nodeAddLabel( state, getId(), context.labelGetOrCreateForName( state, label.name() ) );
+        }
+        catch ( SchemaKernelException e )
+        {
+            throw new ConstraintViolationException( "Unable to add label.", e );
+        }
+        catch ( EntityNotFoundException e )
+        {
+            throw new NotFoundException( "No node with id " + getId() + " found.", e );
+        }
+        finally
+        {
+            context.close( state );
+        }
+    }
+
+    @Override
+    public void removeLabel( Label label )
+    {
+        StatementOperations context = statementCtxProvider.getCtxForWriting();
+        StatementState state = statementCtxProvider.statementForWriting();
+        try
+        {
+            long labelId = context.labelGetForName( state, label.name() );
+            context.nodeRemoveLabel( state, getId(), labelId );
+        }
+        catch ( LabelNotFoundKernelException e )
+        {
+            return;
+        }
+        catch ( EntityNotFoundException e )
+        {
+            throw new NotFoundException( "No node with id " + getId() + " found.", e );
+        }
+        finally
+        {
+            context.close( state );
+        }
+    }
+
+    @Override
+    public boolean hasLabel( Label label )
+    {
+        StatementOperations context = statementCtxProvider.getCtxForReading();
+        StatementState state = statementCtxProvider.statementForReading();
+        try
+        {
+            return context.nodeHasLabel( state, getId(), context.labelGetForName( state, label.name() ) );
+        }
+        catch ( LabelNotFoundKernelException e )
+        {
+            return false;
+        }
+        catch ( EntityNotFoundException e )
+        {
+            return false;
+        }
+        finally
+        {
+            context.close( state );
+        }
+    }
+
+    @Override
+    public ResourceIterable<Label> getLabels()
+    {
+        return new ResourceIterable<Label>()
+        {
+            @SuppressWarnings( "resource" )
+            @Override
+            public ResourceIterator<Label> iterator()
+            {
+                final StatementOperations context = statementCtxProvider.getCtxForReading();
+                Iterator<Long> labels;
+
+                final StatementState state = statementCtxProvider.statementForReading();
+                try
+                {
+                    labels = context.nodeGetLabels( state, getId() );
+                }
+                catch ( EntityNotFoundException e )
+                {
+                    context.close( state );
+                    throw new NotFoundException( "No node with id " + getId() + " found.", e );
+                }
+
+                return nodeLookup.getCleanupService().resourceIterator( map( new Function<Long, Label>()
+                {
+                    @Override
+                    public Label apply( Long labelId )
+                    {
+                        try
+                        {
+                            return label( context.labelGetName( state, labelId ) );
+                        }
+                        catch ( LabelNotFoundKernelException e )
+                        {
+                            throw new ThisShouldNotHappenError( "Mattias", "Listed labels for node " + nodeId +
+                                    ", but the returned label " + labelId + " doesn't exist anymore" );
+                        }
+                    }
+                }, labels ), state.closeable( context ) );
+            }
+        };
+    }
+}

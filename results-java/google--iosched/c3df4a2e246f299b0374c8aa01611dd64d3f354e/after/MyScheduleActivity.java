@@ -1,0 +1,628 @@
+/*
+ * Copyright 2014 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.samples.apps.iosched.myschedule;
+
+import android.app.AlertDialog;
+import android.content.DialogInterface;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.database.ContentObserver;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.preference.PreferenceManager;
+import android.support.design.widget.TabLayout;
+import android.support.v4.view.ViewCompat;
+import android.support.v4.view.ViewPager;
+import android.text.SpannableString;
+import android.text.TextUtils;
+import android.text.method.LinkMovementMethod;
+import android.text.util.Linkify;
+import android.util.TypedValue;
+import android.view.LayoutInflater;
+import android.view.Menu;
+import android.view.View;
+import android.widget.ScrollView;
+import android.widget.TextView;
+
+import com.google.samples.apps.iosched.BuildConfig;
+import com.google.samples.apps.iosched.Config;
+import com.google.samples.apps.iosched.R;
+import com.google.samples.apps.iosched.model.ScheduleHelper;
+import com.google.samples.apps.iosched.model.ScheduleItem;
+import com.google.samples.apps.iosched.provider.ScheduleContract;
+import com.google.samples.apps.iosched.session.SessionDetailActivity;
+import com.google.samples.apps.iosched.settings.SettingsUtils;
+import com.google.samples.apps.iosched.ui.BaseActivity;
+import com.google.samples.apps.iosched.util.AnalyticsHelper;
+import com.google.samples.apps.iosched.util.ParserUtils;
+import com.google.samples.apps.iosched.util.ThrottledContentObserver;
+import com.google.samples.apps.iosched.util.TimeUtils;
+import com.google.samples.apps.iosched.util.UIUtils;
+
+import java.util.Arrays;
+import java.util.Date;
+import java.util.HashSet;
+import java.util.Set;
+
+import static com.google.samples.apps.iosched.util.LogUtils.LOGD;
+import static com.google.samples.apps.iosched.util.LogUtils.LOGE;
+import static com.google.samples.apps.iosched.util.LogUtils.makeLogTag;
+
+/**
+ * This shows the schedule of the logged in user, organised per day.
+ * <p/>
+ * Depending on the device, this Activity uses either a {@link ViewPager} with a
+ * {@link MyScheduleSingleDayFragment} for its page (the "narrow" layout) or a
+ * {@link MyScheduleAllDaysFragment}, which uses a {@link MyScheduleSingleDayNoScrollView} for each
+ * day. Each day data is backed by a {@link MyScheduleDayAdapter} (the "wide" layout).
+ */
+public class MyScheduleActivity extends BaseActivity implements
+        MyScheduleSingleDayFragment.Listener {
+
+    /**
+     * Interval that a timer will redraw the UI during the conference, so that time sensitive
+     * widgets, like the "Now" and "Ended" indicators can be properly updated.
+     */
+    private static final long INTERVAL_TO_REDRAW_UI = 1 * TimeUtils.MINUTE;
+
+    private static final String SCREEN_LABEL = "My Schedule";
+
+    private static final String TAG = makeLogTag(MyScheduleActivity.class);
+
+    private static int BASE_TAB_VIEW_ID = 12345;
+
+    /**
+     * If true, we are in the wide (tablet landscape) mode where we show conference days side by
+     * side; if false, we are in narrow (non tablet landscape) mode where we use a ViewPager and
+     * show one conference day per page.
+     */
+    private boolean mWideMode = false;
+
+    // If in wide mode, we have MyScheduleView widgets showing each day
+
+    // The adapters that serves as the source of data for the UI, indicating the available
+    // items. We have one adapter per day of the conference. When we push new data into these
+    // adapters, the corresponding UIs update automatically.
+    private MyScheduleDayAdapter[] mScheduleAdapters = new MyScheduleDayAdapter[
+            Config.CONFERENCE_DAYS.length];
+
+    /**
+     * For users attending the conference, an extra day, prior to the conference, is added, for
+     * picking up the badge.
+     */
+    private MyScheduleDayAdapter mPreConferenceDayAdapter;
+
+    // The ScheduleHelper is responsible for feeding data in a format suitable to the Adapter.
+    private ScheduleHelper mDataHelper;
+
+    /**
+     * This is used for narrow mode only, to switch between days, it is null in wide mode
+     */
+    private ViewPager mViewPager;
+
+    /**
+     * This is used for narrow mode only, it is empty in wide mode
+     */
+    private Set<MyScheduleSingleDayFragment> mMyScheduleSingleDayFragments = new HashSet<MyScheduleSingleDayFragment>();
+
+    /**
+     * This is used for narrow mode only, it is null in wide mode. Each page in the
+     * {@link #mViewPager} is an {@link MyScheduleSingleDayFragment}.
+     */
+    private MyScheduleDayViewPagerAdapter mViewPagerAdapter;
+
+    /**
+     * This is used for narrow mode only, to display the conference days, it is null in wide mode
+     */
+    private TabLayout mTabLayout;
+
+    /**
+     * This is used in wide mode only, it is null otherwise
+     */
+    private ScrollView mScrollViewWide;
+
+    // Login failed butter bar
+    private View mButterBar;
+
+    /**
+     * During the conference, this is set to the index of the current day in the
+     * {@link #mScheduleAdapters}. Outside of conference period, this is set to 0.
+     */
+    private int mToday;
+
+    /**
+     * True during the conference or pre conference, false otherwise
+     */
+    private boolean mConferenceInProgress;
+
+    private boolean mDestroyed = false;
+
+    public static final String ARG_CONFERENCE_DAY_INDEX
+            = "com.google.samples.apps.iosched.ARG_CONFERENCE_DAY_INDEX";
+
+    public static final String EXTRA_DIALOG_TITLE
+            = "com.google.samples.apps.iosched.EXTRA_DIALOG_TITLE";
+    public static final String EXTRA_DIALOG_MESSAGE
+            = "com.google.samples.apps.iosched.EXTRA_DIALOG_MESSAGE";
+    public static final String EXTRA_DIALOG_YES
+            = "com.google.samples.apps.iosched.EXTRA_DIALOG_YES";
+    public static final String EXTRA_DIALOG_NO
+            = "com.google.samples.apps.iosched.EXTRA_DIALOG_NO";
+    public static final String EXTRA_DIALOG_URL
+            = "com.google.samples.apps.iosched.EXTRA_DIALOG_URL";
+
+    private boolean mShowedAnnouncementDialog = false;
+
+    private int mViewPagerScrollState = ViewPager.SCROLL_STATE_IDLE;
+
+    @Override
+    protected int getSelfNavDrawerItem() {
+        return NAVDRAWER_ITEM_MY_SCHEDULE;
+    }
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.my_schedule_act);
+
+        launchSessionDetailIfRequiredByIntent(getIntent());
+
+        // ANALYTICS SCREEN: View the My Schedule screen
+        // Contains: Nothing (Page name is a constant)
+        AnalyticsHelper.sendScreenView(SCREEN_LABEL);
+
+        mDataHelper = new ScheduleHelper(this);
+
+        initViews();
+
+        overridePendingTransition(0, 0);
+        addDataObservers();
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        calculateCurrentDay();
+
+        if (mConferenceInProgress) {
+            scheduleNextUIUpdate();
+        }
+
+        updateData();
+
+        // TODO - test this doesn't create a weird loop (dialog will trigger onResume() when
+        // dismissed?)
+        showAnnouncementDialogIfNeeded(getIntent());
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        mDestroyed = true;
+        removeDataObservers();
+    }
+
+    /**
+     * Pre-process the {@code intent} received to open this activity to determine if it was a deep
+     * link to a SessionDetail. Typically you wouldn't use this type of logic, but we need to
+     * because of the path of session details page on the website is only /schedule and session
+     * ids are part of the query parameters ("sid").
+     */
+    private void launchSessionDetailIfRequiredByIntent(Intent intent) {
+        if (intent != null && !TextUtils.isEmpty(intent.getDataString())) {
+            String intentDataString = intent.getDataString();
+            try {
+                Uri dataUri = Uri.parse(intentDataString);
+
+                // Website sends sessionId in query parameter "sid". If present, show
+                // SessionDetailActivity
+                String sessionId = dataUri.getQueryParameter("sid");
+                if (!TextUtils.isEmpty(sessionId)) {
+                    LOGD(TAG, "SessionId received from website: " + sessionId);
+                    Uri data = ScheduleContract.Sessions.buildSessionUri(sessionId);
+                    Intent sessionDetailIntent = new Intent(MyScheduleActivity.this,
+                            SessionDetailActivity.class);
+                    sessionDetailIntent.setData(data);
+                    startActivity(sessionDetailIntent);
+                    finish();
+                } else {
+                    LOGD(TAG, "No SessionId received from website");
+                }
+            } catch (Exception exception) {
+                LOGE(TAG, "Data uri existing but wasn't parsable for a session detail deep link");
+            }
+        }
+    }
+
+    private void initViews() {
+        // Set up view to show login failure
+        mButterBar = findViewById(R.id.butter_bar);
+        hideLoginFailureView();
+
+        // Prepare data adapters
+        if (SettingsUtils.isAttendeeAtVenue(this)) {
+            mPreConferenceDayAdapter = new MyScheduleDayAdapter(this, getLUtils());
+            preparePreConferenceDayAdapter();
+        }
+        for (int i = 0; i < Config.CONFERENCE_DAYS.length; i++) {
+            mScheduleAdapters[i] = new MyScheduleDayAdapter(this, getLUtils());
+        }
+
+        // Set up correct view mode
+        detectNarrowOrWideMode();
+        if (mWideMode) {
+            setUpViewForWideMode();
+        } else {
+            setUpViewPagerForNarrowMode();
+        }
+    }
+
+    private void detectNarrowOrWideMode() {
+        mWideMode = getFragmentManager().findFragmentById(R.id.myScheduleWideFrag) != null;
+    }
+
+    private void setUpViewForWideMode() {
+        mScrollViewWide = (ScrollView) findViewById(R.id.main_content_wide);
+
+        // Nothing else to do, as wide mode only uses MyScheduleAllDaysFragment, which will set
+        // itself up
+    }
+
+    private void setUpViewPagerForNarrowMode() {
+        mViewPager = (ViewPager) findViewById(R.id.view_pager);
+        mViewPagerAdapter = new MyScheduleDayViewPagerAdapter(this, getFragmentManager(),
+                showPreConferenceData());
+        mViewPager.setAdapter(mViewPagerAdapter);
+
+        mTabLayout = (TabLayout) findViewById(R.id.sliding_tabs);
+
+        mTabLayout.setupWithViewPager(mViewPager);
+
+        mTabLayout.setOnTabSelectedListener(new TabLayout.OnTabSelectedListener() {
+            @Override
+            public void onTabSelected(TabLayout.Tab tab) {
+                mViewPager.setCurrentItem(tab.getPosition(), true);
+                TextView view = (TextView) findViewById(BASE_TAB_VIEW_ID + tab.getPosition());
+                view.setContentDescription(
+                        getString(R.string.talkback_selected,
+                                getString(R.string.a11y_button, tab.getText())));
+            }
+
+            @Override
+            public void onTabUnselected(TabLayout.Tab tab) {
+                TextView view = (TextView) findViewById(BASE_TAB_VIEW_ID + tab.getPosition());
+                view.setContentDescription(
+                        getString(R.string.a11y_button, tab.getText()));
+            }
+
+            @Override
+            public void onTabReselected(TabLayout.Tab tab) {
+                // Do nothing
+            }
+        });
+        mViewPager.setPageMargin(getResources()
+                .getDimensionPixelSize(R.dimen.my_schedule_page_margin));
+        mViewPager.setPageMarginDrawable(R.drawable.page_margin);
+
+        setTabLayoutContentDescriptionsForNarrowLayout();
+    }
+
+    /**
+     * This method is an ad-hoc implementation of the pre conference day, which contains an item
+     * to pick up the badge at registration desk
+     */
+    private void preparePreConferenceDayAdapter() {
+        ScheduleItem item = new ScheduleItem();
+        item.title = getString(R.string.my_schedule_badgepickup);
+        item.startTime = ParserUtils.parseTime(BuildConfig.PRECONFERENCE_DAY_START);
+        item.endTime = ParserUtils.parseTime(BuildConfig.PRECONFERENCE_DAY_END);
+        item.type = ScheduleItem.BREAK;
+        item.room = item.subtitle = getString(R.string.my_schedule_badgepickup_description);
+        item.sessionType = ScheduleItem.SESSION_TYPE_MISC;
+        mPreConferenceDayAdapter.updateItems(Arrays.asList(item));
+    }
+
+    @Override
+    protected void onPostCreate(Bundle savedInstanceState) {
+        super.onPostCreate(savedInstanceState);
+
+        calculateCurrentDay();
+        if (mViewPager != null) {
+            showDay(mToday);
+        }
+
+        setProgressBarTopWhenActionBarShown((int)
+                TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 2,
+                        getResources().getDisplayMetrics()));
+    }
+
+    private void calculateCurrentDay() {
+        long now = TimeUtils.getCurrentTime(this);
+
+        // If we are before or after the conference, the first day is considered the current day
+        mToday = 0;
+        mConferenceInProgress = false;
+
+        for (int i = 0; i < Config.CONFERENCE_DAYS.length; i++) {
+            if (now >= Config.CONFERENCE_DAYS[i][0] && now <= Config.CONFERENCE_DAYS[i][1]) {
+                mToday = i;
+                mConferenceInProgress = true;
+                break;
+            }
+        }
+    }
+
+    private void showDay(int day) {
+        int preConferenceDays = showPreConferenceData() ? 1 : 0;
+        mViewPager.setCurrentItem(day + preConferenceDays);
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        LOGD(TAG, "onNewIntent, extras " + intent.getExtras());
+        if (intent.hasExtra(EXTRA_DIALOG_MESSAGE)) {
+            mShowedAnnouncementDialog = false;
+            showAnnouncementDialogIfNeeded(intent);
+        }
+    }
+
+    private void setTabLayoutContentDescriptionsForNarrowLayout() {
+        LayoutInflater inflater = getLayoutInflater();
+        int gap = mPreConferenceDayAdapter == null ? 0 : 1;
+        for (int i = 0, count = mTabLayout.getTabCount(); i < count; i++) {
+            TabLayout.Tab tab = mTabLayout.getTabAt(i);
+            TextView view = (TextView) inflater.inflate(R.layout.tab_my_schedule, mTabLayout, false);
+            view.setId(BASE_TAB_VIEW_ID + i);
+            view.setText(tab.getText());
+            if (i == 0) {
+                view.setContentDescription(
+                        getString(R.string.talkback_selected,
+                                getString(R.string.a11y_button, tab.getText())));
+            } else {
+                view.setContentDescription(
+                        getString(R.string.a11y_button, tab.getText()));
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
+                view.announceForAccessibility(
+                        getString(R.string.my_schedule_tab_desc_a11y,
+                                TimeUtils.getDayName(this, i - gap)));
+            }
+            tab.setCustomView(view);
+        }
+    }
+
+    private void hideLoginFailureView() {
+        mButterBar.setVisibility(View.GONE);
+        deregisterHideableHeaderView(mButterBar);
+    }
+
+    @Override
+    public void onAuthFailure(String accountName) {
+        super.onAuthFailure(accountName);
+        UIUtils.setUpButterBar(mButterBar, getString(R.string.login_failed_text),
+                getString(R.string.login_failed_text_retry), new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        hideLoginFailureView();
+                        retryAuth();
+
+                    }
+                }
+        );
+        registerHideableHeaderView(findViewById(R.id.butter_bar));
+    }
+
+    @Override
+    protected void onAccountChangeRequested() {
+        super.onAccountChangeRequested();
+        hideLoginFailureView();
+    }
+
+    @Override
+    public boolean canSwipeRefreshChildScrollUp() {
+        if (mWideMode) {
+            return ViewCompat.canScrollVertically(mScrollViewWide, -1);
+        }
+
+        // Prevent the swipe refresh by returning true here
+        if (mViewPagerScrollState == ViewPager.SCROLL_STATE_DRAGGING) {
+            return true;
+        }
+
+        for (MyScheduleSingleDayFragment fragment : mMyScheduleSingleDayFragments) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.ICE_CREAM_SANDWICH_MR1) {
+                if (!fragment.getUserVisibleHint()) {
+                    continue;
+                }
+            }
+
+            return ViewCompat.canScrollVertically(fragment.getListView(), -1);
+        }
+
+        return false;
+    }
+
+    private void showAnnouncementDialogIfNeeded(Intent intent) {
+        final String title = intent.getStringExtra(EXTRA_DIALOG_TITLE);
+        final String message = intent.getStringExtra(EXTRA_DIALOG_MESSAGE);
+
+        if (!mShowedAnnouncementDialog && !TextUtils.isEmpty(title) && !TextUtils
+                .isEmpty(message)) {
+            LOGD(TAG, "showAnnouncementDialogIfNeeded, title: " + title);
+            LOGD(TAG, "showAnnouncementDialogIfNeeded, message: " + message);
+            final String yes = intent.getStringExtra(EXTRA_DIALOG_YES);
+            LOGD(TAG, "showAnnouncementDialogIfNeeded, yes: " + yes);
+            final String no = intent.getStringExtra(EXTRA_DIALOG_NO);
+            LOGD(TAG, "showAnnouncementDialogIfNeeded, no: " + no);
+            final String url = intent.getStringExtra(EXTRA_DIALOG_URL);
+            LOGD(TAG, "showAnnouncementDialogIfNeeded, url: " + url);
+            final SpannableString spannable = new SpannableString(message == null ? "" : message);
+            Linkify.addLinks(spannable, Linkify.WEB_URLS);
+
+            AlertDialog.Builder builder = new AlertDialog.Builder(this);
+            if (!TextUtils.isEmpty(title)) {
+                builder.setTitle(title);
+            }
+            builder.setMessage(spannable);
+            if (!TextUtils.isEmpty(no)) {
+                builder.setNegativeButton(no, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        dialog.cancel();
+                    }
+                });
+            }
+            if (!TextUtils.isEmpty(yes)) {
+                builder.setPositiveButton(yes, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                        startActivity(intent);
+                    }
+                });
+            }
+            final AlertDialog dialog = builder.create();
+            dialog.show();
+            final TextView messageView = (TextView) dialog.findViewById(android.R.id.message);
+            if (messageView != null) {
+                // makes the embedded links in the text clickable, if there are any
+                messageView.setMovementMethod(LinkMovementMethod.getInstance());
+            }
+            mShowedAnnouncementDialog = true;
+        }
+    }
+
+    private void updateData() {
+        for (int i = 0; i < Config.CONFERENCE_DAYS.length; i++) {
+            mDataHelper.getScheduleDataAsync(mScheduleAdapters[i],
+                    Config.CONFERENCE_DAYS[i][0], Config.CONFERENCE_DAYS[i][1]);
+        }
+    }
+
+    public MyScheduleDayAdapter[] getConferenceData() {
+        return mScheduleAdapters;
+    }
+
+    public MyScheduleDayAdapter getPreConferenceData() {
+        return mPreConferenceDayAdapter;
+    }
+
+    private boolean showPreConferenceData() {
+        return mPreConferenceDayAdapter != null;
+    }
+
+    @Override
+    public void onSingleDayFragmentAttached(MyScheduleSingleDayFragment fragment) {
+        mMyScheduleSingleDayFragments.add(fragment);
+    }
+
+    @Override
+    public void onSingleDayFragmentDetached(MyScheduleSingleDayFragment fragment) {
+        mMyScheduleSingleDayFragments.remove(fragment);
+    }
+
+    @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        super.onCreateOptionsMenu(menu);
+        getMenuInflater().inflate(R.menu.my_schedule, menu);
+        return true;
+    }
+
+    protected void addDataObservers() {
+        getContentResolver().registerContentObserver(
+                ScheduleContract.BASE_CONTENT_URI, true, mObserver);
+
+        SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(this);
+        sp.registerOnSharedPreferenceChangeListener(mPrefChangeListener);
+    }
+
+    public void removeDataObservers() {
+        getContentResolver().unregisterContentObserver(mObserver);
+
+        SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(this);
+        sp.unregisterOnSharedPreferenceChangeListener(mPrefChangeListener);
+    }
+
+    private final SharedPreferences.OnSharedPreferenceChangeListener mPrefChangeListener =
+            new SharedPreferences.OnSharedPreferenceChangeListener() {
+                @Override
+                public void onSharedPreferenceChanged(SharedPreferences sp, String key) {
+                    LOGD(TAG, "sharedpreferences key " + key + " changed, maybe reloading data.");
+                    for (MyScheduleDayAdapter adapter : mScheduleAdapters) {
+                        if (SettingsUtils.PREF_LOCAL_TIMES.equals(key)) {
+                            adapter.forceUpdate();
+                        } else if (SettingsUtils.PREF_ATTENDEE_AT_VENUE.equals(key)) {
+                            updateData();
+                        }
+                    }
+                }
+            };
+
+    private final ContentObserver mObserver = new ThrottledContentObserver(
+            new ThrottledContentObserver.Callbacks() {
+                @Override
+                public void onThrottledContentObserverFired() {
+                    LOGD(TAG, "content may be changed, reloading data");
+                    updateData();
+                }
+            });
+
+    private Runnable mUpdateUIRunnable = new Runnable() {
+        @Override
+        public void run() {
+            MyScheduleActivity activity = MyScheduleActivity.this;
+            if (activity.hasBeenDestroyed()) {
+                LOGD(TAG, "Activity is not valid anymore. Stopping UI Updater");
+                return;
+            }
+
+            LOGD(TAG, "Running MySchedule UI updater (now=" +
+                    new Date(TimeUtils.getCurrentTime(activity)) + ")");
+
+            if (activity.mScheduleAdapters != null
+                    && activity.mScheduleAdapters.length > mToday
+                    && activity.mScheduleAdapters[mToday] != null) {
+                try {
+                    activity.mScheduleAdapters[mToday].forceUpdate();
+                } finally {
+                    if (mConferenceInProgress) {
+                        scheduleNextUIUpdate();
+                    }
+                }
+            }
+        }
+    };
+
+    private Handler mUpdateUIHandler = new Handler();
+
+    private void scheduleNextUIUpdate() {
+        // TODO -test setup
+        // Remove existing UI update runnable, if any
+        mUpdateUIHandler.removeCallbacks(mUpdateUIRunnable);
+
+        // Post runnable with delay
+        mUpdateUIHandler.postDelayed(mUpdateUIRunnable, INTERVAL_TO_REDRAW_UI);
+    }
+
+    private boolean hasBeenDestroyed() {
+        return mDestroyed;
+    }
+
+}

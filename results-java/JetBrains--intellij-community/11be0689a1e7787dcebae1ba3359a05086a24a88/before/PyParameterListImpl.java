@@ -1,0 +1,87 @@
+/*
+ *  Copyright 2005 Pythonid Project
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS"; BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+package com.jetbrains.python.psi.impl;
+
+import com.intellij.lang.ASTNode;
+import com.intellij.psi.PsiElement;
+import com.jetbrains.python.PyElementTypes;
+import com.jetbrains.python.psi.*;
+import com.jetbrains.python.psi.stubs.PyParameterListStub;
+import org.jetbrains.annotations.NotNull;
+
+/**
+ * Created by IntelliJ IDEA.
+ * User: yole
+ * Date: 29.05.2005
+ * Time: 23:03:25
+ * To change this template use File | Settings | File Templates.
+ */
+public class PyParameterListImpl extends PyBaseElementImpl<PyParameterListStub> implements PyParameterList {
+  public PyParameterListImpl(ASTNode astNode) {
+    super(astNode);
+  }
+
+  public PyParameterListImpl(final PyParameterListStub stub) {
+    super(stub, PyElementTypes.PARAMETER_LIST);
+  }
+
+  @Override
+  protected void acceptPyVisitor(PyElementVisitor pyVisitor) {
+    pyVisitor.visitPyParameterList(this);
+  }
+
+  public PyParameter[] getParameters() {
+    return getStubOrPsiChildren(PyElementTypes.FORMAL_PARAMETER, new PyParameter[0]);
+  }
+
+  public void addParameter(final PyParameter param) {
+    PsiElement paren = getLastChild();
+    if (paren != null && ")".equals(paren.getText())) {
+      PyUtil.ensureWritable(this);
+      ASTNode beforeWhat = paren.getNode(); // the closing bracket will be this
+      PyParameter[] params = getParameters();
+      addItemNode(param, beforeWhat, true, params.length == 0);
+    }
+  }
+
+  // TODO: open for general usage by all list-like structurtes
+  private void addItemNode(PyParameter item, ASTNode beforeThis, boolean isFirst, boolean isLast) {
+    PyUtil.ensureWritable(this);
+    ASTNode node = getNode();
+    ASTNode itemNode = item.getNode();
+    if (! isFirst) {
+      node.addChild(getLanguage().getElementGenerator().createComma(getProject()), beforeThis);
+    }
+    node.addChild(itemNode, beforeThis);
+    if (! isLast) {
+      node.addChild(getLanguage().getElementGenerator().createComma(getProject()), beforeThis);
+    }
+  }
+
+  @NotNull
+  public Iterable<PyElement> iterateNames() {
+    return new ArrayIterable<PyElement>(getParameters());
+  }
+
+  public PyElement getElementNamed(final String the_name) {
+    return IterHelper.findName(iterateNames(), the_name);
+  }
+
+  public boolean mustResolveOutside() {
+    return false;  // we don't exactly have children to resolve, but if we did...
+  }
+}

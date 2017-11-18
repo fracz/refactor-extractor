@@ -1,0 +1,20 @@
+commit 6c8f8c9d827a5340f9e6493c14d8c252d1f0d52a
+Author: Andy Wilkinson <awilkinson@pivotal.io>
+Date:   Tue Jun 21 15:03:10 2016 +0100
+
+    Better diagnotics when ESCF subclass breaks with custom management port
+
+    When a custom management.port is used, the child context is configured
+    with an EmbeddedServletContainerFactory bean that has the same class
+    as the parent context’s EmbeddedServletContainerFactory bean. This
+    ensures that the child context uses the same type of embedded container
+    as its parent when there are multiple embedded containers on the
+    classpath. It also causes a failure when the custom
+    EmbeddedServletContainerFactory subclass cannot be instantiated, for
+    example because it’s an anonymous inner-class.
+
+    This commit improves the diagnostics so that we fail fast with an
+    information exception message when we detect that the embedded servlet
+    container factory bean’s class cannot be instantiated.
+
+    Closes gh-6193

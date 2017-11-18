@@ -1,0 +1,17 @@
+commit 6b9b0230c4de394348c42b6f5964fc66eb659dd3
+Author: Sebastien Deleuze <sdeleuze@pivotal.io>
+Date:   Fri Feb 3 11:18:01 2017 +0100
+
+    Introduce JSON streaming support
+
+    This commit introduces JSON streaming support which
+    consists of serializing HTTP request with
+    application/stream+json media type as line delimited JSON.
+
+    It also optimize Flux serialization for application/json by
+    using flux.collectList() and a single Jackson invocation
+    instead of one call per element previous strategy.
+    This change result in a x4 throughput improvement
+    for collection with a lot of small elements.
+
+    Issues: SPR-15095, SPR-15104

@@ -1,0 +1,133 @@
+/**
+ * Copyright (C) 2006 Google Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.inject.internal;
+
+import com.google.common.collect.ImmutableList;
+import com.google.inject.Key;
+import com.google.inject.internal.InjectorImpl.InjectorOptions;
+import com.google.inject.spi.Dependency;
+import com.google.inject.spi.DependencyAndSource;
+
+import java.util.Arrays;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Internal context. Used to coordinate injections and support circular
+ * dependencies.
+ *
+ * @author crazybob@google.com (Bob Lee)
+ */
+final class InternalContext {
+
+  private final InjectorOptions options;
+
+  private final Map<Object, ConstructionContext<?>> constructionContexts =
+      new IdentityHashMap<Object, ConstructionContext<?>>();
+
+  /** Keeps track of the type that is currently being requested for injection. */
+  private Dependency<?> dependency;
+
+  /**
+   * Keeps track of the hierarchy of types needed during injection.
+   *
+   * <p>This is a pairwise combination of dependencies and sources, with dependencies or keys on
+   * even indices, and sources on odd indices. This structure is to avoid the memory overhead of
+   * DependencyAndSource objects, which can add to several tens of megabytes in large applications.
+   */
+  private Object[] dependencyStack = new Object[16];
+  private int dependencyStackSize = 0;
+
+  InternalContext(InjectorOptions options) {
+    this.options = options;
+  }
+
+  InjectorOptions getInjectorOptions() {
+    return options;
+  }
+
+  @SuppressWarnings("unchecked")
+  <T> ConstructionContext<T> getConstructionContext(Object key) {
+    ConstructionContext<T> constructionContext
+        = (ConstructionContext<T>) constructionContexts.get(key);
+    if (constructionContext == null) {
+      constructionContext = new ConstructionContext<T>();
+      constructionContexts.put(key, constructionContext);
+    }
+    return constructionContext;
+  }
+
+  Dependency<?> getDependency() {
+    return dependency;
+  }
+
+  /** Sets the new current dependency & adds it to the state. */
+  Dependency<?> pushDependency(Dependency<?> dependency, Object source) {
+    Dependency<?> previous = this.dependency;
+    this.dependency = dependency;
+    doPushState(dependency, source);
+    return previous;
+  }
+
+  /** Pops the current state & sets the new dependency. */
+  void popStateAndSetDependency(Dependency<?> newDependency) {
+    popState();
+    this.dependency = newDependency;
+  }
+
+  /** Adds to the state without setting the dependency. */
+  void pushState(Key<?> key, Object source) {
+    doPushState(key, source);
+  }
+
+  private void doPushState(Object dependencyOrKey, Object source) {
+    int localSize = dependencyStackSize;
+    Object[] localStack = dependencyStack;
+    if (localStack.length < localSize + 2) {
+      localStack = dependencyStack = Arrays.copyOf(localStack, (localStack.length * 3) / 2 + 2);
+    }
+    localStack[localSize++] = dependencyOrKey;
+    localStack[localSize++] = source;
+    dependencyStackSize = localSize;
+  }
+
+  /** Pops from the state without setting a dependency. */
+  void popState() {
+    Object[] localElements = dependencyStack;
+    int localSize = dependencyStackSize;
+    localElements[--localSize] = null;
+    localElements[--localSize] = null;
+    dependencyStackSize = localSize;
+  }
+
+  /** Returns the current dependency chain (all the state stored in the dependencyStack). */
+  List<DependencyAndSource> getDependencyChain() {
+    ImmutableList.Builder<DependencyAndSource> builder = ImmutableList.builder();
+    for (int i = 0; i < dependencyStackSize; i += 2) {
+      Object evenEntry = dependencyStack[i];
+      Dependency<?> dependency;
+      if (evenEntry instanceof Key) {
+        dependency = Dependency.get((Key<?>) evenEntry);
+      } else {
+        dependency = (Dependency<?>) evenEntry;
+      }
+      builder.add(new DependencyAndSource(dependency, dependencyStack[i + 1]));
+    }
+    return builder.build();
+  }
+}

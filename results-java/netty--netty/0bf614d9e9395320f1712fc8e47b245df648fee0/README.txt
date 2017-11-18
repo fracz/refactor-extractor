@@ -1,0 +1,16 @@
+commit 0bf614d9e9395320f1712fc8e47b245df648fee0
+Author: Scott Mitchell <scott_mitchell@apple.com>
+Date:   Thu Aug 10 16:20:41 2017 -0700
+
+    SocketGatheringWriteTest improvements
+
+    Motivation:
+    SocketGatherWriteTest has been observed to fail and it has numerous issues which when resolved may help reduce the test failures.
+
+    Modifications:
+    - A volatile counter and a spin/sleep loop is used to trigger test termination. Incrementing a volatile is generally bad practice and can be avoided in this situation. This mechanism can be replaced by a promise. This mechanism should also trigger upon exception or channel inactive.
+    - The TestHandler maintains an internal buffer, but it is not released. We now only create a buffer on the server side and release it after comparing the expected results.
+    - The composite buffer creation logic can be simplified, also the existing composite buffer doesn't take into account the buffer's reader index when building buf2.
+
+    Result:
+    Cleaner test.

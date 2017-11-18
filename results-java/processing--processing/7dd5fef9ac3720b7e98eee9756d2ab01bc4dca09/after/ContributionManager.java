@@ -1,0 +1,967 @@
+/* -*- mode: java; c-basic-offset: 2; indent-tabs-mode: nil -*- */
+
+/*
+ Part of the Processing project - http://processing.org
+
+ Copyright (c) 2004-11 Ben Fry and Casey Reas
+ Copyright (c) 2001-04 Massachusetts Institute of Technology
+
+ This program is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation; either version 2 of the License, or
+ (at your option) any later version.
+
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+
+ You should have received a copy of the GNU General Public License
+ along with this program; if not, write to the Free Software Foundation,
+ Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+
+package processing.app;
+
+import java.awt.*;
+import java.awt.event.*;
+import java.awt.image.CropImageFilter;
+import java.awt.image.FilteredImageSource;
+import java.io.*;
+import java.net.*;
+import java.text.*;
+import java.util.*;
+import java.util.List;
+import java.util.zip.*;
+
+import javax.imageio.ImageIO;
+import javax.swing.*;
+import javax.swing.event.*;
+
+import processing.app.contribution.*;
+
+public class ContributionManager {
+
+  private static final String DRAG_AND_DROP_SECONDARY =
+      ".plb files usually contain contributed libraries for <br>" +
+      "Processing. Click “Yes” to install this library to your<br>" +
+      "sketchbook. If you wish to add this file to your<br>" +
+      "sketch instead, click “No” and use <i>Sketch &gt;<br>Add File...</i>";
+
+  private static final String DISCOVERY_ERROR_TITLE = "Trouble discovering libraries";
+
+  private static final String DISCOVERY_INTERNAL_ERROR_MESSAGE =
+        "An internal error occured while searching for libraries in the file.\n"
+      + "This may be a one time error, so try again.";
+
+  private static final String DISCOVERY_NONE_FOUND_ERROR_MESSAGE =
+      "Maybe it's just us, but it looks like there are no\n"
+    + "libraries in the file we just downloaded.\n";
+
+  static final String ANY_CATEGORY = "Any";
+
+  JFrame dialog;
+
+  JProgressBar installProgressBar;
+
+  FilterField filterField;
+
+  ContributionListPanel contributionListPanel;
+
+  JComboBox categoryChooser;
+
+  Image[] contributionIcons;
+
+  // the calling editor, so updates can be applied
+  Editor editor;
+
+  String category;
+
+  ContributionListing contribListing;
+
+  /**
+   * Initializes the contribution listing and fetches the advertised
+   * contributions in a separate thread. This does not initialize any AWT
+   * components except for a single JProgressBar which is needed in case
+   * showFrame is called in the middle of downloading.
+   */
+  public ContributionManager() {
+    contribListing = new ContributionListing();
+
+    contributionListPanel = new ContributionListPanel(this);
+    contribListing.addContributionListener(contributionListPanel);
+
+    JProgressBar progressBar = contributionListPanel.getSetupProgressBar();
+    contribListing.getAdvertisedContributions(new JProgressMonitor(progressBar) {
+
+      @Override
+      public void finishedAction() {
+        synchronized (contribListing) {
+          updateContributionListing();
+          updateCategoryChooser();
+
+          progressBar.setVisible(false);
+        }
+      }
+    });
+  }
+
+  /** Width of each contribution icon. */
+  static final int ICON_WIDTH = 25;
+  /** Height of each contribution icon. */
+  static final int ICON_HEIGHT = 20;
+
+  protected void showFrame(Editor editor) {
+    this.editor = editor;
+
+    updateContributionListing();
+
+    if (dialog == null) {
+      dialog = new JFrame("Contribution Manager");
+
+      Base.setIcon(dialog);
+
+      createComponents();
+
+      registerDisposeListeners();
+
+      dialog.pack();
+      Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
+      dialog.setLocation((screen.width - dialog.getWidth()) / 2,
+                         (screen.height - dialog.getHeight()) / 2);
+
+      contributionListPanel.grabFocus();
+    }
+
+    dialog.setVisible(true);
+
+    if (contributionIcons == null) {
+      try {
+        Image allButtons = ImageIO.read(Base.getLibStream("contributions.gif"));
+        int count = allButtons.getHeight(dialog) / ICON_HEIGHT;
+        contributionIcons = new Image[count];
+        contributionIcons[0]  = allButtons;
+        contributionIcons[1]  = allButtons;
+        contributionIcons[2]  = allButtons;
+        contributionIcons[3]  = allButtons;
+
+        for (int i = 0; i < count; i++) {
+          Image image = dialog.createImage(new FilteredImageSource(allButtons.
+                                                                   getSource(),
+                                           new CropImageFilter(0, i * ICON_HEIGHT,
+                                                               ICON_WIDTH,
+                                                               ICON_HEIGHT)));
+          contributionIcons[i] = image;
+        }
+
+        contributionListPanel.updateColors();
+      } catch (IOException e) {
+        // TODO Auto-generated catch block
+        e.printStackTrace();
+      }
+    }
+  }
+
+  public Image getContributionIcon(Contribution.Type type) {
+
+    if (contributionIcons == null)
+      return null;
+
+    switch (type) {
+    case LIBRARY:
+      return contributionIcons[0];
+    case TOOL:
+      return contributionIcons[1];
+    case MODE:
+      return contributionIcons[2];
+    case LIBRARY_COMPILATION:
+      return contributionIcons[3];
+    }
+    return null;
+  }
+
+  /**
+   * Close the window after an OK or Cancel.
+   */
+  protected void disposeFrame() {
+    dialog.dispose();
+    editor = null;
+  }
+
+  private void createComponents() {
+    dialog.setResizable(true);
+
+    Container pane = dialog.getContentPane();
+    pane.setLayout(new GridBagLayout());
+
+    GridBagConstraints c = new GridBagConstraints();
+    c.gridx = 0;
+    c.gridy = 0;
+    c.gridwidth = 2;
+    c.weightx = 1;
+    c.fill = GridBagConstraints.HORIZONTAL;
+    filterField = new FilterField();
+
+    pane.add(filterField, c);
+
+    c = new GridBagConstraints();
+    c.fill = GridBagConstraints.BOTH;
+    c.gridx = 0;
+    c.gridy = 1;
+    c.gridwidth = 2;
+    c.weighty = 1;
+    c.weightx = 1;
+
+    final JScrollPane scrollPane = new JScrollPane();
+    scrollPane.setPreferredSize(new Dimension(300,300));
+    scrollPane.setViewportView(contributionListPanel);
+    scrollPane.getViewport().setOpaque(true);
+
+    scrollPane.getViewport().setBackground(contributionListPanel.getBackground());
+
+    scrollPane.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_ALWAYS);
+    pane.add(scrollPane, c);
+    //pane.add(scrollPane, c);
+    scrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+
+    c = new GridBagConstraints();
+    c.gridx = 0;
+    c.gridy = 2;
+    pane.add(new Label("Category:"), c);
+
+    c = new GridBagConstraints();
+    c.fill = GridBagConstraints.HORIZONTAL;
+    c.gridx = 1;
+    c.gridy = 2;
+
+    categoryChooser = new JComboBox();
+    updateCategoryChooser();
+    pane.add(categoryChooser, c);
+    categoryChooser.addItemListener(new ItemListener() {
+
+      public void itemStateChanged(ItemEvent e) {
+        category = (String) categoryChooser.getSelectedItem();
+        if (ANY_CATEGORY.equals(category)) {
+          category = null;
+        }
+
+        filterLibraries(category, filterField.filters);
+      }
+    });
+
+    dialog.setMinimumSize(new Dimension(550, 400));
+  }
+
+  private void updateCategoryChooser() {
+    if (categoryChooser == null)
+      return;
+
+    ArrayList<String> categories;
+    categoryChooser.removeAllItems();
+    categories = new ArrayList<String>(contribListing.getCategories());
+    Collections.sort(categories);
+    categories.add(0, ANY_CATEGORY);
+    for (String s : categories) {
+      categoryChooser.addItem(s);
+    }
+  }
+
+  private void registerDisposeListeners() {
+    dialog.addWindowListener(new WindowAdapter() {
+      public void windowClosing(WindowEvent e) {
+        disposeFrame();
+      }
+    });
+    ActionListener disposer = new ActionListener() {
+      public void actionPerformed(ActionEvent actionEvent) {
+        disposeFrame();
+      }
+    };
+    Base.registerWindowCloseKeys(dialog.getRootPane(), disposer);
+
+    // handle window closing commands for ctrl/cmd-W or hitting ESC.
+
+    dialog.getContentPane().addKeyListener(new KeyAdapter() {
+      public void keyPressed(KeyEvent e) {
+        //System.out.println(e);
+        KeyStroke wc = Base.WINDOW_CLOSE_KEYSTROKE;
+        if ((e.getKeyCode() == KeyEvent.VK_ESCAPE) ||
+            (KeyStroke.getKeyStrokeForEvent(e).equals(wc))) {
+          disposeFrame();
+        }
+      }
+    });
+  }
+
+  public void filterLibraries(String category, List<String> filters) {
+
+    List<Contribution> filteredLibraries = contribListing
+        .getFilteredLibraryList(category, filters);
+
+    contributionListPanel.filterLibraries(filteredLibraries);
+  }
+
+  protected void updateContributionListing() {
+    if (editor == null)
+      return;
+
+    ArrayList<Library> libraries = editor.getMode().contribLibraries;
+    ArrayList<LibraryCompilation> compilations = LibraryCompilation.list(libraries);
+
+    // Remove libraries from the list that are part of a compilations
+    for (LibraryCompilation compilation : compilations) {
+      Iterator<Library> it = libraries.iterator();
+      while (it.hasNext()) {
+        Library current = it.next();
+        if (compilation.getFolder().equals(current.getFolder().getParentFile())) {
+          it.remove();
+        }
+      }
+    }
+
+    ArrayList<Contribution> contributions = new ArrayList<Contribution>();
+    contributions.addAll(editor.contribTools);
+    contributions.addAll(libraries);
+    contributions.addAll(compilations);
+
+    contribListing.updateInstalledList(contributions);
+  }
+
+  /**
+   * Non-blocking call to remove a contribution in a new thread.
+   */
+  public void removeContribution(final InstalledContribution contribution,
+                                 final JProgressMonitor pm) {
+
+    new Thread(new Runnable() {
+
+      public void run() {
+        pm.startTask("Removing", ProgressMonitor.UNKNOWN);
+        if (contribution != null) {
+          if (backupContribution(contribution)) {
+            Contribution advertisedVersion = contribListing
+                .getAdvertisedContribution(contribution);
+
+            if (advertisedVersion == null) {
+              contribListing.removeContribution(contribution);
+            } else {
+              contribListing.replaceContribution(contribution, advertisedVersion);
+            }
+          }
+        }
+        refreshInstalled();
+        pm.finished();
+      }
+    }).start();
+
+  }
+
+  /**
+   * Non-blocking call to download and install a contribution in a new thread.
+   */
+  public void downloadAndInstall(URL url,
+                                 final Contribution info,
+                                 final JProgressMonitor downloadProgressMonitor,
+                                 final JProgressMonitor installProgressMonitor) {
+
+    File libDest = getTemporaryFile(url);
+
+    final FileDownloader downloader = new FileDownloader(url, libDest,
+                                                         downloadProgressMonitor);
+
+    downloader.setPostOperation(new Runnable() {
+
+      public void run() {
+
+        File contributionFile = downloader.getFile();
+
+        if (contributionFile != null) {
+          installProgressMonitor.startTask("Installing",
+                                           ProgressMonitor.UNKNOWN);
+
+          InstalledContribution contribution = null;
+          switch (info.getType()) {
+          case LIBRARY:
+            contribution = installLibrary(contributionFile, false);
+            break;
+          case LIBRARY_COMPILATION:
+            contribution = installLibraryCompilation(contributionFile);
+            break;
+          case TOOL:
+            contribution = installTool(contributionFile);
+            break;
+          }
+
+          if (contribution != null) {
+            // XXX contributionListing.getInformationFromAdvertised(contribution); get the category at least
+            contribListing.replaceContribution(info, contribution);
+            refreshInstalled();
+          }
+
+        }
+
+        dialog.pack();
+
+        installProgressMonitor.finished();
+      }
+    });
+
+    new Thread(downloader).start();
+  }
+
+  protected LibraryCompilation installLibraryCompilation(File f) {
+    File parentDir = unzipFileToTemp(f);
+
+    LibraryCompilation compilation = LibraryCompilation.create(parentDir);
+
+    if (compilation == null) {
+      Base.showWarning(DISCOVERY_ERROR_TITLE,
+                       DISCOVERY_NONE_FOUND_ERROR_MESSAGE, null);
+      return null;
+    }
+
+    String folderName = compilation.getName();
+
+    File libraryDestination = editor.getBase().getSketchbookLibrariesFolder();
+    File dest = new File(libraryDestination, folderName);
+
+    // XXX: Check for conflicts with other library names, etc.
+    boolean errorEncountered = false;
+    if (dest.exists()) {
+      if (!dest.delete()) {
+        // Problem
+        errorEncountered = true;
+      }
+    }
+
+    if (!errorEncountered) {
+      // Install it, return it
+      if (parentDir.renameTo(dest)) {
+        return LibraryCompilation.create(dest);
+      }
+    }
+
+    return null;
+  }
+
+  public Library confirmAndInstallLibrary(Editor editor, File libFile) {
+    this.editor = editor;
+
+    int result = Base.showYesNoQuestion(this.editor, "Install",
+                             "Install libraries from " + libFile.getName() + "?",
+                             DRAG_AND_DROP_SECONDARY);
+
+    if (result == JOptionPane.YES_OPTION) {
+      return installLibrary(libFile, true);
+    }
+
+    return null;
+  }
+
+  /**
+   * Creates a temporary folder and unzips a file to a subdirectory of the temp
+   * folder. The subdirectory is the only file of the tempo folder.
+   *
+   * e.g. if the contents of foo.zip are /hello and /world, then the resulting
+   * files will be
+   *     /tmp/foo9432423uncompressed/foo/hello
+   *     /tmp/foo9432423uncompress/foo/world
+   * ...and "/tmp/id9432423uncompress/foo/" will be returned.
+   *
+   * @return the folder where the zips contents have been unzipped to (the
+   *         subdirectory of the temp folder).
+   */
+  private static File unzipFileToTemp(File libFile) {
+
+    String fileName = getFileName(libFile);
+    File tmpFolder = null;
+
+    try {
+      tmpFolder = Base.createTempFolder(fileName, "uncompressed");
+      tmpFolder = new File(tmpFolder, fileName);
+      tmpFolder.mkdirs();
+    } catch (IOException e) {
+      Base.showWarning("Trouble creating temporary folder",
+           "Could not create a place to store libary's uncompressed contents,\n" +
+           "so it won't be installed.", e);
+    }
+
+    unzip(libFile, tmpFolder);
+
+    return tmpFolder;
+  }
+
+  protected File getTemporaryFile(URL url) {
+    try {
+      File tmpFolder = Base.createTempFolder("library", "download");
+
+      String[] segments = url.getFile().split("/");
+      File libFile = new File(tmpFolder, segments[segments.length - 1]);
+      libFile.setWritable(true);
+
+      return libFile;
+    } catch (IOException e) {
+      Base.showWarning("Trouble creating temporary folder",
+                       "Could not create a place to store libraries being downloaded.\n", e);
+    }
+
+    return null;
+  }
+
+  /**
+   * Returns the name of a file without its path or extension.
+   *
+   * For example,
+   *   "/path/to/helpfullib.zip" returns "helpfullib"
+   *   "helpfullib-0.1.1.plb" returns "helpfullib-0.1.1"
+   */
+  protected static String getFileName(File libFile) {
+    String path = libFile.getPath();
+    int lastSeparator = path.lastIndexOf(File.separatorChar);
+
+    String fileName;
+    if (lastSeparator != -1) {
+      fileName = path.substring(lastSeparator + 1);
+    } else {
+      fileName = path;
+    }
+
+    int lastDot = fileName.lastIndexOf('.');
+    if (lastDot != -1) {
+      return fileName.substring(0, lastDot);
+    }
+
+    return fileName;
+  }
+
+  protected ToolContribution installTool(File zippedToolFile) {
+    File tempDir = unzipFileToTemp(zippedToolFile);
+
+    ArrayList<ToolContribution> discoveredTools = ToolContribution.list(tempDir);
+    if (discoveredTools.isEmpty()) {
+      // Sometimes tool authors place all their folders in the base
+      // directory of a zip file instead of in single folder as the
+      // guidelines suggest. If this is the case, we might be able to find the
+      // library by stepping up a directory and searching for libraries again.
+      discoveredTools = ToolContribution.list(tempDir.getParentFile());
+    }
+
+    if (discoveredTools != null && discoveredTools.size() == 1) {
+      ToolContribution discoveredTool = discoveredTools.get(0);
+      return installTool(discoveredTool);
+    } else {
+      // Diagnose the problem and notify the user
+      if (discoveredTools == null || discoveredTools.isEmpty()) {
+        Base.showWarning(DISCOVERY_ERROR_TITLE,
+                         DISCOVERY_INTERNAL_ERROR_MESSAGE, null);
+      } else {
+        Base.showWarning("Too many tools",
+                         "We found more than one tool in the file we just\n"
+                       + "downloaded. That shouldn't happen, so we're going\n"
+                       + "to ignore this file.", null);
+      }
+    }
+
+    return null;
+  }
+
+  protected ToolContribution installTool(ToolContribution newTool) {
+
+    ArrayList<ToolContribution> oldTools = editor.contribTools;
+
+    String toolFolderName = newTool.getFolder().getName();
+
+    File toolDestination = editor.getBase().getSketchbookToolsFolder();
+    File newToolDest = new File(toolDestination, toolFolderName);
+
+    for (ToolContribution oldTool : oldTools) {
+
+      // XXX: Handle other cases when installing libraries.
+      //   -What if a library by the same name is already installed?
+      //   -What if newLibDest exists, but isn't used by an existing library?
+      if (oldTool.getFolder().exists() && oldTool.getFolder().equals(newToolDest)) {
+
+        if (!backupContribution(oldTool)) {
+          return null;
+        }
+      }
+    }
+
+    // Move newLib to the sketchbook library folder
+    if (newTool.getFolder().renameTo(newToolDest)) {
+      return ToolContribution.getTool(newToolDest);
+    } else {
+      Base.showWarning("Trouble moving new tool to the sketchbook",
+                       "Could not move tool \"" + newTool.getName() + "\" to "
+                           + newToolDest.getAbsolutePath() + ".\n", null);
+    }
+
+    return null;
+  }
+
+  protected Library installLibrary(File libFile, boolean confirmReplace) {
+    File tempDir = unzipFileToTemp(libFile);
+
+    try {
+      ArrayList<Library> discoveredLibs = Library.list(tempDir);
+      if (discoveredLibs.isEmpty()) {
+        // Sometimes library authors place all their folders in the base
+        // directory of a zip file instead of in single folder as the
+        // guidelines suggest. If this is the case, we might be able to find the
+        // library by stepping up a directory and searching for libraries again.
+        discoveredLibs = Library.list(tempDir.getParentFile());
+      }
+
+      if (discoveredLibs != null && discoveredLibs.size() == 1) {
+        Library discoveredLib = discoveredLibs.get(0);
+        return installLibrary(discoveredLib, confirmReplace);
+      } else {
+        // Diagnose the problem and notify the user
+        if (discoveredLibs == null) {
+          Base.showWarning(DISCOVERY_ERROR_TITLE,
+                           DISCOVERY_INTERNAL_ERROR_MESSAGE, null);
+        } else if (discoveredLibs.isEmpty()) {
+          Base.showWarning(DISCOVERY_ERROR_TITLE,
+                           DISCOVERY_NONE_FOUND_ERROR_MESSAGE, null);
+        } else {
+          Base.showWarning("Too many libraries",
+                           "We found more than one library in the library file\n"
+                         + "we just downloaded. That shouldn't happen, so we're\n"
+                         + "going to ignore this file.", null);
+        }
+      }
+    } catch (IOException ioe) {
+      Base.showWarning(DISCOVERY_ERROR_TITLE, DISCOVERY_INTERNAL_ERROR_MESSAGE,
+                       ioe);
+    }
+
+    return null;
+  }
+
+  /**
+   * @param confirmReplace
+   *          if true and the library is already installed, opens a prompt to
+   *          ask the user if it's okay to replace the library. If false, the
+   *          library is always replaced with the new copy.
+   */
+  protected Library installLibrary(Library newLib, boolean confirmReplace) {
+
+    ArrayList<Library> oldLibs = editor.getMode().contribLibraries;
+
+    String libFolderName = newLib.getFolder().getName();
+
+    File libraryDestination = editor.getBase().getSketchbookLibrariesFolder();
+    File newLibDest = new File(libraryDestination, libFolderName);
+
+    boolean doInstall = true;
+
+    for (Library oldLib : oldLibs) {
+
+      // XXX: Handle other cases when installing libraries.
+      //   -What if a library by the same name is already installed?
+      //   -What if newLibDest exists, but isn't used by an existing library?
+      if (oldLib.getFolder().exists() && oldLib.getFolder().equals(newLibDest)) {
+
+        int result = 0;
+        if (confirmReplace) {
+          result = Base.showYesNoQuestion(editor, "Replace",
+                 "Replace existing \"" + oldLib.getName() + "\" library?",
+                 "An existing copy of the \"" + oldLib.getName() + "\" library<br>"+
+                 "has been found in your sketchbook. Clicking “Yes”<br>"+
+                 "will move the existing library to a backup folder<br>" +
+                 " in <i>libraries/old</i> before replacing it.");
+        }
+        if (!confirmReplace || result == JOptionPane.YES_OPTION) {
+          if (!backupContribution(oldLib)) {
+            return null;
+          }
+        } else {
+          doInstall = false;
+        }
+      }
+    }
+
+    if (doInstall) {
+      // Move newLib to the sketchbook library folder
+      if (newLib.getFolder().renameTo(newLibDest)) {
+        return new Library(newLibDest, null);
+//      try {
+//        FileUtils.copyDirectory(newLib.folder, libFolder);
+//        FileUtils.deleteQuietly(newLib.folder);
+//        newLib.folder = libFolder;
+//      } catch (IOException e) {
+      } else {
+        Base.showWarning("Trouble moving new library to the sketchbook",
+                         "Could not move library \"" + newLib.getName() + "\" to "
+                             + newLibDest.getAbsolutePath() + ".\n", null);
+      }
+    }
+
+    return null;
+  }
+
+  public void refreshInstalled() {
+    editor.getMode().rebuildImportMenu();
+    editor.rebuildToolMenu();
+  }
+
+  /**
+   * Moves the given contribution to a backup folder.
+   */
+  private boolean backupContribution(InstalledContribution contribution) {
+
+    File backupFolder = null;
+
+    switch (contribution.getType()) {
+    case LIBRARY:
+    case LIBRARY_COMPILATION:
+      backupFolder = createLibraryBackupFolder();
+      break;
+    case MODE:
+    case TOOL:
+      backupFolder = createToolBackupFolder();
+      break;
+    }
+
+    if (backupFolder == null) return false;
+
+    String libFolderName = contribution.getFolder().getName();
+
+    String prefix = new SimpleDateFormat("yyyy-MM-dd").format(new Date());
+    final String backupName = prefix + "_" + libFolderName;
+    File backupFolderForLib = getUniqueName(backupFolder, backupName);
+
+//    try {
+//      FileUtils.moveDirectory(lib.folder, backupFolderForLib);
+//      return true;
+    if (contribution.getFolder().renameTo(backupFolderForLib)) {
+      return true;
+    } else {
+//    } catch (IOException e) {
+      Base.showWarning("Trouble creating backup of old \"" + contribution.getName() + "\" library",
+                       "Could not move library to backup folder:\n"
+                           + backupFolderForLib.getAbsolutePath(), null);
+      return false;
+    }
+  }
+
+  private File createLibraryBackupFolder() {
+
+    File libraryBackupFolder = new File(editor.getBase()
+        .getSketchbookLibrariesFolder(), "old");
+
+    if (!libraryBackupFolder.exists() || !libraryBackupFolder.isDirectory()) {
+      if (!libraryBackupFolder.mkdirs()) {
+        Base.showWarning("Trouble creating folder to store old libraries in",
+                         "Could not create folder "
+                             + libraryBackupFolder.getAbsolutePath()
+                             + ".\n"
+                             + "That's gonna prevent us from replacing the library.",
+                         null);
+        return null;
+      }
+    }
+
+    return libraryBackupFolder;
+  }
+
+  private File createToolBackupFolder() {
+
+    File toolsBackupFolder = new File(editor.getBase()
+        .getSketchbookToolsFolder(), "old");
+
+    if (!toolsBackupFolder.exists() || !toolsBackupFolder.isDirectory()) {
+      if (!toolsBackupFolder.mkdirs()) {
+        Base.showWarning("Trouble creating folder to store old libraries in",
+                         "Could not create folder "
+                             + toolsBackupFolder.getAbsolutePath()
+                             + ".\n"
+                             + "That's gonna prevent us from replacing the library.",
+                         null);
+        return null;
+      }
+    }
+
+    return toolsBackupFolder;
+  }
+
+  /**
+   * Returns a file in the parent folder that does not exist yet. If
+   * parent/fileName already exists, this will look for parent/fileName(2)
+   * then parent/fileName(3) and so forth.
+   *
+   * @return a file that does not exist yet
+   */
+  public static File getUniqueName(File parentFolder, String fileName) {
+    File backupFolderForLib;
+    int i = 1;
+    do {
+      String folderName = fileName;
+      if (i >= 2) {
+        folderName += "(" + i + ")";
+      }
+      i++;
+
+      backupFolderForLib = new File(parentFolder, folderName);
+    } while (backupFolderForLib.exists());
+
+    return backupFolderForLib;
+  }
+
+  public static void unzip(File zipFile, File dest) {
+    try {
+      FileInputStream fis = new FileInputStream(zipFile);
+      CheckedInputStream checksum = new CheckedInputStream(fis, new Adler32());
+      ZipInputStream zis = new ZipInputStream(new BufferedInputStream(checksum));
+      ZipEntry next = null;
+      while ((next = zis.getNextEntry()) != null) {
+        File currentFile = new File(dest, next.getName());
+        if (next.isDirectory()) {
+          currentFile.mkdirs();
+        } else {
+          currentFile.createNewFile();
+          unzipEntry(zis, currentFile);
+        }
+      }
+    } catch (Exception e) {
+      e.printStackTrace();
+    }
+  }
+
+  private static void unzipEntry(ZipInputStream zin, File f) throws IOException {
+    FileOutputStream out = new FileOutputStream(f);
+    byte[] b = new byte[512];
+    int len = 0;
+    while ((len = zin.read(b)) != -1) {
+      out.write(b, 0, len);
+    }
+    out.close();
+  }
+
+  public void setFilterText(String filter) {
+    if (filter == null || filter.isEmpty()) {
+      filterField.setText("");
+      filterField.isShowingHint = true;
+    } else {
+      filterField.setText(filter);
+      filterField.isShowingHint = false;
+    }
+    filterField.applyFilter();
+
+  }
+
+  class FilterField extends JTextField {
+
+    final static String filterHint = "Filter your search...";
+
+    boolean isShowingHint;
+
+    List<String> filters;
+
+    public FilterField () {
+      super(filterHint);
+
+      isShowingHint = true;
+
+      filters = new ArrayList<String>();
+
+      addFocusListener(new FocusListener() {
+
+        public void focusLost(FocusEvent focusEvent) {
+          if (filterField.getText().isEmpty()) {
+            isShowingHint = true;
+          }
+
+          updateStyle();
+        }
+
+        public void focusGained(FocusEvent focusEvent) {
+          if (isShowingHint) {
+            isShowingHint = false;
+            filterField.setText("");
+          }
+
+          updateStyle();
+        }
+      });
+
+      getDocument().addDocumentListener(new DocumentListener() {
+
+        public void removeUpdate(DocumentEvent e) {
+          applyFilter();
+        }
+
+        public void insertUpdate(DocumentEvent e) {
+          applyFilter();
+        }
+
+        public void changedUpdate(DocumentEvent e) {
+          applyFilter();
+        }
+      });
+    }
+
+    public void applyFilter() {
+      String filter = filterField.getFilterText();
+      filter = filter.toLowerCase();
+
+      // Replace anything but 0-9, a-z, or : with a space
+      filter = filter.replaceAll("[^\\x30-\\x39^\\x61-\\x7a^\\x3a]", " ");
+      filters = Arrays.asList(filter.split(" "));
+      filterLibraries(category, filters);
+    }
+
+    public String getFilterText() {
+      return isShowingHint ? "" : getText();
+    }
+
+    public void updateStyle() {
+      if (isShowingHint) {
+        filterField.setText(filterHint);
+
+        // setForeground(UIManager.getColor("TextField.light")); // too light
+        setForeground(Color.gray);
+      } else {
+        setForeground(UIManager.getColor("TextField.foreground"));
+      }
+    }
+  }
+
+  public boolean hasAlreadyBeenOpened() {
+    return dialog != null;
+  }
+
+  public ContributionListing getListing() {
+    return contribListing;
+  }
+
+}
+
+abstract class JProgressMonitor extends AbstractProgressMonitor {
+  JProgressBar progressBar;
+
+  public JProgressMonitor(JProgressBar progressBar) {
+    this.progressBar = progressBar;
+  }
+
+  public void startTask(String name, int maxValue) {
+    isFinished = false;
+    progressBar.setString(name);
+    progressBar.setIndeterminate(maxValue == UNKNOWN);
+    progressBar.setMaximum(maxValue);
+  }
+
+  public void setProgress(int value) {
+    super.setProgress(value);
+    progressBar.setValue(value);
+  }
+
+  @Override
+  public void finished() {
+    super.finished();
+    finishedAction();
+  }
+
+  public abstract void finishedAction();
+
+}

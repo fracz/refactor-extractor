@@ -1,0 +1,78 @@
+/*
+ * Copyright (C) 2017 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.android.server.autofill;
+
+import android.annotation.Nullable;
+import android.os.Bundle;
+import android.service.autofill.Dataset;
+import android.view.autofill.AutofillId;
+import android.view.autofill.AutofillValue;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Objects;
+import java.util.Set;
+
+final class Helper {
+
+    static final boolean DEBUG = true; // TODO(b/33197203): set to false when stable
+    static final boolean VERBOSE = false;
+
+    static void append(StringBuilder builder, Bundle bundle) {
+        if (bundle == null || !DEBUG) {
+            builder.append("null");
+            return;
+        }
+        final Set<String> keySet = bundle.keySet();
+        builder.append("[Bundle with ").append(keySet.size()).append(" extras:");
+        for (String key : keySet) {
+            final Object value = bundle.get(key);
+            builder.append(' ').append(key).append('=');
+            builder.append((value instanceof Object[])
+                    ? Arrays.toString((Objects[]) value) : value);
+        }
+        builder.append(']');
+    }
+
+    static String bundleToString(Bundle bundle) {
+        final StringBuilder builder = new StringBuilder();
+        append(builder, bundle);
+        return builder.toString();
+    }
+
+    /**
+     * Gets the value of a {@link Dataset} field by its id, or {@code null} if not found.
+     */
+    @Nullable
+    static AutofillValue findValue(Dataset dataset, AutofillId id) {
+        if (dataset != null) {
+            final ArrayList<AutofillId> ids = dataset.getFieldIds();
+            final int size = ids.size();
+            for (int i = 0; i < size; i++) {
+                if (id.equals(ids.get(i))) {
+                    return dataset.getFieldValues().get(i);
+                }
+
+            }
+        }
+        return null;
+    }
+
+    private Helper() {
+        throw new UnsupportedOperationException("contains static members only");
+    }
+}

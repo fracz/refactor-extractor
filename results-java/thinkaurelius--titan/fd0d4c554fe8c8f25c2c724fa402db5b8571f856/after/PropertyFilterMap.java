@@ -1,0 +1,84 @@
+package com.thinkaurelius.faunus.mapreduce.filter;
+
+import com.thinkaurelius.faunus.FaunusEdge;
+import com.thinkaurelius.faunus.FaunusVertex;
+import com.thinkaurelius.faunus.Tokens;
+import com.thinkaurelius.faunus.mapreduce.ElementChecker;
+import com.tinkerpop.blueprints.Direction;
+import com.tinkerpop.blueprints.Edge;
+import com.tinkerpop.blueprints.Element;
+import com.tinkerpop.blueprints.Query;
+import com.tinkerpop.blueprints.Vertex;
+import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.mapreduce.Mapper;
+
+import java.io.IOException;
+
+/**
+ * @author Marko A. Rodriguez (http://markorodriguez.com)
+ */
+public class PropertyFilterMap {
+
+    public static final String CLASS = Tokens.makeNamespace(PropertyFilterMap.class) + ".class";
+    public static final String KEY = Tokens.makeNamespace(PropertyFilterMap.class) + ".key";
+    public static final String VALUES = Tokens.makeNamespace(PropertyFilterMap.class) + ".values";
+    public static final String VALUE_CLASS = Tokens.makeNamespace(PropertyFilterMap.class) + ".valueClass";
+    public static final String COMPARE = Tokens.makeNamespace(PropertyFilterMap.class) + ".compare";
+    public static final String NULL_WILDCARD = Tokens.makeNamespace(PropertyFilterMap.class) + ".nullWildcard";
+
+    public enum Counters {
+        EDGES_KEPT,
+        EDGES_DROPPED
+    }
+
+    public static class Map extends Mapper<NullWritable, FaunusVertex, NullWritable, FaunusVertex> {
+
+        private boolean isVertex;
+        private ElementChecker elementChecker;
+
+        @Override
+        public void setup(final Mapper.Context context) throws IOException, InterruptedException {
+            this.isVertex = context.getConfiguration().getClass(CLASS, Element.class, Element.class).equals(Vertex.class);
+            final String key = context.getConfiguration().get(KEY);
+            final Class valueClass = context.getConfiguration().getClass(VALUE_CLASS, String.class);
+            final String[] valueStrings = context.getConfiguration().getStrings(VALUES);
+            final Object[] values = new Object[valueStrings.length];
+            if (valueClass.equals(String.class)) {
+                for (int i = 0; i < valueStrings.length; i++) {
+                    values[i] = valueStrings[i];
+                }
+            } else if (Number.class.isAssignableFrom((valueClass))) {
+                for (int i = 0; i < valueStrings.length; i++) {
+                    values[i] = Float.valueOf(valueStrings[i]);
+                }
+            } else if (valueClass.equals(Boolean.class)) {
+                for (int i = 0; i < valueStrings.length; i++) {
+                    values[i] = Boolean.valueOf(valueStrings[i]);
+                }
+            } else {
+                throw new IOException("Class " + valueClass + " is an unsupported value class");
+            }
+
+            final Query.Compare compare = Query.Compare.valueOf(context.getConfiguration().get(COMPARE));
+            final Boolean nullIsWildcard = context.getConfiguration().getBoolean(NULL_WILDCARD, false);
+
+            this.elementChecker = new ElementChecker(nullIsWildcard, key, compare, values);
+        }
+
+        @Override
+        public void map(final NullWritable key, final FaunusVertex value, final Mapper<NullWritable, FaunusVertex, NullWritable, FaunusVertex>.Context context) throws IOException, InterruptedException {
+
+            if (this.isVertex) {
+                if (!this.elementChecker.isLegal(value))
+                    value.setEnergy(0);
+            } else {
+                for (Edge edge : value.getEdges(Direction.BOTH)) {
+                    if (!this.elementChecker.isLegal((FaunusEdge) edge))
+                        ((FaunusEdge) edge).setEnergy(0);
+                }
+            }
+
+            context.write(NullWritable.get(), value);
+        }
+    }
+}

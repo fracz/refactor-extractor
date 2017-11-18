@@ -1,0 +1,455 @@
+/*
+ * Copyright 2000-2007 JetBrains s.r.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.intellij.ui;
+
+import com.intellij.openapi.application.Application;
+import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.diagnostic.Logger;
+import com.intellij.util.ui.UIUtil;
+import org.jetbrains.annotations.NotNull;
+
+import javax.swing.*;
+import javax.swing.border.Border;
+import java.awt.*;
+import java.util.ArrayList;
+
+/**
+ * This is high performance Swing component which represents an icon
+ * with a colored text. The text consists of fragments. Each
+ * text fragment has its own color (foreground) and font style.
+ *
+ * @author Vladimir Kondratyev
+ */
+public class SimpleColoredComponent extends JComponent {
+  private static final Logger LOG = Logger.getInstance("#com.intellij.ui.SimpleColoredComponent");
+
+  private final ArrayList<String> myFragments;
+  private final ArrayList<SimpleTextAttributes> myAttributes;
+  private ArrayList<Object> myFragmentTags = null;
+
+  /**
+   * Component's icon. It can be <code>null</code>.
+   */
+  private Icon myIcon;
+  /**
+   * Internal padding
+   */
+  private Insets myIpad;
+  /**
+   * Gap between icon and text. It is used only if icon is defined.
+   */
+  private int myIconTextGap;
+  /**
+   * Defines whether the focus border around the text is painted or not.
+   * For example, text can have a border if the component represents a selected item
+   * in focused JList.
+   */
+  private boolean myPaintFocusBorder;
+  /**
+   * Defines whether the focus border around the text extends to icon or not
+   */
+  private boolean myFocusBorderAroundIcon;
+  /**
+   * This is the border around the text. For example, text can have a border
+   * if the component represents a selected item in a focused JList.
+   * Border can be <code>null</code>.
+   */
+  private final MyBorder myBorder;
+
+  private int myMainTextLastIndex = -1;
+
+  private int myAlignIndex;
+  private int myAlignWidth;
+
+  public SimpleColoredComponent() {
+    myFragments = new ArrayList<String>(3);
+    myAttributes = new ArrayList<SimpleTextAttributes>(3);
+    myIpad = new Insets(1, 2, 1, 2);
+    myIconTextGap = 2;
+    myBorder = new MyBorder();
+    setOpaque(true);
+  }
+
+  /**
+   * Appends string fragments to existing ones. Appended string
+   * will have specified <code>attributes</code>.
+   */
+  public final void append(@NotNull final String fragment, @NotNull final SimpleTextAttributes attributes) {
+    append(fragment, attributes, myMainTextLastIndex < 0);
+  }
+
+  /**
+   * Appends string fragments to existing ones. Appended string
+   * will have specified <code>attributes</code>.
+   */
+  public synchronized void append(@NotNull final String fragment, @NotNull final SimpleTextAttributes attributes, boolean isMainText) {
+    myFragments.add(fragment);
+    myAttributes.add(attributes);
+    if (isMainText) {
+      myMainTextLastIndex = myFragments.size() - 1;
+    }
+  }
+
+  public synchronized void append(@NotNull final String fragment, @NotNull final SimpleTextAttributes attributes, Object tag) {
+    append(fragment, attributes);
+    if (myFragmentTags == null) {
+      myFragmentTags = new ArrayList<Object>();
+    }
+    while(myFragmentTags.size() < myFragments.size()-1) {
+      myFragmentTags.add(null);
+    }
+    myFragmentTags.add(tag);
+  }
+
+  public synchronized void appendAlign(int alignWidth) {
+    myAlignIndex = myFragments.size()-1;
+    myAlignWidth = alignWidth;
+  }
+
+  /**
+   * Clear all special attributes of <code>SimpleColoredComponent</code>.
+   * The are icon, text fragments and their attributes, "paint focus border".
+   */
+  public synchronized void clear() {
+    myIcon = null;
+    myPaintFocusBorder = false;
+    setBorder(null);
+    myFragments.clear();
+    myAttributes.clear();
+    myFragmentTags = null;
+    myMainTextLastIndex = -1;
+    myAlignIndex = -1;
+    myAlignWidth = -1;
+  }
+
+  /**
+   * @return component's icon. This method returns <code>null</code>
+   *         if there is no icon.
+   */
+  public final Icon getIcon() {
+    return myIcon;
+  }
+
+  /**
+   * Sets a new component icon
+   */
+  public final void setIcon(final Icon icon) {
+    myIcon = icon;
+  }
+
+  /**
+   * @return "leave" (internal) internal paddings of the component
+   */
+  public Insets getIpad() {
+    return myIpad;
+  }
+
+  /**
+   * Sets specified internal paddings
+   */
+  public void setIpad(final Insets ipad) {
+    myIpad = ipad;
+  }
+
+  /**
+   * @return gap between icon and text
+   */
+  public int getIconTextGap() {
+    return myIconTextGap;
+  }
+
+  /**
+   * Sets a new gap between icon and text
+   *
+   * @throws java.lang.IllegalArgumentException
+   *          if the <code>iconTextGap</code>
+   *          has a negative value
+   */
+  public void setIconTextGap(final int iconTextGap) {
+    if (iconTextGap < 0) {
+      throw new IllegalArgumentException("wrong iconTextGap: " + iconTextGap);
+    }
+    myIconTextGap = iconTextGap;
+  }
+
+  /**
+   * Sets whether focus border is painted or not
+   */
+  protected final void setPaintFocusBorder(final boolean paintFocusBorder) {
+    myPaintFocusBorder = paintFocusBorder;
+  }
+
+  /**
+   * Sets whether focus border extends to icon or not. If so then
+   * component also extends the selection.
+   */
+  protected final void setFocusBorderAroundIcon(final boolean focusBorderAroundIcon) {
+    myFocusBorderAroundIcon = focusBorderAroundIcon;
+  }
+
+  public Dimension getPreferredSize() {
+    return computePreferredSize(false);
+
+  }
+
+  public synchronized Object getFragmentTag(int index) {
+    if (myFragmentTags != null && index < myFragmentTags.size()) {
+      return myFragmentTags.get(index);
+    }
+    return null;
+  }
+
+  public final synchronized Dimension computePreferredSize(final boolean mainTextOnly) {
+    // Calculate width
+    int width = myIpad.left;
+
+    if (myIcon != null) {
+      width += myIcon.getIconWidth() + myIconTextGap;
+    }
+
+    final Insets borderInsets = myBorder.getBorderInsets(this);
+    width += borderInsets.left;
+
+    Font font = getFont();
+    LOG.assertTrue(font != null);
+
+    for (int i = 0; i < myAttributes.size(); i++) {
+      SimpleTextAttributes attributes = myAttributes.get(i);
+      if (font.getStyle() != attributes.getStyle()) { // derive font only if it is necessary
+        font = font.deriveFont(attributes.getStyle());
+      }
+      final FontMetrics metrics = getFontMetrics(font);
+      width += metrics.stringWidth(myFragments.get(i));
+      if (i == myAlignIndex && width < myAlignWidth) {
+        width = myAlignWidth;
+      }
+
+      if (mainTextOnly && myMainTextLastIndex >= 0 && i == myMainTextLastIndex) break;
+    }
+    width += myIpad.right + borderInsets.right;
+
+    // Calculate height
+    int height = myIpad.top + myIpad.bottom;
+
+    final FontMetrics metrics = getFontMetrics(font);
+    int textHeight = metrics.getHeight();
+    textHeight += borderInsets.top + borderInsets.bottom;
+
+    if (myIcon != null) {
+      height += Math.max(myIcon.getIconHeight(), textHeight);
+    }
+    else {
+      height += textHeight;
+    }
+
+    // Take into accound that the component itself can have a border
+    final Insets insets = getInsets();
+    width += insets.left + insets.right;
+    height += insets.top + insets.bottom;
+
+    return new Dimension(width, height);
+  }
+
+  public int findFragmentAt(int x) {
+    int curX = myIpad.left;
+    if (myIcon != null) {
+      curX += myIcon.getIconWidth() + myIconTextGap;
+    }
+
+    Font font = getFont();
+    LOG.assertTrue(font != null);
+
+    for (int i = 0; i < myAttributes.size(); i++) {
+      SimpleTextAttributes attributes = myAttributes.get(i);
+      if (font.getStyle() != attributes.getStyle()) { // derive font only if it is necessary
+        font = font.deriveFont(attributes.getStyle());
+      }
+      final FontMetrics metrics = getFontMetrics(font);
+      final int curWidth = metrics.stringWidth(myFragments.get(i));
+      if (x >= curX && x < curX + curWidth) {
+        return i;
+      }
+      curX += curWidth;
+      if (i == myAlignIndex && curX < myAlignWidth) {
+        curX = myAlignWidth;
+      }
+    }
+    return -1;
+  }
+
+  protected void paintComponent(final Graphics g) {
+    try {
+      doPaint(g);
+    }
+    catch (RuntimeException e) {
+      LOG.error(logSwingPath(), e);
+      throw e;
+    }
+  }
+
+  protected synchronized void doPaint(final Graphics g) {
+    checkCanPaint();
+    int xOffset = 0;
+
+    // Paint icon and its background
+    final Icon icon = myIcon;   // guard against concurrent modification (IDEADEV-12635)
+    if (icon != null) {
+      final Container parent = getParent();
+      final Color iconBackgroundColor;
+      if (parent != null && !myFocusBorderAroundIcon && !UIUtil.isUnderQuaquaLookAndFeel()) {
+        iconBackgroundColor = parent.getBackground();
+      }
+      else {
+        iconBackgroundColor = getBackground();
+      }
+      g.setColor(iconBackgroundColor);
+      g.fillRect(0, 0, icon.getIconWidth() + myIpad.left + myIconTextGap, getHeight());
+
+      icon.paintIcon(this, g, myIpad.left, (getHeight() - icon.getIconHeight()) / 2);
+
+      xOffset += myIpad.left + icon.getIconWidth() + myIconTextGap;
+    }
+
+    if (isOpaque()) {
+      // Paint text background
+      g.setColor(getBackground());
+      g.fillRect(xOffset, 0, getWidth() - xOffset, getHeight());
+    }
+
+    // If there is no icon, then we have to add left internal padding
+    if (xOffset == 0) {
+      xOffset = myIpad.left;
+    }
+
+    // Paint focus border around the text and icon (if necessary)
+    if (myPaintFocusBorder) {
+      if (myFocusBorderAroundIcon || icon == null) {
+        myBorder.paintBorder(this, g, 0, 0, getWidth(), getHeight());
+      }
+      else {
+        myBorder.paintBorder(this, g, xOffset, 0, getWidth() - xOffset, getHeight());
+      }
+    }
+    xOffset += myBorder.getBorderInsets(this).left;
+
+    // Paint text
+    UIUtil.applyRenderingHints(g);
+    for (int i = 0; i < myFragments.size(); i++) {
+      final SimpleTextAttributes attributes = myAttributes.get(i);
+      Font font = getFont();
+      if (font.getStyle() != attributes.getStyle()) { // derive font only if it is necessary
+        font = font.deriveFont(attributes.getStyle());
+      }
+      g.setFont(font);
+      final FontMetrics metrics = getFontMetrics(font);
+
+      final String fragment = myFragments.get(i);
+      final int fragmentWidth = metrics.stringWidth(fragment);
+
+      final Color bgColor = attributes.getBgColor();
+      if (isOpaque() && bgColor != null) {
+        g.setColor(bgColor);
+        g.fillRect(xOffset, 0, fragmentWidth, getHeight());
+      }
+
+      Color color = attributes.getFgColor();
+      if (color == null) { // in case if color is not defined we have to get foreground color from Swing hierarchy
+        color = getForeground();
+      }
+      if (!isEnabled()) {
+        color = UIUtil.getTextInactiveTextColor();
+      }
+      g.setColor(color);
+
+      final int textBaseline = (getHeight() - metrics.getHeight()) / 2 + metrics.getAscent();
+      g.drawString(fragment, xOffset, textBaseline);
+
+      // 1. Strikeout effect
+      if (attributes.isStrikeout()) {
+        final int strikeOutAt = textBaseline + (metrics.getDescent() - metrics.getAscent()) / 2;
+        UIUtil.drawLine(g, xOffset, strikeOutAt, xOffset + fragmentWidth, strikeOutAt);
+      }
+      // 2. Waved effect
+      if (attributes.isWaved()) {
+        if (attributes.getWaveColor() != null) {
+          g.setColor(attributes.getWaveColor());
+        }
+        final int wavedAt = textBaseline + 1;
+        for (int x = xOffset; x <= xOffset + fragmentWidth; x += 4) {
+          UIUtil.drawLine(g, x, wavedAt, x + 2, wavedAt + 2);
+          UIUtil.drawLine(g, x + 3, wavedAt + 1, x + 4, wavedAt);
+        }
+      }
+      if (attributes.isUnderline()) {
+        final int underlineAt = textBaseline + 1;
+        UIUtil.drawLine(g, xOffset, underlineAt, xOffset + fragmentWidth, underlineAt);
+      }
+
+
+      xOffset += fragmentWidth;
+      if (i == myAlignIndex && xOffset < myAlignWidth) {
+        xOffset = myAlignWidth;
+      }
+    }
+  }
+
+  private static void checkCanPaint() {
+    /* wtf??
+    if (!isDisplayable()) {
+      LOG.assertTrue(false, logSwingPath());
+    }
+    */
+    final Application application = ApplicationManager.getApplication();
+    if (application != null) {
+      application.assertIsDispatchThread();
+    }
+    else if (!SwingUtilities.isEventDispatchThread()) {
+      throw new RuntimeException(Thread.currentThread().toString());
+    }
+  }
+
+  private String logSwingPath() {
+    //noinspection HardCodedStringLiteral
+    final StringBuilder buffer = new StringBuilder("Components hierarchy:\n");
+    for (Container c = this; c != null; c = c.getParent()) {
+      buffer.append('\n');
+      buffer.append(c.toString());
+    }
+    return buffer.toString();
+  }
+
+  private static final class MyBorder implements Border {
+    private final Insets myInsets;
+
+    public MyBorder() {
+      myInsets = new Insets(1, 1, 1, 1);
+    }
+
+    public void paintBorder(final Component c, final Graphics g, final int x, final int y, final int width, final int height) {
+      g.setColor(Color.BLACK);
+      UIUtil.drawDottedRectangle(g, x, y, x + width - 1, y + height - 1);
+    }
+
+    public Insets getBorderInsets(final Component c) {
+      return myInsets;
+    }
+
+    public boolean isBorderOpaque() {
+      return true;
+    }
+  }
+
+}

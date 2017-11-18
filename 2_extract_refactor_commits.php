@@ -20,7 +20,7 @@ echo 'Getting refactor changes from found commits...' . PHP_EOL;
 
 $progress = new \ProgressBar\Manager(0, count($commits));
 
-$outputDir = __DIR__ . '/results/' . str_replace('/', '--', $project);
+$outputDir = __DIR__ . '/results-java/' . str_replace('/', '--', $project);
 @mkdir($outputDir);
 
 $files = 0;

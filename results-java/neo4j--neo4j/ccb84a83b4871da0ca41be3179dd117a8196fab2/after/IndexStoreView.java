@@ -1,0 +1,82 @@
+/**
+ * Copyright (c) 2002-2014 "Neo Technology,"
+ * Network Engine for Objects in Lund AB [http://neotechnology.com]
+ *
+ * This file is part of Neo4j.
+ *
+ * Neo4j is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package org.neo4j.kernel.impl.api.index;
+
+import java.io.IOException;
+
+import org.neo4j.helpers.collection.Visitor;
+import org.neo4j.kernel.api.index.IndexDescriptor;
+import org.neo4j.kernel.api.index.NodePropertyUpdate;
+import org.neo4j.kernel.api.index.PropertyAccessor;
+import org.neo4j.kernel.api.labelscan.NodeLabelUpdate;
+
+/** The indexing services view of the universe. */
+public interface IndexStoreView extends PropertyAccessor
+{
+    /**
+     * Retrieve all nodes in the database with a given label and property, as pairs of node id and property value.
+     *
+     * @return a {@link StoreScan} to start and to stop the scan.
+     */
+    <FAILURE extends Exception> StoreScan<FAILURE> visitNodesWithPropertyAndLabel(
+            IndexDescriptor descriptor, Visitor<NodePropertyUpdate, FAILURE> visitor );
+
+    /**
+     * Retrieve all nodes in the database which has got one or more of the given labels AND
+     * one or more of the given property key ids.
+     *
+     * @return a {@link StoreScan} to start and to stop the scan.
+     */
+    <FAILURE extends Exception> StoreScan<FAILURE> visitNodes( int[] labelIds, int[] propertyKeyIds,
+            Visitor<NodePropertyUpdate, FAILURE> propertyUpdateVisitor,
+            Visitor<NodeLabelUpdate, FAILURE> labelUpdateVisitor );
+
+    Iterable<NodePropertyUpdate> nodeAsUpdates( long nodeId );
+
+    long getIndexCount( IndexDescriptor descriptor );
+
+    void replaceIndexCount( IndexDescriptor descriptor, long total );
+
+    void updateIndexCount( IndexDescriptor descriptor, long delta );
+
+    void flushIndexCounts() throws IOException;
+
+    static class IndexCountVisitors
+    {
+        public static IndexCountVisitor newIndexCountVisitor( final IndexStoreView view, final IndexDescriptor descriptor )
+        {
+            return new IndexCountVisitor()
+            {
+                @Override
+                public void incrementIndexCount( long transactionId, long deltaCount )
+                {
+                    view.updateIndexCount( descriptor, deltaCount );
+                }
+
+                @Override
+                public void replaceIndexCount( long transactionId, long totalCount )
+                {
+                    view.replaceIndexCount( descriptor, totalCount );
+
+                }
+            };
+        };
+    }
+}

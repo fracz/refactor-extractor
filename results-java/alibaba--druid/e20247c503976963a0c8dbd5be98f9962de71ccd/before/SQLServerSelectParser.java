@@ -1,0 +1,98 @@
+/*
+ * Copyright 1999-2011 Alibaba Group Holding Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.alibaba.druid.sql.dialect.sqlserver.parser;
+
+import com.alibaba.druid.sql.ast.SQLSetQuantifier;
+import com.alibaba.druid.sql.ast.statement.SQLSelect;
+import com.alibaba.druid.sql.ast.statement.SQLSelectQuery;
+import com.alibaba.druid.sql.dialect.sqlserver.ast.SQLServerSelect;
+import com.alibaba.druid.sql.dialect.sqlserver.ast.SQLServerSelectQueryBlock;
+import com.alibaba.druid.sql.dialect.sqlserver.ast.Top;
+import com.alibaba.druid.sql.parser.SQLExprParser;
+import com.alibaba.druid.sql.parser.SQLSelectParser;
+import com.alibaba.druid.sql.parser.Token;
+
+public class SQLServerSelectParser extends SQLSelectParser {
+
+    public SQLServerSelectParser(String sql){
+        super(new SQLServerExprParser(sql));
+    }
+
+    public SQLServerSelectParser(SQLExprParser exprParser){
+        super(exprParser);
+    }
+
+    public SQLSelect select()  {
+        SQLServerSelect select = new SQLServerSelect();
+
+        withSubquery(select);
+
+        select.setQuery(query());
+        select.setOrderBy(parseOrderBy());
+
+        if (select.getOrderBy() == null) {
+            select.setOrderBy(parseOrderBy());
+        }
+
+        return select;
+    }
+
+    public SQLSelectQuery query()  {
+        if (lexer.token() == Token.LPAREN) {
+            lexer.nextToken();
+
+            SQLSelectQuery select = query();
+            accept(Token.RPAREN);
+
+            return queryRest(select);
+        }
+
+        SQLServerSelectQueryBlock queryBlock = new SQLServerSelectQueryBlock();
+
+        if (lexer.token() == Token.SELECT) {
+            lexer.nextToken();
+
+            if (lexer.token() == Token.DISTINCT) {
+                queryBlock.setDistionOption(SQLSetQuantifier.DISTINCT);
+                lexer.nextToken();
+            } else if (lexer.token() == Token.ALL) {
+                queryBlock.setDistionOption(SQLSetQuantifier.ALL);
+                lexer.nextToken();
+            }
+
+            if (lexer.token() == Token.TOP) {
+                Top top = new Top();
+                lexer.nextToken();
+                top.setExpr(createExprParser().primary());
+                queryBlock.setTop(top);
+            }
+
+            parseSelectList(queryBlock);
+        }
+
+        parseFrom(queryBlock);
+
+        parseWhere(queryBlock);
+
+        parseGroupBy(queryBlock);
+
+        return queryRest(queryBlock);
+    }
+
+    protected SQLExprParser createExprParser() {
+        return new SQLServerExprParser(lexer);
+    }
+}

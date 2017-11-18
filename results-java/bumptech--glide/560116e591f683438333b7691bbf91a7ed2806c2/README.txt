@@ -1,0 +1,31 @@
+commit 560116e591f683438333b7691bbf91a7ed2806c2
+Author: christianw <christianw@google.com>
+Date:   Tue Jul 18 10:57:27 2017 -0700
+
+    Replace uses of deprecated RobolectricPackageManager with ShadowPackageManager.
+
+    replace_string \
+      'import org.robolectric.res.builder.RobolectricPackageManager;' \
+      'import org.robolectric.shadows.ShadowPackageManager;'
+
+    replace_string \
+      'import static org.robolectric.RuntimeEnvironment.getRobolectricPackageManager;' \
+      'import static org.robolectric.Shadows.shadowOf;'
+
+    replace_string \
+      'RuntimeEnvironment.getRobolectricPackageManager\(\)' \
+      'shadowOf(RuntimeEnvironment.application.getPackageManager())'
+
+    replace_string 'RobolectricPackageManager' 'ShadowPackageManager'.
+
+    ... plus fixes for line length and readability.
+
+    Compatibility for [] and https://github.com/robolectric/robolectric/pull/3203
+
+    Tested:
+        TAP --sample for global presubmit queue
+        []
+
+    -------------
+    Created by MOE: https://github.com/google/moe
+    MOE_MIGRATED_REVID=162373742

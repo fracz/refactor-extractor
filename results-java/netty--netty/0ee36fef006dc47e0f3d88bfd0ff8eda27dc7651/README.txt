@@ -1,0 +1,56 @@
+commit 0ee36fef006dc47e0f3d88bfd0ff8eda27dc7651
+Author: chhsiao90 <chhsiao90@gmail.com>
+Date:   Sun Mar 5 23:22:54 2017 +0800
+
+    Accept two ways to start HTTP/2 over clear text
+
+    Motivation:
+
+    HTTP/2 support two ways to start on a no-tls tcp connection,
+    http/1.1 upgrade and prior knowlege methodology to start HTTP/2.
+    Currently, the http2-server from example only support
+    starting by upgrade. I think we can do a simple dispatch by peek first
+    bytes from inbound that match to prior knowledge preface or not and
+    determine which handlers to set into pipeline.
+
+    Modifications:
+
+    Add ClearTextHttp2ServerUpgradeHandler to support start HTTP/2 via clear
+    text with two approach. And update example/http2-server to support
+    this functionality.
+
+    Result:
+
+    netty HTTP/2 and the example http2-server accept for two ways to start
+    HTTP/2 over clear text.
+
+    Fixed memory leak problem
+
+    Update fields to final
+
+    Rename ClearText to cleartext
+
+    Addressed comments for code improvement
+
+    - Always prefer static, final, and private if possible
+    - Add UnstableApi annotation
+    - Used EmbeddedChannel.readInbound instead of unhandled inbound handler
+    - More assertion
+
+    Update javadoc for CleartextHttp2ServerUpgradeHandler
+
+    Rename ClearTextHttp2ServerUpgradeHandler to CleartextHttp2ServerUpgradeHandler
+
+    Removed redundant code about configure pipeline
+
+    nit: PriorKnowledgeHandler
+
+    Removed Mockito.spy, investigate conn state instead
+
+    Add Http2UpgradeEvent
+
+    Check null of the constructor arguments
+
+    Rename Http2UpgradeEvent to PriorKnowledgeUpgradeEvent
+
+    Update unit test

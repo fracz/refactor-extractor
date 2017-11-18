@@ -1,0 +1,82 @@
+/**
+ * Copyright (c) 2002-2014 "Neo Technology,"
+ * Network Engine for Objects in Lund AB [http://neotechnology.com]
+ *
+ * This file is part of Neo4j.
+ *
+ * Neo4j is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
+package org.neo4j.cluster.statemachine;
+
+import static org.neo4j.cluster.com.message.Message.CONVERSATION_ID;
+import static org.neo4j.cluster.com.message.Message.FROM;
+import static org.neo4j.cluster.protocol.atomicbroadcast.multipaxos.InstanceId.INSTANCE;
+
+import org.neo4j.cluster.protocol.heartbeat.HeartbeatState;
+import org.neo4j.kernel.impl.util.StringLogger;
+import org.neo4j.kernel.logging.Logging;
+
+/**
+ * Logs state transitions in {@link StateMachine}s. Use this for debugging mainly.
+ */
+public class StateTransitionLogger
+        implements StateTransitionListener
+{
+    private final Logging logging;
+
+    public StateTransitionLogger( Logging logging )
+    {
+        this.logging = logging;
+    }
+
+    @Override
+    public void stateTransition( StateTransition transition )
+    {
+        StringLogger logger = logging.getMessagesLog( transition.getOldState().getClass() );
+
+        if ( logger.isDebugEnabled() )
+        {
+            if ( transition.getOldState() == HeartbeatState.heartbeat )
+            {
+                return;
+            }
+
+            // The bulk of the message
+            StringBuilder line = new StringBuilder( transition.getOldState().getClass().getSuperclass().getSimpleName
+                    () +
+                    ": " + transition );
+
+            // Who was this message from?
+            if ( transition.getMessage().hasHeader( FROM ) )
+            {
+                line.append( " from:" + transition.getMessage().getHeader( FROM ) );
+            }
+
+            if ( transition.getMessage().hasHeader( INSTANCE ) )
+            {
+                line.append( " instance:" + transition.getMessage().getHeader( INSTANCE ) );
+            }
+
+            if ( transition.getMessage().hasHeader( CONVERSATION_ID ) )
+            {
+                line.append( " conversation-id:" + transition.getMessage().getHeader( CONVERSATION_ID ) );
+            }
+
+            line.append( " payload:" + transition.getMessage().getPayload() );
+
+            // Log it
+            logger.debug( line.toString() );
+        }
+    }
+}

@@ -1,0 +1,22 @@
+commit 255764f1a0080122b15e8be95acae7963d9055cc
+Author: Andy Wilkinson <awilkinson@pivotal.io>
+Date:   Wed Jul 29 10:00:06 2015 +0100
+
+    Ensure that custom Liquibase logger is always used
+
+    Liquibase 3.4.0 contains a bug that causes the initialization of its
+    ServiceLocator to pollute its map of loggers with a DefaultLogger for
+    the logger named "liquibase". Liquibase 3.4.1 contains a change that
+    improves the situation, but does not address is completely. Creating a
+    CustomResolverServiceLocator, as we do, still causes the map of
+    loggers to be polluted due to logging that's performed in
+    ClassLoaderResourceAccessor.getResourcesAsStream.
+
+    The commit address the problem by upgrading to Liquibase 3.4.1 and
+    adding the package containing our custom logger to the default service
+    locator before we register our custom service locator. This ensures
+    that the logging that's performed during the creation of our custom
+    service locator will still use our custom logger.
+
+    Closes gh-3470
+    Closes gh-3616

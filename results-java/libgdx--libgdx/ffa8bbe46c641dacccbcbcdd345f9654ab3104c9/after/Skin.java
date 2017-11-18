@@ -1,0 +1,430 @@
+/*******************************************************************************
+ * Copyright 2011 See AUTHORS file.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
+
+package com.badlogic.gdx.scenes.scene2d.ui;
+
+import java.io.IOException;
+import java.io.Writer;
+
+import com.badlogic.gdx.Files.FileType;
+import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.files.FileHandle;
+import com.badlogic.gdx.graphics.Color;
+import com.badlogic.gdx.graphics.Texture;
+import com.badlogic.gdx.graphics.Texture.TextureFilter;
+import com.badlogic.gdx.graphics.g2d.BitmapFont;
+import com.badlogic.gdx.graphics.g2d.NinePatch;
+import com.badlogic.gdx.graphics.g2d.TextureRegion;
+import com.badlogic.gdx.scenes.scene2d.ui.Button.ButtonStyle;
+import com.badlogic.gdx.scenes.scene2d.ui.CheckBox.CheckBoxStyle;
+import com.badlogic.gdx.utils.Disposable;
+import com.badlogic.gdx.utils.GdxRuntimeException;
+import com.badlogic.gdx.utils.Json;
+import com.badlogic.gdx.utils.Json.Serializer;
+import com.badlogic.gdx.utils.JsonWriter.OutputType;
+import com.badlogic.gdx.utils.ObjectMap;
+import com.badlogic.gdx.utils.ObjectMap.Entry;
+import com.badlogic.gdx.utils.SerializationException;
+
+/** A skin holds styles for widgets and the resources (texture regions, ninepatches, bitmap fonts, etc) for those styles. A skin
+ * has a single texture that the resources may reference. This reduces the number of texture binds necessary for rendering many
+ * different widgets.
+ * <p>
+ * The resources and styles for a skin are usually defined using JSON (or a format that is {@link OutputType#minimal JSON-like}),
+ * which is formatted in this way:
+ *
+ * <pre>
+ * {
+ * 	resources: {
+ * 		className: {
+ * 			name: value,
+ * 			...
+ * 		},
+ * 		...
+ * 	},
+ * 	styles: {
+ * 		className: {
+ * 			name: value,
+ * 			...
+ * 		},
+ * 		...
+ * 	}
+ * }
+ * </pre>
+ *
+ * There are two sections, one named "resources" and the other "styles". Each section has a class name, which has a number of
+ * names and values. The name is the name of the resource or style for that class, and the value is the serialized resource or
+ * style. Here is a real example:
+ *
+ * <pre>
+ * {
+ * 	resources: {
+ * 		com.badlogic.gdx.graphics.g2d.TextureRegion: {
+ * 			check-on: { x: 13, y: 77, width: 14, height: 14 },
+ * 			check-off: { x: 2, y: 97, width: 14, height: 14 }
+ * 		},
+ * 		com.badlogic.gdx.graphics.Color: {
+ * 			white: { r: 1, g: 1, b: 1, a: 1 }
+ * 		},
+ * 		com.badlogic.gdx.graphics.g2d.BitmapFont: {
+ * 			default-font: default.fnt
+ * 		}
+ * 	},
+ * 	styles: {
+ * 		com.badlogic.gdx.scenes.scene2d.ui.CheckBox$CheckBoxStyle: {
+ * 			default: {
+ * 				checkboxOn: check-on, checkboxOff: check-off,
+ * 				font: default-font, fontColor: white
+ * 			}
+ * 		}
+ * 	}
+ * }
+ * </pre>
+ *
+ * Here some named resource are defined: texture regions, a color, and a bitmap font. Also, a {@link CheckBoxStyle} is defined
+ * named "default" and it references the resources by name.
+ * <p>
+ * Styles and resources are retrieved from the skin using the type and name:
+ *
+ * <pre>
+ * Color highlight = skin.getResource(&quot;highlight&quot;, Color.class);
+ * TextureRegion someRegion = skin.getResource(&quot;logo&quot;, TextureRegion.class);
+ * CheckBoxStyle checkBoxStyle = skin.getStyle(&quot;bigCheckbox&quot;, CheckBoxStyle.class);
+ * CheckBox checkBox = new CheckBox(&quot;Check me!&quot;, checkBoxStyle);
+ * </pre>
+ *
+ * For convenience, most widget constructors will accept a skin and look up the necessary style using the name "default".
+ * <p>
+ * The JSON required for a style is simply a JSON object with the field names and values. If the type of a style object's field
+ * has a section defined under "resources", the resource is looked up by name. Eg, in the example above, the
+ * {@link CheckBoxStyle#checkboxOn} field is of type TextureRegion, so the "check-on" texture region defined in the "resources"
+ * section is used.
+ * <p>
+ * The following gives examples for the types of resources that are supported by default:
+ * <p>
+ * {@link Color}:
+ *
+ * <pre>
+ * { r: 1, g: 1, b: 1, a: 1 }
+ * </pre>
+ *
+ * {@link TextureRegion}:
+ *
+ * <pre>
+ * { x: 13, y: 77, width: 14, height: 14 }
+ * </pre>
+ *
+ * {@link NinePatch}:
+ *
+ * <pre>
+ * [
+ * 	{ x: 2, y: 55, width: 5, height: 5 },
+ * 	{ x: 7, y: 55, width: 2, height: 5 },
+ * 	{ x: 9, y: 55, width: 5, height: 5 },
+ * 	{ x: 2, y: 60, width: 5, height: 11 },
+ * 	{ x: 7, y: 60, width: 2, height: 11 },
+ * 	{ x: 9, y: 60, width: 5, height: 11 },
+ * 	{ x: 2, y: 71, width: 5, height: 4 },
+ * 	{ x: 7, y: 71, width: 2, height: 4 },
+ * 	{ x: 9, y: 71, width: 5, height: 4 }
+ * ]
+ * </pre>
+ *
+ * {@link NinePatch} can also be specified as a single region, which is set as the center of the ninepatch:
+ *
+ * <pre>
+ * [ { width: 20, height: 20, x: 6, y: 2 } ]
+ * </pre>
+ *
+ * This notation is useful to use a single region as a ninepatch. Eg, when creating a button made up of a single image for the
+ * {@link ButtonStyle#up} field, which is a ninepatch.
+ * <p>
+ * {@link BitmapFont} is just the path to the bitmap font file:
+ *
+ * <pre>
+ * default.fnt
+ * </pre>
+ *
+ * It first looks for the font file in the directory containing the skin file. If not found there, it uses the specified path as
+ * an {@link FileType#Internal} path. The bitmap font will use a texture region with the same name as the font file. If no texture
+ * region with that name is defined in the skin, it will look in the same directory as the font file for a PNG with the same name
+ * as the font file.
+ * <p>
+ * The skin JSON is extensible. Styles and resources for your own widgets may be included in the skin, usually without writing any
+ * code. Deserialization is handled by the {@link Json} class, which automatically serializes and deserializes most objects. While
+ * nearly any style object can be automatically deserialized, often resource objects require custom deserialization. Eg,
+ * TextureRegion, BitmapFont, and NinePatch need to reference the skin's single texture. If needed,
+ * {@link #getJsonLoader(FileHandle)} may be overridden to register additional custom {@link Serializer serializers}.
+ *
+ * @author Nathan Sweet */
+public class Skin implements Disposable {
+	ObjectMap<Class, ObjectMap<String, Object>> resources = new ObjectMap();
+	ObjectMap<Class, ObjectMap<String, Object>> styles = new ObjectMap();
+	Texture texture;
+
+	public Skin () {
+	}
+
+	public Skin (FileHandle skinFile, FileHandle textureFile) {
+		texture = new Texture(textureFile);
+		try {
+			getJsonLoader(skinFile).fromJson(Skin.class, skinFile);
+		} catch (SerializationException ex) {
+			throw new SerializationException("Error reading file: " + skinFile, ex);
+		}
+	}
+
+	public Skin (FileHandle skinFile, Texture texture) {
+		this.texture = texture;
+		texture.setFilter(TextureFilter.Linear, TextureFilter.Linear);
+		try {
+			getJsonLoader(skinFile).fromJson(Skin.class, skinFile);
+		} catch (SerializationException ex) {
+			throw new SerializationException("Error reading file: " + skinFile, ex);
+		}
+	}
+
+	public void addResource (String name, Object resource) {
+		if (resource == null) throw new IllegalArgumentException("resource cannot be null.");
+		ObjectMap<String, Object> typeResources = resources.get(resource.getClass());
+		if (typeResources == null) {
+			typeResources = new ObjectMap();
+			resources.put(resource.getClass(), typeResources);
+		}
+		typeResources.put(name, resource);
+	}
+
+	public <T> T getResource (String name, Class<T> type) {
+		ObjectMap<String, Object> typeResources = resources.get(type);
+		if (typeResources == null) throw new GdxRuntimeException("No resources registered with type: " + type.getName());
+		Object resource = typeResources.get(name);
+		if (resource == null) throw new GdxRuntimeException("No " + type.getName() + " resource registered with name: " + name);
+		return (T)resource;
+	}
+
+	public boolean hasResource (String name, Class type) {
+		ObjectMap<String, Object> typeResources = resources.get(type);
+		if (typeResources == null) return false;
+		Object resource = typeResources.get(name);
+		if (resource == null) return false;
+		return true;
+	}
+
+	public void addStyle (String name, Object style) {
+		if (style == null) throw new IllegalArgumentException("style cannot be null.");
+		ObjectMap<String, Object> typeStyles = styles.get(style.getClass());
+		if (typeStyles == null) {
+			typeStyles = new ObjectMap();
+			styles.put(style.getClass(), typeStyles);
+		}
+		typeStyles.put(name, style);
+	}
+
+	public <T> T getStyle (Class<T> type) {
+		return getStyle("default", type);
+	}
+
+	public <T> T getStyle (String name, Class<T> type) {
+		ObjectMap<String, Object> typeStyles = styles.get(type);
+		if (typeStyles == null) throw new GdxRuntimeException("No styles registered with type: " + type.getName());
+		Object style = typeStyles.get(name);
+		if (style == null) throw new GdxRuntimeException("No " + type.getName() + " style registered with name: " + name);
+		return (T)style;
+	}
+
+	public boolean hasStyle (String name, Class type) {
+		ObjectMap<String, Object> typeStyles = styles.get(type);
+		if (typeStyles == null) return false;
+		Object style = typeStyles.get(name);
+		if (style == null) return false;
+		return true;
+	}
+
+	/** Disposes the {@link Texture} and all {@link Disposable} resources of this Skin. */
+	@Override
+	public void dispose () {
+		texture.dispose();
+		for (Object object : resources.values())
+			if (object instanceof Disposable) ((Disposable)object).dispose();
+	}
+
+	public void setTexture (Texture texture) {
+		this.texture = texture;
+	}
+
+	/** Returns the single {@link Texture} that all resources in this skin reference. */
+	public Texture getTexture () {
+		return texture;
+	}
+
+	public void save (FileHandle skinFile) {
+		String text = getJsonLoader(null).prettyPrint(this, true);
+		Writer writer = skinFile.writer(false);
+		try {
+			writer.write(text);
+			writer.close();
+		} catch (IOException ex) {
+			throw new GdxRuntimeException(ex);
+		}
+	}
+
+	protected Json getJsonLoader (final FileHandle skinFile) {
+		final Skin skin = this;
+
+		Json json = new Json();
+		json.setTypeName(null);
+		json.setUsePrototypes(false);
+
+		class AliasSerializer implements Serializer {
+			final ObjectMap<String, ?> map;
+
+			public AliasSerializer (ObjectMap<String, ?> map) {
+				this.map = map;
+			}
+
+			public void write (Json json, Object object, Class valueType) {
+				for (Entry<String, ?> entry : map.entries()) {
+					if (entry.value.equals(object)) {
+						json.writeValue(entry.key);
+						return;
+					}
+				}
+				throw new SerializationException(object.getClass().getSimpleName() + " not found: " + object);
+			}
+
+			public Object read (Json json, Object jsonData, Class type) {
+				String name = (String)jsonData;
+				Object object = map.get(name);
+				if (object != null) return object;
+				throw new SerializationException("Skin references a " + type.getSimpleName()
+					+ " that could not be found in the resources: " + jsonData);
+			}
+		}
+
+		json.setSerializer(Skin.class, new Serializer<Skin>() {
+			public void write (Json json, Skin skin, Class valueType) {
+				json.writeObjectStart();
+				json.writeValue("resources", skin.resources);
+				for (Entry<Class, ObjectMap<String, Object>> entry : resources.entries())
+					json.setSerializer(entry.key, new AliasSerializer(entry.value));
+				json.writeField(skin, "styles");
+				json.writeObjectEnd();
+			}
+
+			public Skin read (Json json, Object jsonData, Class ignored) {
+				ObjectMap map = (ObjectMap)jsonData;
+				readTypeMap(json, (ObjectMap)map.get("resources"), true);
+				for (Entry<Class, ObjectMap<String, Object>> entry : resources.entries())
+					json.setSerializer(entry.key, new AliasSerializer(entry.value));
+				readTypeMap(json, (ObjectMap)map.get("styles"), false);
+				return skin;
+			}
+
+			private void readTypeMap (Json json, ObjectMap<String, ObjectMap> typeToValueMap, boolean isResource) {
+				if (typeToValueMap == null)
+					throw new SerializationException("Skin file is missing a \"" + (isResource ? "resources" : "styles")
+						+ "\" section.");
+				if (isResource) {
+					// Read NinePatches and TextureRegions before other resources, so resources like BitmapFont can reference them.
+					{
+						ObjectMap valueMap = typeToValueMap.remove(NinePatch.class.getName());
+						if (valueMap != null) readType(json, NinePatch.class.getName(), valueMap, isResource);
+					}
+					{
+						ObjectMap valueMap = typeToValueMap.remove(TextureRegion.class.getName());
+						if (valueMap != null) readType(json, TextureRegion.class.getName(), valueMap, isResource);
+					}
+				}
+				for (Entry<String, ObjectMap> typeEntry : typeToValueMap.entries())
+					readType(json, typeEntry.key, (ObjectMap)typeEntry.value, isResource);
+			}
+
+			private void readType (Json json, String className, ObjectMap<String, ObjectMap> valueMap, boolean isResource) {
+				Class type;
+				try {
+					type = Class.forName(className);
+				} catch (ClassNotFoundException ex) {
+					throw new SerializationException(ex);
+				}
+				for (Entry<String, ObjectMap> valueEntry : valueMap.entries()) {
+					try {
+						if (isResource)
+							addResource(valueEntry.key, json.readValue(type, valueEntry.value));
+						else
+							addStyle(valueEntry.key, json.readValue(type, valueEntry.value));
+					} catch (Exception ex) {
+						throw new SerializationException("Error reading " + type.getSimpleName() + ": " + valueEntry.key, ex);
+					}
+				}
+			}
+		});
+
+		json.setSerializer(TextureRegion.class, new Serializer<TextureRegion>() {
+			public void write (Json json, TextureRegion region, Class valueType) {
+				json.writeObjectStart();
+				json.writeValue("x", region.getRegionX());
+				json.writeValue("y", region.getRegionY());
+				json.writeValue("width", region.getRegionWidth());
+				json.writeValue("height", region.getRegionHeight());
+				json.writeObjectEnd();
+			}
+
+			public TextureRegion read (Json json, Object jsonData, Class type) {
+				int x = json.readValue("x", int.class, jsonData);
+				int y = json.readValue("y", int.class, jsonData);
+				int width = json.readValue("width", int.class, jsonData);
+				int height = json.readValue("height", int.class, jsonData);
+				return new TextureRegion(skin.texture, x, y, width, height);
+			}
+		});
+
+		json.setSerializer(BitmapFont.class, new Serializer<BitmapFont>() {
+			public void write (Json json, BitmapFont font, Class valueType) {
+				json.writeValue(font.getData().getFontFile().toString().replace('\\', '/'));
+			}
+
+			public BitmapFont read (Json json, Object jsonData, Class type) {
+				String path = json.readValue(String.class, jsonData);
+				FileHandle file = skinFile.parent().child(path);
+				if (!file.exists()) file = Gdx.files.internal(path);
+				// Use a region with the same name as the font, else use a PNG file in the same directory as the FNT file.
+				TextureRegion region = null;
+				if (skin.hasResource(file.nameWithoutExtension(), TextureRegion.class))
+					region = skin.getResource(file.nameWithoutExtension(), TextureRegion.class);
+				return new BitmapFont(file, region, false);
+			}
+		});
+
+		json.setSerializer(NinePatch.class, new Serializer<NinePatch>() {
+			public void write (Json json, NinePatch ninePatch, Class valueType) {
+				TextureRegion[] patches = ninePatch.getPatches();
+				if (patches[0] == null && patches[1] == null && patches[2] == null && patches[3] == null && patches[4] != null
+					&& patches[5] == null && patches[6] == null && patches[7] == null && patches[8] == null)
+					json.writeValue(new TextureRegion[] {patches[4]});
+				else
+					json.writeValue(ninePatch.getPatches());
+			}
+
+			public NinePatch read (Json json, Object jsonData, Class type) {
+				TextureRegion[] regions = json.readValue(TextureRegion[].class, jsonData);
+				if (regions.length == 1) return new NinePatch(regions[0]);
+				return new NinePatch(regions);
+			}
+		});
+
+		return json;
+	}
+}

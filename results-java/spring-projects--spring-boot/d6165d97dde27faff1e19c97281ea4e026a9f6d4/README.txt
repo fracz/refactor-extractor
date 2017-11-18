@@ -1,0 +1,16 @@
+commit d6165d97dde27faff1e19c97281ea4e026a9f6d4
+Author: Dave Syer <dsyer@pivotal.io>
+Date:   Fri Sep 19 16:02:29 2014 +0100
+
+    A few tweaks that might improve performance on startup
+
+    ... or couldn't hurt anyway.
+
+    1. Extends the definition of a web application for @ConditionalOnWebapp
+    so that a StandardEnvironment can be used (cutting out JNDI failures
+    for Environment properties)
+
+    2. Doesn't bother using StandardServletEnvironment in integration tests
+
+    3. Make the NON_ENUMERABLE_ENUMERABLES in PropertySourcesPropertyValues
+    static so they only get initialized once (not a huge issue at all)

@@ -1,0 +1,17 @@
+commit 371f8066d2502f6c6d75c5d0f80cd25e19b5e58b
+Author: Norman Maurer <nmaurer@redhat.com>
+Date:   Fri Jun 20 18:19:45 2014 +0200
+
+    [#2580] [#2587] Fix buffer corruption regression when ByteBuf.order(LITTLE_ENDIAN) is used
+
+    Motivation:
+
+    To improve the speed of ByteBuf with order LITTLE_ENDIAN and where the native order is also LITTLE_ENDIAN (intel) we introduces a new special SwappedByteBuf before in commit 4ad3984c8b725ef59856d174d09d1209d65933fc. Unfortunally the commit has a flaw which does not handle correctly the case when a ByteBuf expands. This was caused because the memoryAddress was cached and never changed again even if the underlying buffer expanded. This can lead to corrupt data or even to SEGFAULT the JVM if you are lucky enough.
+
+    Modification:
+
+    Always lookup the actual memoryAddress of the wrapped ByteBuf.
+
+    Result:
+
+    No more data-corruption for ByteBuf with order LITTLE_ENDIAN and no JVM crashes.

@@ -1,0 +1,58 @@
+/*
+ * Copyright (c) 2007 Mockito contributors
+ * This program is made available under the terms of the MIT License.
+ */
+package org.mockito.internal.verification;
+
+import java.util.List;
+
+import org.mockito.exceptions.Reporter;
+import org.mockito.exceptions.base.HasStackTrace;
+import org.mockito.internal.invocation.ActualInvocationsFinder;
+import org.mockito.internal.invocation.Invocation;
+import org.mockito.internal.invocation.InvocationMatcher;
+import org.mockito.internal.progress.VerificationModeImpl;
+
+public class NumberOfInvocationsVerifier implements Verifier {
+
+    private final Reporter reporter;
+    private final ActualInvocationsFinder finder;
+
+    public NumberOfInvocationsVerifier() {
+        this(new Reporter(), new ActualInvocationsFinder());
+    }
+
+    NumberOfInvocationsVerifier(Reporter reporter, ActualInvocationsFinder finder) {
+        this.reporter = reporter;
+        this.finder = finder;
+    }
+
+    public void verify(List<Invocation> invocations, InvocationMatcher wanted, VerificationModeImpl mode) {
+        if (!mode.exactNumberOfInvocationsMode()) {
+            return;
+        }
+
+        List<Invocation> actualInvocations = finder.findInvocations(invocations, wanted, mode);
+
+        int actualCount = actualInvocations.size();
+        if (mode.tooLittleActualInvocations(actualCount)) {
+            HasStackTrace lastInvocation = getLastSafely(actualInvocations);
+            reporter.tooLittleActualInvocations(mode.wantedCount(), actualCount, wanted.toString(), lastInvocation);
+        } else if (mode.tooManyActualInvocations(actualCount)) {
+            HasStackTrace firstUndesired = actualInvocations.get(mode.wantedCount()).getStackTrace();
+            reporter.tooManyActualInvocations(mode.wantedCount(), actualCount, wanted.toString(), firstUndesired);
+        }
+
+        for (Invocation i : actualInvocations) {
+            i.markVerified();
+        }
+    }
+
+    private HasStackTrace getLastSafely(List<Invocation> actualInvocations) {
+        if (actualInvocations.isEmpty()) {
+            return null;
+        } else {
+            return actualInvocations.get(actualInvocations.size() - 1).getStackTrace();
+        }
+    }
+}

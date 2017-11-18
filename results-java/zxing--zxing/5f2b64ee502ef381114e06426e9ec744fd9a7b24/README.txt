@@ -1,0 +1,7 @@
+commit 5f2b64ee502ef381114e06426e9ec744fd9a7b24
+Author: dswitkin <dswitkin@59b500cc-1b3d-0410-9834-0bbf25fbcc57>
+Date:   Mon Jun 22 15:50:08 2009 +0000
+
+    Used IntelliJ's amazing refactoring functions to change the argument ordering of ByteMatrix. I want to standardize this across ZXing: the first component should always be horizontal and the second vertical, whether supplying an x, y point or a width, height pair. Also, we should always use x and y as variables with x being the horizontal component to avoid confusion.
+
+    git-svn-id: https://zxing.googlecode.com/svn/trunk@975 59b500cc-1b3d-0410-9834-0bbf25fbcc57

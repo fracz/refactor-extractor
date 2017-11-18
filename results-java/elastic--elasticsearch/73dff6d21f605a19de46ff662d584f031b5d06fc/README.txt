@@ -1,0 +1,8 @@
+commit 73dff6d21f605a19de46ff662d584f031b5d06fc
+Author: Yannick Welsch <yannick@welsch.lu>
+Date:   Wed Aug 23 10:10:05 2017 +0930
+
+    Add workaround for Javadoc generation issues on JDK 9 b181
+
+    The javadoc tool on JDK 9 has issues with the combination of anonymous classes and varargs parameters.
+    This commit simply refactors a few anonymous classes to private inner classes.

@@ -1,0 +1,17 @@
+commit 462200278acc8e0224496a8f05ad3480dcdc679f
+Author: cpovirk <cpovirk@google.com>
+Date:   Mon Aug 10 10:51:43 2015 -0700
+
+    Suppress tests under Android.
+    - ByteStreamsTest.testNewDataOutput_writeChars may show a legitimate bug, whether in our code or in the Android library.
+    - CloserTest.testCreate looks up the JDK version. We should update this to look up the Android version if applicable.
+    - Android seems to have trouble with:
+      - nested test classes
+      - test classes without default constructors (which are necessarily constructed in suite() methods).
+
+    I've also improved some failure messages in ByteStreamsTest.
+
+    (Note that we don't actually run these tests on Android at HEAD. This will be changing soon.)
+    -------------
+    Created by MOE: http://code.google.com/p/moe-java
+    MOE_MIGRATED_REVID=100292134

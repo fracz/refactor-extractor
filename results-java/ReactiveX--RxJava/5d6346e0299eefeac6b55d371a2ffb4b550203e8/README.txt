@@ -1,0 +1,9 @@
+commit 5d6346e0299eefeac6b55d371a2ffb4b550203e8
+Author: Ben Christensen <benjchristensen@netflix.com>
+Date:   Thu Jan 31 13:04:44 2013 -0800
+
+    synchronization and contract refactoring
+
+    No longer will synchronization ever be added automatically. If synchronization is needed then the synchronize() operator should be used.
+    The AtomicObserver is added to Observables (but not internally trusted ones) to ensure compliance with the Rx contract and auto-unsubscribe. This should generally mean just 1 wrapper at the top of a sequence chain.
+    These changes are based on a discussion with Erik about how Rx 2.0 works in .Net.

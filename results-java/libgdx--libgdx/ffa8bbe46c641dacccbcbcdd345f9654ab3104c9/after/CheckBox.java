@@ -1,0 +1,73 @@
+
+package com.badlogic.gdx.scenes.scene2d.ui;
+
+import com.badlogic.gdx.graphics.Color;
+import com.badlogic.gdx.graphics.g2d.BitmapFont;
+import com.badlogic.gdx.graphics.g2d.SpriteBatch;
+import com.badlogic.gdx.graphics.g2d.TextureRegion;
+
+/** A checkbox is a button that contains an image indicating the checked or unchecked state and a label.
+ * @author Nathan Sweet */
+public class CheckBox extends Button {
+	private Image image;
+
+	public CheckBox (Skin skin) {
+		this("", skin);
+	}
+
+	public CheckBox (String text, CheckBoxStyle style) {
+		this(text, style, null);
+	}
+
+	public CheckBox (String text, Skin skin) {
+		this(text, skin.getStyle(CheckBoxStyle.class), null);
+	}
+
+	public CheckBox (String text, CheckBoxStyle style, String name) {
+		super(style, name);
+		add(image = new Image(style.checkboxOff));
+		Label label = new Label(text, style);
+		label.setAlignment(Align.CENTER);
+		add(label);
+		pack();
+	}
+
+	public void setStyle (ButtonStyle style) {
+		if (!(style instanceof CheckBoxStyle)) throw new IllegalArgumentException("Style must be a CheckBoxStyle.");
+		super.setStyle(style);
+		if (image != null) {
+			CheckBoxStyle checkBoxStyle = (CheckBoxStyle)style;
+			image.setRegion(isChecked ? checkBoxStyle.checkboxOn : checkBoxStyle.checkboxOff);
+		}
+	}
+
+	public CheckBoxStyle getStyle () {
+		return (CheckBoxStyle)super.getStyle();
+	}
+
+	public void draw (SpriteBatch batch, float parentAlpha) {
+		CheckBoxStyle style = (CheckBoxStyle)getStyle();
+		image.setRegion(isChecked ? style.checkboxOn : style.checkboxOff);
+		super.draw(batch, parentAlpha);
+	}
+
+	public Image getImage () {
+		return image;
+	}
+
+	/** The style for a select box, see {@link CheckBox}.
+	 * @author Nathan Sweet */
+	static public class CheckBoxStyle extends ButtonStyle {
+		public TextureRegion checkboxOn, checkboxOff;
+
+		public CheckBoxStyle () {
+		}
+
+		public CheckBoxStyle (TextureRegion checkboxOff, TextureRegion checkboxOn, BitmapFont font, Color fontColor) {
+			this.checkboxOff = checkboxOff;
+			this.checkboxOn = checkboxOn;
+			this.font = font;
+			this.fontColor = fontColor;
+		}
+	}
+}

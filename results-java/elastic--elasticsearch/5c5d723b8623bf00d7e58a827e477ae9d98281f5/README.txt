@@ -1,0 +1,11 @@
+commit 5c5d723b8623bf00d7e58a827e477ae9d98281f5
+Author: Luca Cavanna <javanna@users.noreply.github.com>
+Date:   Tue Jul 18 15:40:17 2017 +0200
+
+    Improve error message when aliases are not supported (#25728)
+
+    With #23997 and #25268 we have changed put alias, delete alias, update aliases and delete index to not accept aliases. Instead concrete indices should be provided as their index parameter.
+
+    This commit improves the error message in case aliases are provided, from an IndexNotFoundException (404 status code) with "no such index" message, to an IllegalArgumentException (400 status code) with "The provided expression [alias] matches an alias, specify the corresponding concrete indices instead." message.
+
+    Note that there is no specific error message for the case where wildcard expressions match one or more aliases. In fact, aliases are simply ignored when expanding wildcards for such APIs. An error is thrown only when the expression ends up matching no indices at all, and allow_no_indices is set to false. In that case the error is still the generic "404 - no such index".

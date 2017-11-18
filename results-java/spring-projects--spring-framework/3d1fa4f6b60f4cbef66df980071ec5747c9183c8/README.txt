@@ -1,0 +1,14 @@
+commit 3d1fa4f6b60f4cbef66df980071ec5747c9183c8
+Author: Rossen Stoyanchev <rstoyanchev@vmware.com>
+Date:   Tue Jan 31 22:10:55 2012 -0500
+
+    SPR-9060 Revise HTTP Session based FlashMapManager implementation.
+
+    The "default" FlashMapManager implementation added in 3.1 was invoked
+    after the redirect, which is too late in cases where the HTTP session
+    has not been yet been created since as the response is committed.
+
+    This change corrects the issue and makes other improvements to the
+    FlashMapManager implementation such as extracting a base
+    AbstractFlashMapManager class and making it easier for other
+    implementations to be added (for example cookie-based).

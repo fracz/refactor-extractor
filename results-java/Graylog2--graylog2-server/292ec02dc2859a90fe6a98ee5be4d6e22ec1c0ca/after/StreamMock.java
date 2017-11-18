@@ -1,0 +1,212 @@
+/**
+ * This file is part of Graylog.
+ *
+ * Graylog is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Graylog is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with Graylog.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+package org.graylog2.streams;
+
+import com.google.common.base.MoreObjects;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
+import org.graylog2.indexer.IndexSet;
+import org.graylog2.plugin.database.validators.Validator;
+import org.graylog2.plugin.streams.Output;
+import org.graylog2.plugin.streams.Stream;
+import org.graylog2.plugin.streams.StreamRule;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+
+import static com.google.common.base.MoreObjects.firstNonNull;
+
+public class StreamMock implements Stream {
+    private String id;
+    private String title;
+    private String description;
+    private boolean disabled;
+    private String contentPack;
+    private List<StreamRule> streamRules;
+    private MatchingType matchingType;
+    private boolean defaultStream;
+
+    public StreamMock(Map<String, Object> stream) {
+        this(stream, Collections.emptyList());
+    }
+
+    public StreamMock(Map<String, Object> stream, List<StreamRule> streamRules) {
+        this.id = stream.get("_id").toString();
+        this.title = (String) stream.get(StreamImpl.FIELD_TITLE);
+        this.description = (String) stream.get(StreamImpl.FIELD_DESCRIPTION);
+        if (stream.containsKey(StreamImpl.FIELD_DISABLED)) {
+            this.disabled = (boolean) stream.get(StreamImpl.FIELD_DISABLED);
+        }
+        this.contentPack = (String) stream.get(StreamImpl.FIELD_CONTENT_PACK);
+        this.streamRules = streamRules;
+        this.matchingType = firstNonNull((MatchingType) stream.get(StreamImpl.FIELD_MATCHING_TYPE), MatchingType.AND);
+        this.defaultStream = (boolean) firstNonNull(stream.get(StreamImpl.FIELD_DEFAULT_STREAM), false);
+    }
+
+    @Override
+    public String getId() {
+        return id;
+    }
+
+    @Override
+    public Map<String, Object> getFields() {
+        return Maps.newHashMap();
+    }
+
+    @Override
+    public Map<String, Validator> getValidations() {
+        return Maps.newHashMap();
+    }
+
+    @Override
+    public Map<String, Validator> getEmbeddedValidations(String key) {
+        return Maps.newHashMap();
+    }
+
+    @Override
+    public Map<String, Object> asMap() {
+        return Maps.newHashMap();
+    }
+
+    @Override
+    public String getTitle() {
+        return title;
+    }
+
+    @Override
+    public String getDescription() {
+        return description;
+    }
+
+    @Override
+    public Boolean getDisabled() {
+        return disabled;
+    }
+
+    @Override
+    public String getContentPack() {
+        return contentPack;
+    }
+
+    @Override
+    public void setTitle(String title) {
+        this.title = title;
+    }
+
+    @Override
+    public void setDescription(String description) {
+        this.description = description;
+    }
+
+    @Override
+    public void setDisabled(Boolean disabled) {
+        this.disabled = disabled;
+    }
+
+    @Override
+    public void setContentPack(String contentPack) {
+        this.contentPack = contentPack;
+    }
+
+    @Override
+    public Boolean isPaused() {
+        return getDisabled() != null ? getDisabled() : false;
+    }
+
+    @Override
+    public Map<String, List<String>> getAlertReceivers() {
+        return Maps.newHashMap();
+    }
+
+    @Override
+    public Map<String, Object> asMap(List<StreamRule> streamRules) {
+        return Maps.newHashMap();
+    }
+
+    @Override
+    public List<StreamRule> getStreamRules() {
+        return streamRules;
+    }
+
+    public void setStreamRules(List<StreamRule> streamRules) {
+        this.streamRules = streamRules;
+    }
+
+    @Override
+    public Set<Output> getOutputs() {
+        return Sets.newHashSet();
+    }
+
+
+    @Override
+    public MatchingType getMatchingType() {
+        return this.matchingType;
+    }
+
+    @Override
+    public void setMatchingType(MatchingType matchingType) {
+        this.matchingType = matchingType;
+    }
+
+    @Override
+    public boolean isDefaultStream() {
+        return defaultStream;
+    }
+
+    @Override
+    public void setDefaultStream(boolean defaultStream) {
+        this.defaultStream = defaultStream;
+    }
+
+    @Override
+    public String toString() {
+        return MoreObjects.toStringHelper(StreamMock.class)
+                .add("id", id)
+                .add("title", title)
+                .add("matchingType", matchingType)
+                .add("defaultStream", defaultStream)
+                .add("disabled", disabled)
+                .toString();
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        StreamMock that = (StreamMock) o;
+        return defaultStream == that.defaultStream &&
+                Objects.equals(id, that.id) &&
+                Objects.equals(title, that.title) &&
+                Objects.equals(description, that.description) &&
+                Objects.equals(streamRules, that.streamRules) &&
+                matchingType == that.matchingType;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(id, title, description, streamRules, matchingType, defaultStream);
+    }
+
+    @Override
+    public Set<IndexSet> getIndexSets() {
+        return Collections.emptySet();
+    }
+}

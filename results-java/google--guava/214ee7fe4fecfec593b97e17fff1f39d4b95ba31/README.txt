@@ -1,0 +1,25 @@
+commit 214ee7fe4fecfec593b97e17fff1f39d4b95ba31
+Author: kevinb@google.com <kevinb@google.com@8138a162-5c33-11de-8abc-d1c337b90d21>
+Date:   Fri Aug 27 23:56:13 2010 +0000
+
+    3 days of pent-up improvements:
+    - Make setException(null) throw NullPointerException instead of silently
+      setting the future to succeeded (with a result value of null).
+    - Remove unnecessary type parameter from transformExceptions() and its
+      implementation class.
+    - New ConcurrentHashMultiset factory method that takes a MapMaker. This allows
+      using soft/weak keys and expiration on the backing map.
+    - Turns out it's annoying to not know whether it's the key or value that was
+      null in an ImmutableMap.
+    - Tiny javadoc fixes, mostly concerning code snippets.
+    - Introduce a package-private Iterables.toArray(Iterable) method as a
+      GWT-compatible alternative to the public Iterables.toArray(Iterable, Class),
+      and achieve a marginally more efficient implementation of the GWT emulation
+      for ImmutableSet's Builder and copyOf methods.
+    - Make EnumBiMap and EnumHashBiMap GwtCompatible.
+
+    Revision created by MOE tool push_codebase.
+    MOE_MIGRATION=
+
+
+    git-svn-id: https://guava-libraries.googlecode.com/svn/trunk@94 8138a162-5c33-11de-8abc-d1c337b90d21

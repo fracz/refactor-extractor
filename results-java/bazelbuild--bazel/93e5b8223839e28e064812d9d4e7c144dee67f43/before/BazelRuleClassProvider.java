@@ -1,0 +1,318 @@
+// Copyright 2014 Google Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package com.google.devtools.build.lib.bazel.rules;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Functions;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.devtools.build.lib.analysis.BaseRuleClasses;
+import com.google.devtools.build.lib.analysis.ConfiguredRuleClassProvider;
+import com.google.devtools.build.lib.analysis.ConfiguredRuleClassProvider.PrerequisiteValidator;
+import com.google.devtools.build.lib.analysis.ConfiguredTarget;
+import com.google.devtools.build.lib.analysis.RuleContext;
+import com.google.devtools.build.lib.analysis.config.BuildConfiguration;
+import com.google.devtools.build.lib.analysis.config.BuildOptions;
+import com.google.devtools.build.lib.analysis.config.ConfigRuleClasses;
+import com.google.devtools.build.lib.analysis.config.ConfigurationEnvironment;
+import com.google.devtools.build.lib.analysis.config.FragmentOptions;
+import com.google.devtools.build.lib.analysis.config.InvalidConfigurationException;
+import com.google.devtools.build.lib.analysis.constraints.EnvironmentRule;
+import com.google.devtools.build.lib.bazel.rules.android.AndroidNdkRepositoryRule;
+import com.google.devtools.build.lib.bazel.rules.android.AndroidSdkRepositoryRule;
+import com.google.devtools.build.lib.bazel.rules.common.BazelActionListenerRule;
+import com.google.devtools.build.lib.bazel.rules.common.BazelExtraActionRule;
+import com.google.devtools.build.lib.bazel.rules.common.BazelFilegroupRule;
+import com.google.devtools.build.lib.bazel.rules.common.BazelTestSuiteRule;
+import com.google.devtools.build.lib.bazel.rules.cpp.BazelCppRuleClasses;
+import com.google.devtools.build.lib.bazel.rules.genrule.BazelGenRuleRule;
+import com.google.devtools.build.lib.bazel.rules.java.BazelJavaBinaryRule;
+import com.google.devtools.build.lib.bazel.rules.java.BazelJavaBuildInfoFactory;
+import com.google.devtools.build.lib.bazel.rules.java.BazelJavaImportRule;
+import com.google.devtools.build.lib.bazel.rules.java.BazelJavaLibraryRule;
+import com.google.devtools.build.lib.bazel.rules.java.BazelJavaPluginRule;
+import com.google.devtools.build.lib.bazel.rules.java.BazelJavaRuleClasses;
+import com.google.devtools.build.lib.bazel.rules.java.BazelJavaTestRule;
+import com.google.devtools.build.lib.bazel.rules.objc.BazelIosTestRule;
+import com.google.devtools.build.lib.bazel.rules.python.BazelPyBinaryRule;
+import com.google.devtools.build.lib.bazel.rules.python.BazelPyLibraryRule;
+import com.google.devtools.build.lib.bazel.rules.python.BazelPyRuleClasses;
+import com.google.devtools.build.lib.bazel.rules.python.BazelPyTestRule;
+import com.google.devtools.build.lib.bazel.rules.sh.BazelShBinaryRule;
+import com.google.devtools.build.lib.bazel.rules.sh.BazelShLibraryRule;
+import com.google.devtools.build.lib.bazel.rules.sh.BazelShRuleClasses;
+import com.google.devtools.build.lib.bazel.rules.sh.BazelShTestRule;
+import com.google.devtools.build.lib.bazel.rules.workspace.HttpArchiveRule;
+import com.google.devtools.build.lib.bazel.rules.workspace.HttpJarRule;
+import com.google.devtools.build.lib.bazel.rules.workspace.LocalRepositoryRule;
+import com.google.devtools.build.lib.bazel.rules.workspace.MavenJarRule;
+import com.google.devtools.build.lib.bazel.rules.workspace.NewHttpArchiveRule;
+import com.google.devtools.build.lib.bazel.rules.workspace.NewLocalRepositoryRule;
+import com.google.devtools.build.lib.bazel.rules.workspace.WorkspaceBaseRule;
+import com.google.devtools.build.lib.packages.Attribute;
+import com.google.devtools.build.lib.packages.PackageGroup;
+import com.google.devtools.build.lib.packages.Rule;
+import com.google.devtools.build.lib.packages.Target;
+import com.google.devtools.build.lib.rules.cpp.CcToolchainRule;
+import com.google.devtools.build.lib.rules.cpp.CppConfiguration;
+import com.google.devtools.build.lib.rules.cpp.CppConfigurationLoader;
+import com.google.devtools.build.lib.rules.cpp.CppOptions;
+import com.google.devtools.build.lib.rules.genquery.GenQueryRule;
+import com.google.devtools.build.lib.rules.java.JavaConfiguration;
+import com.google.devtools.build.lib.rules.java.JavaConfigurationLoader;
+import com.google.devtools.build.lib.rules.java.JavaCpuSupplier;
+import com.google.devtools.build.lib.rules.java.JavaImportBaseRule;
+import com.google.devtools.build.lib.rules.java.JavaOptions;
+import com.google.devtools.build.lib.rules.java.JavaToolchainRule;
+import com.google.devtools.build.lib.rules.java.Jvm;
+import com.google.devtools.build.lib.rules.java.JvmConfigurationLoader;
+import com.google.devtools.build.lib.rules.objc.ExperimentalIosTestRule;
+import com.google.devtools.build.lib.rules.objc.IosApplicationRule;
+import com.google.devtools.build.lib.rules.objc.IosDeviceRule;
+import com.google.devtools.build.lib.rules.objc.IosExtensionBinaryRule;
+import com.google.devtools.build.lib.rules.objc.IosExtensionRule;
+import com.google.devtools.build.lib.rules.objc.J2ObjcCommandLineOptions;
+import com.google.devtools.build.lib.rules.objc.J2ObjcConfiguration;
+import com.google.devtools.build.lib.rules.objc.ObjcBinaryRule;
+import com.google.devtools.build.lib.rules.objc.ObjcBuildInfoFactory;
+import com.google.devtools.build.lib.rules.objc.ObjcBundleLibraryRule;
+import com.google.devtools.build.lib.rules.objc.ObjcBundleRule;
+import com.google.devtools.build.lib.rules.objc.ObjcCommandLineOptions;
+import com.google.devtools.build.lib.rules.objc.ObjcConfigurationLoader;
+import com.google.devtools.build.lib.rules.objc.ObjcFrameworkRule;
+import com.google.devtools.build.lib.rules.objc.ObjcImportRule;
+import com.google.devtools.build.lib.rules.objc.ObjcLibraryRule;
+import com.google.devtools.build.lib.rules.objc.ObjcOptionsRule;
+import com.google.devtools.build.lib.rules.objc.ObjcProtoLibraryRule;
+import com.google.devtools.build.lib.rules.objc.ObjcRuleClasses;
+import com.google.devtools.build.lib.rules.objc.ObjcXcodeprojRule;
+import com.google.devtools.build.lib.rules.python.PythonConfigurationLoader;
+import com.google.devtools.build.lib.rules.python.PythonOptions;
+import com.google.devtools.build.lib.rules.workspace.BindRule;
+import com.google.devtools.build.lib.syntax.Label;
+import com.google.devtools.build.lib.syntax.SkylarkType;
+
+/**
+ * A rule class provider implementing the rules Bazel knows.
+ */
+public class BazelRuleClassProvider {
+
+  /**
+   * Used by the build encyclopedia generator.
+   */
+  public static ConfiguredRuleClassProvider create() {
+    ConfiguredRuleClassProvider.Builder builder =
+        new ConfiguredRuleClassProvider.Builder();
+    setup(builder);
+    return builder.build();
+  }
+
+  public static final JavaCpuSupplier JAVA_CPU_SUPPLIER = new JavaCpuSupplier() {
+    @Override
+    public String getJavaCpu(BuildOptions buildOptions, ConfigurationEnvironment env)
+        throws InvalidConfigurationException {
+      JavaOptions javaOptions = buildOptions.get(JavaOptions.class);
+      return javaOptions.javaCpu == null ? "default" : javaOptions.javaCpu;
+    }
+  };
+
+  private static class BazelPrerequisiteValidator implements PrerequisiteValidator {
+    @Override
+    public void validate(RuleContext.Builder context,
+        ConfiguredTarget prerequisite, Attribute attribute) {
+      validateDirectPrerequisiteVisibility(context, prerequisite, attribute.getName());
+    }
+
+    private void validateDirectPrerequisiteVisibility(
+        RuleContext.Builder context, ConfiguredTarget prerequisite, String attrName) {
+      Rule rule = context.getRule();
+      Target prerequisiteTarget = prerequisite.getTarget();
+      Label prerequisiteLabel = prerequisiteTarget.getLabel();
+      // We don't check the visibility of late-bound attributes, because it would break some
+      // features.
+      if (!context.getRule().getLabel().getPackageName().equals(
+              prerequisite.getTarget().getLabel().getPackageName())
+          && !context.isVisible(prerequisite)) {
+        if (!context.getConfiguration().checkVisibility()) {
+          context.ruleWarning(String.format("Target '%s' violates visibility of target "
+              + "'%s'. Continuing because --nocheck_visibility is active",
+              rule.getLabel(), prerequisiteLabel));
+        } else {
+          // Oddly enough, we use reportError rather than ruleError here.
+          context.reportError(rule.getLocation(),
+              String.format("Target '%s' is not visible from target '%s'. Check "
+                  + "the visibility declaration of the former target if you think "
+                  + "the dependency is legitimate",
+                  prerequisiteLabel, rule.getLabel()));
+        }
+      }
+
+      if (prerequisiteTarget instanceof PackageGroup) {
+        if (!attrName.equals("visibility")) {
+          context.reportError(rule.getAttributeLocation(attrName),
+              "in " + attrName + " attribute of " + rule.getRuleClass()
+              + " rule " + rule.getLabel() +  ": package group '"
+              + prerequisiteLabel + "' is misplaced here "
+              + "(they are only allowed in the visibility attribute)");
+        }
+      }
+    }
+  }
+
+  /**
+   * List of all build option classes in Blaze.
+   */
+  // TODO(bazel-team): make this private, remove from tests, then BuildOptions.of can be merged
+  // into RuleClassProvider.
+  @VisibleForTesting
+  @SuppressWarnings("unchecked")
+  public static final ImmutableList<Class<? extends FragmentOptions>> BUILD_OPTIONS =
+      ImmutableList.of(
+          BuildConfiguration.Options.class,
+          CppOptions.class,
+          JavaOptions.class,
+          PythonOptions.class,
+          ObjcCommandLineOptions.class,
+          J2ObjcCommandLineOptions.class
+      );
+
+  /**
+   * Java objects accessible from Skylark rule implementations using this module.
+   */
+  private static final ImmutableMap<String, SkylarkType> skylarkBuiltinJavaObects =
+      ImmutableMap.of(
+          "jvm", SkylarkType.of(Jvm.class),
+          "java_configuration", SkylarkType.of(JavaConfiguration.class),
+          "cpp", SkylarkType.of(CppConfiguration.class));
+
+  public static void setup(ConfiguredRuleClassProvider.Builder builder) {
+    builder
+        .addBuildInfoFactory(new BazelJavaBuildInfoFactory())
+        .addBuildInfoFactory(new ObjcBuildInfoFactory())
+        .setConfigurationCollectionFactory(new BazelConfigurationCollection())
+        .setPrerequisiteValidator(new BazelPrerequisiteValidator())
+        .setSkylarkAccessibleJavaClasses(skylarkBuiltinJavaObects);
+
+    for (Class<? extends FragmentOptions> fragmentOptions : BUILD_OPTIONS) {
+      builder.addConfigurationOptions(fragmentOptions);
+    }
+
+    builder.addRuleDefinition(new WorkspaceBaseRule());
+
+    builder.addRuleDefinition(new BaseRuleClasses.BaseRule());
+    builder.addRuleDefinition(new BaseRuleClasses.RuleBase());
+    builder.addRuleDefinition(new BazelBaseRuleClasses.BinaryBaseRule());
+    builder.addRuleDefinition(new BaseRuleClasses.TestBaseRule());
+    builder.addRuleDefinition(new BazelBaseRuleClasses.ErrorRule());
+
+    builder.addRuleDefinition(new EnvironmentRule());
+
+    builder.addRuleDefinition(new ConfigRuleClasses.ConfigBaseRule());
+    builder.addRuleDefinition(new ConfigRuleClasses.ConfigSettingRule());
+
+    builder.addRuleDefinition(new BazelFilegroupRule());
+    builder.addRuleDefinition(new BazelTestSuiteRule());
+    builder.addRuleDefinition(new BazelGenRuleRule());
+    builder.addRuleDefinition(new GenQueryRule());
+
+    builder.addRuleDefinition(new BazelShRuleClasses.ShRule());
+    builder.addRuleDefinition(new BazelShLibraryRule());
+    builder.addRuleDefinition(new BazelShBinaryRule());
+    builder.addRuleDefinition(new BazelShTestRule());
+
+    builder.addRuleDefinition(new CcToolchainRule());
+    builder.addRuleDefinition(new BazelCppRuleClasses.CcLinkingRule());
+    builder.addRuleDefinition(new BazelCppRuleClasses.CcDeclRule());
+    builder.addRuleDefinition(new BazelCppRuleClasses.CcBaseRule());
+    builder.addRuleDefinition(new BazelCppRuleClasses.CcRule());
+    builder.addRuleDefinition(new BazelCppRuleClasses.CcBinaryBaseRule());
+    builder.addRuleDefinition(new BazelCppRuleClasses.CcBinaryRule());
+    builder.addRuleDefinition(new BazelCppRuleClasses.CcTestRule());
+    builder.addRuleDefinition(new BazelCppRuleClasses.CcLibraryBaseRule());
+    builder.addRuleDefinition(new BazelCppRuleClasses.CcLibraryRule());
+
+    builder.addRuleDefinition(new BazelPyRuleClasses.PyBaseRule());
+    builder.addRuleDefinition(new BazelPyRuleClasses.PyBinaryBaseRule());
+    builder.addRuleDefinition(new BazelPyLibraryRule());
+    builder.addRuleDefinition(new BazelPyBinaryRule());
+    builder.addRuleDefinition(new BazelPyTestRule());
+
+    builder.addWorkspaceFile(BazelJavaRuleClasses.getDefaultWorkspace());
+    builder.addRuleDefinition(new BazelJavaRuleClasses.BaseJavaBinaryRule());
+    builder.addRuleDefinition(new BazelJavaRuleClasses.IjarBaseRule());
+    builder.addRuleDefinition(new BazelJavaRuleClasses.JavaBaseRule());
+    builder.addRuleDefinition(new JavaImportBaseRule());
+    builder.addRuleDefinition(new BazelJavaRuleClasses.JavaRule());
+    builder.addRuleDefinition(new BazelJavaBinaryRule());
+    builder.addRuleDefinition(new BazelJavaLibraryRule());
+    builder.addRuleDefinition(new BazelJavaImportRule());
+    builder.addRuleDefinition(new BazelJavaTestRule());
+    builder.addRuleDefinition(new BazelJavaPluginRule());
+    builder.addRuleDefinition(new JavaToolchainRule());
+
+    builder.addRuleDefinition(new BazelIosTestRule());
+    builder.addRuleDefinition(new ExperimentalIosTestRule());
+    builder.addRuleDefinition(new IosDeviceRule());
+    builder.addRuleDefinition(new ObjcBinaryRule());
+    builder.addRuleDefinition(new ObjcBundleRule());
+    builder.addRuleDefinition(new ObjcBundleLibraryRule());
+    builder.addRuleDefinition(new ObjcFrameworkRule());
+    builder.addRuleDefinition(new ObjcImportRule());
+    builder.addRuleDefinition(new ObjcLibraryRule());
+    builder.addRuleDefinition(new ObjcOptionsRule());
+    builder.addRuleDefinition(new ObjcProtoLibraryRule());
+    builder.addRuleDefinition(new ObjcXcodeprojRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.CoptsRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.ObjcProtoRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.IosTestBaseRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.BundlingRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.ReleaseBundlingRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.SimulatorRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.CompilingRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.LinkingRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.ResourcesRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.XcodegenRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.AlwaysLinkRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.OptionsRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.SdkFrameworksDependerRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.CompileDependencyRule());
+    builder.addRuleDefinition(new ObjcRuleClasses.ResourceToolsRule());
+    builder.addRuleDefinition(new IosApplicationRule());
+    builder.addRuleDefinition(new IosExtensionBinaryRule());
+    builder.addRuleDefinition(new IosExtensionRule());
+
+    builder.addRuleDefinition(new BazelExtraActionRule());
+    builder.addRuleDefinition(new BazelActionListenerRule());
+
+    builder.addRuleDefinition(new BindRule());
+    builder.addRuleDefinition(new HttpArchiveRule());
+    builder.addRuleDefinition(new HttpJarRule());
+    builder.addRuleDefinition(new LocalRepositoryRule());
+    builder.addRuleDefinition(new MavenJarRule());
+    builder.addRuleDefinition(new NewHttpArchiveRule());
+    builder.addRuleDefinition(new NewLocalRepositoryRule());
+    builder.addRuleDefinition(new AndroidSdkRepositoryRule());
+    builder.addRuleDefinition(new AndroidNdkRepositoryRule());
+
+    builder.addConfigurationFragment(new BazelConfiguration.Loader());
+    builder.addConfigurationFragment(new CppConfigurationLoader(
+        Functions.<String>identity()));
+    builder.addConfigurationFragment(new PythonConfigurationLoader(Functions.<String>identity()));
+    builder.addConfigurationFragment(new JvmConfigurationLoader(JAVA_CPU_SUPPLIER));
+    builder.addConfigurationFragment(new JavaConfigurationLoader(JAVA_CPU_SUPPLIER));
+    builder.addConfigurationFragment(new ObjcConfigurationLoader());
+    builder.addConfigurationFragment(new J2ObjcConfiguration.Loader());
+  }
+}

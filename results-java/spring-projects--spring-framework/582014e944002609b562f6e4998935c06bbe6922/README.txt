@@ -1,0 +1,25 @@
+commit 582014e944002609b562f6e4998935c06bbe6922
+Author: Brian Clozel <bclozel@pivotal.io>
+Date:   Thu Aug 24 19:35:16 2017 +0200
+
+    Support HTTP range requests in MVC Controllers
+
+    Prior to this commit, HTTP Range requests were only supported by the
+    ResourceHttpRequestHandler when serving static resources.
+
+    This commit improves the `HttpEntityMethodProcessor` and
+    the `RequestResponseBodyMethodProcessor`. They now extract
+    `ResourceRegion`s from the `Resource` instance returned by the
+    Controller and let the Resource-related message converters
+    handle the writing of the resource (including partial writes).
+
+    Controller methods can now handle Range requests for
+    return types that extend Resource or HttpEntity:
+
+        @RequestMapping("/example/video.mp4")
+        public Resource handler() { }
+
+        @RequestMapping("/example/video.mp4")
+        public HttpEntity<Resource> handler() { }
+
+    Issue: SPR-15789, SPR-13834

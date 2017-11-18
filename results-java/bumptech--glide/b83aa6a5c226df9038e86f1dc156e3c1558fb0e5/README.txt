@@ -1,0 +1,33 @@
+commit b83aa6a5c226df9038e86f1dc156e3c1558fb0e5
+Author: niloc <niloc@google.com>
+Date:   Thu Jul 30 16:24:34 2015 -0700
+
+    Rollforward of []
+    Added use of byte arrays and int arrays to glide gif decoding to improve performance on <L devices. Created general ArrayPool that allows pooling of any array type with a corresponding adapter interface. Follow up CL will replace ByteArrayPool with ArrayPool<byte[]> in Glide.
+
+    NEW: Fixed import for VisibleForTesting annotation
+
+    Automated g4 rollback of changelist 99520837.
+
+    *** Reason for rollback ***
+
+    Fixed VisibleForTesting import issue
+
+    *** Original change description ***
+
+    Automated g4 rollback of changelist 99517599.
+
+    *** Reason for rollback ***
+
+    VisibleForTesting annotation causing build failure
+
+    *** Original change description ***
+
+    Added use of byte arrays and int arrays to glide gif decoding to improve performance on <L devices. Created general ArrayPool that allows pooling of any array type with a corresponding adapter interface. Follow up CL will replace ByteArrayPool with ArrayPool<byte[]> in Glide.
+
+    ***
+
+    ***
+    -------------
+    Created by MOE: http://code.google.com/p/moe-java
+    MOE_MIGRATED_REVID=99524860

@@ -1,0 +1,23 @@
+commit 2e51b48cd9ad9ad3e599aa0cb0b916061a061dfa
+Author: Phillip Webb <pwebb@pivotal.io>
+Date:   Thu Aug 31 22:19:44 2017 -0700
+
+    Refactor actuator package locations
+
+    Restructure actuator packages to improve structure. The following
+    changes have been made:
+
+     - Separate actuator and actuator auto-configuration into different
+       modules.
+     - Move endpoint code into `spring-boot-actuator`.
+     - Move `Endpoint` implementations from a single package into
+       technology specific packages.
+     - Move `HealthIndicator` implementations from a single package into
+       technology specific packages.
+     - As much as possible attempt to mirror the `spring-boot` package
+       structure and class naming in `spring-boot-actuator` and
+       `spring-boot-actuator-autoconfigure`.
+     - Move `DataSourceBuilder` and DataSource meta-data support from
+       `spring-boot-actuator` to `spring-boot`.
+
+    Fixes gh-10261

@@ -1,0 +1,150 @@
+/**
+ * Copyright 2014 Nikita Koksharov, Nickolay Borbit
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.redisson.connection;
+
+import java.net.URI;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Semaphore;
+
+import org.redisson.Config;
+import org.redisson.codec.RedisCodecWrapper;
+
+import com.lambdaworks.redis.RedisClient;
+import com.lambdaworks.redis.RedisConnection;
+import com.lambdaworks.redis.codec.RedisCodec;
+import com.lambdaworks.redis.pubsub.RedisPubSubAdapter;
+import com.lambdaworks.redis.pubsub.RedisPubSubConnection;
+import com.lambdaworks.redis.pubsub.RedisPubSubListener;
+
+/**
+ *
+ * @author Nikita Koksharov
+ *
+ */
+//TODO ping support
+//TODO multi addresses support
+public class ConnectionManager {
+
+    public static class PubSubEntry {
+
+        private final Semaphore semaphore;
+        private final RedisPubSubConnection conn;
+        private final int subscriptionsPerConnection;
+
+        public PubSubEntry(RedisPubSubConnection conn, int subscriptionsPerConnection) {
+            super();
+            this.conn = conn;
+            this.subscriptionsPerConnection = subscriptionsPerConnection;
+            this.semaphore = new Semaphore(subscriptionsPerConnection);
+        }
+
+        public void addListener(RedisPubSubListener listener) {
+            conn.addListener(listener);
+        }
+
+        public void removeListener(RedisPubSubListener listener) {
+            conn.removeListener(listener);
+        }
+
+        public boolean subscribe(RedisPubSubAdapter listener, Object channel) {
+            if (semaphore.tryAcquire()) {
+                conn.addListener(listener);
+                conn.subscribe(channel);
+                return true;
+            }
+            return false;
+        }
+
+        public void unsubscribe(Object channel) {
+            conn.unsubscribe(channel);
+            semaphore.release();
+        }
+
+        public boolean tryClose() {
+            if (semaphore.tryAcquire(subscriptionsPerConnection)) {
+                conn.close();
+                return true;
+            }
+            return false;
+        }
+
+    }
+
+    private final Queue<RedisConnection> connections = new ConcurrentLinkedQueue<RedisConnection>();
+    private final Queue<PubSubEntry> pubSubConnections = new ConcurrentLinkedQueue<PubSubEntry>();
+
+    private final Semaphore activeConnections;
+    private final RedisClient redisClient;
+    private final RedisCodec codec;
+    private final Config config;
+
+    public ConnectionManager(Config config) {
+        URI address = config.getAddresses().iterator().next();
+        redisClient = new RedisClient(address.getHost(), address.getPort());
+        codec = new RedisCodecWrapper(config.getCodec());
+        activeConnections = new Semaphore(config.getConnectionPoolSize());
+        this.config = config;
+    }
+
+    public <K, V> RedisConnection<K, V> acquireConnection() {
+        activeConnections.acquireUninterruptibly();
+        RedisConnection<K, V> conn = connections.poll();
+        if (conn == null) {
+            conn = redisClient.connect(codec);
+            if (config.getPassword() != null) {
+                conn.auth(config.getPassword());
+            }
+        }
+        return conn;
+    }
+
+    public <K, V> PubSubEntry subscribe(RedisPubSubAdapter<K, V> listener, K channel) {
+        for (PubSubEntry entry : pubSubConnections) {
+            if (entry.subscribe(listener, channel)) {
+                return entry;
+            }
+        }
+
+        activeConnections.acquireUninterruptibly();
+        RedisPubSubConnection<K, V> conn = redisClient.connectPubSub(codec);
+        if (config.getPassword() != null) {
+            conn.auth(config.getPassword());
+        }
+        PubSubEntry entry = new PubSubEntry(conn, config.getSubscriptionsPerConnection());
+        entry.subscribe(listener, channel);
+        pubSubConnections.add(entry);
+        return entry;
+    }
+
+    public <K> void unsubscribe(PubSubEntry entry, K channel) {
+        entry.unsubscribe(channel);
+        if (entry.tryClose()) {
+            pubSubConnections.remove(entry);
+            activeConnections.release();
+        }
+    }
+
+    public void release(RedisConnection сonnection) {
+        activeConnections.release();
+        connections.add(сonnection);
+    }
+
+    public void shutdown() {
+        redisClient.shutdown();
+    }
+
+}

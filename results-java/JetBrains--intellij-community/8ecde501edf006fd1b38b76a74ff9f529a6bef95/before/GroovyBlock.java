@@ -1,0 +1,260 @@
+/*
+ * Copyright 2000-2011 JetBrains s.r.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.jetbrains.plugins.groovy.formatter;
+
+import com.intellij.formatting.*;
+import com.intellij.lang.ASTNode;
+import com.intellij.openapi.util.TextRange;
+import com.intellij.psi.PsiComment;
+import com.intellij.psi.PsiElement;
+import com.intellij.psi.PsiErrorElement;
+import com.intellij.psi.PsiWhiteSpace;
+import com.intellij.psi.codeStyle.CommonCodeStyleSettings;
+import com.intellij.psi.tree.ILazyParseableElementType;
+import com.intellij.util.containers.CollectionFactory;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.plugins.groovy.formatter.processors.GroovyIndentProcessor;
+import org.jetbrains.plugins.groovy.formatter.processors.GroovySpacingProcessor;
+import org.jetbrains.plugins.groovy.formatter.processors.GroovySpacingProcessorBasic;
+import org.jetbrains.plugins.groovy.lang.groovydoc.psi.api.GrDocComment;
+import org.jetbrains.plugins.groovy.lang.groovydoc.psi.api.GrDocTag;
+import org.jetbrains.plugins.groovy.lang.parser.GroovyElementTypes;
+import org.jetbrains.plugins.groovy.lang.psi.GroovyFileBase;
+import org.jetbrains.plugins.groovy.lang.psi.api.auxiliary.GrListOrMap;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.*;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.arguments.GrArgumentList;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.branch.GrBreakStatement;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.branch.GrContinueStatement;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.branch.GrReturnStatement;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.branch.GrThrowStatement;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.clauses.GrCaseSection;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.expressions.GrAssignmentExpression;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.expressions.GrBinaryExpression;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.expressions.GrCommandArgumentList;
+import org.jetbrains.plugins.groovy.lang.psi.api.statements.params.GrParameterList;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Block implementation for Groovy formatter
+ *
+ * @author ilyas
+ */
+public class GroovyBlock implements Block, GroovyElementTypes, ASTBlock {
+
+  final protected ASTNode myNode;
+  final protected Alignment myAlignment;
+  final protected Indent myIndent;
+  final protected Wrap myWrap;
+  final protected CommonCodeStyleSettings mySettings;
+  final protected GroovyCodeStyleSettings myGroovySettings;
+  final protected Map<PsiElement, Alignment> myInnerAlignments;
+
+  protected List<Block> mySubBlocks = null;
+
+  public GroovyBlock(@NotNull final ASTNode node,
+                     @Nullable final Alignment alignment,
+                     @NotNull final Indent indent,
+                     @Nullable final Wrap wrap,
+                     final CommonCodeStyleSettings settings,
+                     GroovyCodeStyleSettings groovySettings
+                    ) {
+    this(node, alignment, indent, wrap, settings, groovySettings, CollectionFactory.<PsiElement, Alignment>hashMap());
+  }
+
+  public GroovyBlock(@NotNull final ASTNode node,
+                     @Nullable Alignment alignment,
+                     @NotNull final Indent indent,
+                     @Nullable final Wrap wrap,
+                     final CommonCodeStyleSettings settings,
+                     GroovyCodeStyleSettings groovySettings,
+                     @NotNull Map<PsiElement, Alignment> innerAlignments) {
+    myNode = node;
+    if (groovySettings.USE_FLYING_GEESE_BRACES && isLeaf()) {
+      PsiElement psi = myNode.getPsi();
+      if (alignment == null) alignment = innerAlignments.get(psi);
+      if (alignment == null) alignment = Alignment.createAlignment(true);
+
+      myAlignment = alignment;
+      innerAlignments.put(psi, myAlignment);
+    }
+    else {
+      myAlignment = alignment;
+    }
+
+
+    myIndent = indent;
+    myWrap = wrap;
+    mySettings = settings;
+    myGroovySettings = groovySettings;
+    myInnerAlignments = innerAlignments;
+  }
+
+  @NotNull
+  public ASTNode getNode() {
+    return myNode;
+  }
+
+  @NotNull
+  public CommonCodeStyleSettings getSettings() {
+    return mySettings;
+  }
+
+  @NotNull
+  public TextRange getTextRange() {
+    return myNode.getTextRange();
+  }
+
+  @NotNull
+  public List<Block> getSubBlocks() {
+    if (mySubBlocks == null) {
+      mySubBlocks = GroovyBlockGenerator.generateSubBlocks(myNode, myAlignment, myWrap, mySettings, myGroovySettings, this);
+    }
+    return mySubBlocks;
+  }
+
+  @Nullable
+  public Wrap getWrap() {
+    return myWrap;
+  }
+
+  @Nullable
+  public Indent getIndent() {
+    return myIndent;
+  }
+
+  @Nullable
+  public Alignment getAlignment() {
+    return myAlignment;
+  }
+
+  /**
+   * Returns spacing between neighbour elements
+   *
+   * @param child1 left element
+   * @param child2 right element
+   * @return
+   */
+  @Nullable
+  public Spacing getSpacing(Block child1, Block child2) {
+    if ((child1 instanceof GroovyBlock) && (child2 instanceof GroovyBlock)) {
+      if (((GroovyBlock)child1).getNode() == ((GroovyBlock)child2).getNode()) {
+        return Spacing.getReadOnlySpacing();
+      }
+
+      Spacing spacing = new GroovySpacingProcessor(((GroovyBlock)child2).getNode(), mySettings, myGroovySettings).getSpacing();
+      return spacing != null ? spacing : GroovySpacingProcessorBasic.getSpacing(((GroovyBlock)child1), ((GroovyBlock)child2), mySettings);
+    }
+    return null;
+  }
+
+  @NotNull
+  public ChildAttributes getChildAttributes(final int newChildIndex) {
+    ASTNode astNode = getNode();
+    final PsiElement psiParent = astNode.getPsi();
+    if (psiParent instanceof GroovyFileBase) {
+      return new ChildAttributes(Indent.getNoneIndent(), null);
+    }
+    if (psiParent instanceof GrSwitchStatement) {
+      List<Block> subBlocks = getSubBlocks();
+      if (newChildIndex > 0) {
+        Block block = subBlocks.get(newChildIndex - 1);
+        if (block instanceof GroovyBlock) {
+          PsiElement anchorPsi = ((GroovyBlock)block).getNode().getPsi();
+          if (anchorPsi instanceof GrCaseSection) {
+            for (GrStatement statement : ((GrCaseSection)anchorPsi).getStatements()) {
+              if (statement instanceof GrBreakStatement ||
+                  statement instanceof GrContinueStatement ||
+                  statement instanceof GrReturnStatement ||
+                  statement instanceof GrThrowStatement) {
+                return new ChildAttributes(GroovyIndentProcessor.getSwitchCaseIndent(anchorPsi), null);
+              }
+            }
+            @SuppressWarnings("ConstantConditions")
+            int indentSize = mySettings.getIndentOptions().INDENT_SIZE;
+            return new ChildAttributes(Indent.getSpaceIndent(mySettings.INDENT_CASE_FROM_SWITCH ? 2 * indentSize : indentSize), null);
+          }
+        }
+      }
+    }
+
+    if (BLOCK_SET.contains(astNode.getElementType()) ||
+        SWITCH_STATEMENT.equals(astNode.getElementType())) {
+//      PsiElement psi = ((GroovyBlock)getSubBlocks().get(newChildIndex)).getNode().getPsi();
+ //     if (GeeseUtil.isClosureRBrace(psi)) {
+   //     return new ChildAttributes(Indent.getNoneIndent(), GeeseUtil.calculateRBraceAlignment(psi, myInnerAlignments));
+    //  }
+
+      return new ChildAttributes(Indent.getNormalIndent(), null);
+    }
+    if (CASE_SECTION.equals(astNode.getElementType())) {
+      return new ChildAttributes(Indent.getNormalIndent(), null);
+    }
+    if (psiParent instanceof GrBinaryExpression ||
+        psiParent instanceof GrCommandArgumentList ||
+        psiParent instanceof GrArgumentList) {
+      return new ChildAttributes(Indent.getContinuationWithoutFirstIndent(), null);
+    }
+    if (psiParent instanceof GrParameterList) {
+      return new ChildAttributes(this.getIndent(), this.getAlignment());
+    }
+    if (psiParent instanceof GrListOrMap) {
+      return new ChildAttributes(Indent.getContinuationIndent(), null);
+    }
+    if (psiParent instanceof GrDocComment || psiParent instanceof GrDocTag) {
+      return new ChildAttributes(Indent.getSpaceIndent(GroovyIndentProcessor.GDOC_COMMENT_INDENT), null);
+    }
+    if (psiParent instanceof GrVariable || psiParent instanceof GrAssignmentExpression) {
+      return new ChildAttributes(Indent.getNormalIndent(), null);
+    }
+    if (psiParent instanceof GrIfStatement || psiParent instanceof GrLoopStatement) {
+      return new ChildAttributes(Indent.getNormalIndent(), null);
+    }
+    return new ChildAttributes(Indent.getNoneIndent(), null);
+  }
+
+
+  public boolean isIncomplete() {
+    return isIncomplete(myNode);
+  }
+
+  /**
+   * @param node Tree node
+   * @return true if node is incomplete
+   */
+  public static boolean isIncomplete(@NotNull final ASTNode node) {
+    if (node.getElementType() instanceof ILazyParseableElementType) return false;
+    ASTNode lastChild = node.getLastChildNode();
+    while (lastChild != null &&
+        !(lastChild.getElementType() instanceof ILazyParseableElementType) &&
+        (lastChild.getPsi() instanceof PsiWhiteSpace || lastChild.getPsi() instanceof PsiComment)) {
+      lastChild = lastChild.getTreePrev();
+    }
+    return lastChild != null && (lastChild.getPsi() instanceof PsiErrorElement || isIncomplete(lastChild));
+  }
+
+  public boolean isLeaf() {
+    return myNode.getFirstChildNode() == null;
+  }
+
+  @Override
+  public String toString() {
+    return getTextRange() + ": " + myNode;
+  }
+}

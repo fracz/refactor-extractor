@@ -1,0 +1,305 @@
+/*
+ * Copyright 2000-2011 JetBrains s.r.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.intellij.psi.impl.file;
+
+import com.intellij.codeInsight.completion.scope.JavaCompletionHints;
+import com.intellij.lang.Language;
+import com.intellij.lang.java.JavaLanguage;
+import com.intellij.navigation.ItemPresentation;
+import com.intellij.navigation.ItemPresentationProviders;
+import com.intellij.openapi.ui.Queryable;
+import com.intellij.openapi.util.Condition;
+import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.psi.*;
+import com.intellij.psi.impl.JavaPsiFacadeImpl;
+import com.intellij.psi.impl.source.tree.java.PsiCompositeModifierList;
+import com.intellij.psi.scope.ElementClassHint;
+import com.intellij.psi.scope.NameHint;
+import com.intellij.psi.scope.PsiScopeProcessor;
+import com.intellij.psi.search.GlobalSearchScope;
+import com.intellij.psi.util.*;
+import com.intellij.util.CommonProcessors;
+import com.intellij.util.containers.ContainerUtil;
+import org.jetbrains.annotations.NonNls;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Set;
+
+public class PsiPackageImpl extends PsiPackageBase implements PsiPackage, Queryable {
+  private volatile CachedValue<PsiModifierList> myAnnotationList;
+  private volatile CachedValue<Collection<PsiDirectory>> myDirectories;
+  private volatile Set<String> myPublicClassNamesCache;
+  private final Object myPublicClassNamesCacheLock = new String("package class names cache lock");
+
+  public PsiPackageImpl(PsiManager manager, String qualifiedName) {
+    super(manager, qualifiedName);
+  }
+
+  protected Collection<PsiDirectory> getAllDirectories() {
+    if (myDirectories == null) {
+      myDirectories = CachedValuesManager.getManager(myManager.getProject()).createCachedValue(new CachedValueProvider<Collection<PsiDirectory>>() {
+        public Result<Collection<PsiDirectory>> compute() {
+          final CommonProcessors.CollectProcessor<PsiDirectory> processor = new CommonProcessors.CollectProcessor<PsiDirectory>();
+          getFacade().processPackageDirectories(PsiPackageImpl.this, allScope(), processor);
+          return Result.create(processor.getResults(), PsiPackageImplementationHelper.getInstance().getDirectoryCachedValueDependencies(
+            PsiPackageImpl.this));
+        }
+      }, false);
+    }
+    return myDirectories.getValue();
+  }
+
+  @Override
+  protected PsiElement findPackage(String qName) {
+    return getFacade().findPackage(qName);
+  }
+
+  public void handleQualifiedNameChange(@NotNull final String newQualifiedName) {
+    PsiPackageImplementationHelper.getInstance().handleQualifiedNameChange(this, newQualifiedName);
+  }
+
+  public VirtualFile[] occursInPackagePrefixes() {
+    return PsiPackageImplementationHelper.getInstance().occursInPackagePrefixes(this);
+  }
+
+  @Override
+  public PsiPackageImpl getParentPackage() {
+    return (PsiPackageImpl)super.getParentPackage();
+  }
+
+
+  @Override
+  protected PsiPackageImpl createInstance(PsiManager manager, String qName) {
+    return new PsiPackageImpl(myManager, qName);
+  }
+
+  @NotNull
+  public Language getLanguage() {
+    return JavaLanguage.INSTANCE;
+  }
+
+  public boolean isValid() {
+    final CommonProcessors.FindFirstProcessor<PsiDirectory> processor = new CommonProcessors.FindFirstProcessor<PsiDirectory>();
+    getFacade().processPackageDirectories(this, allScope(), processor);
+    return processor.getFoundValue() != null || PsiPackageImplementationHelper.getInstance().packagePrefixExists(this);
+  }
+
+  public void accept(@NotNull PsiElementVisitor visitor) {
+    if (visitor instanceof JavaElementVisitor) {
+      ((JavaElementVisitor)visitor).visitPackage(this);
+    }
+    else {
+      visitor.visitElement(this);
+    }
+  }
+
+  public String toString() {
+    return "PsiPackage:" + getQualifiedName();
+  }
+
+  @NotNull
+  public PsiClass[] getClasses() {
+    return getClasses(allScope());
+  }
+
+  protected GlobalSearchScope allScope() {
+    return PsiPackageImplementationHelper.getInstance().adjustAllScope(this, GlobalSearchScope.allScope(getProject()));
+  }
+
+  @NotNull
+  public PsiClass[] getClasses(@NotNull GlobalSearchScope scope) {
+    return getFacade().getClasses(this, scope);
+  }
+
+  @Nullable
+  public PsiModifierList getAnnotationList() {
+    if (myAnnotationList == null) {
+      myAnnotationList = CachedValuesManager.getManager(myManager.getProject()).createCachedValue(new PackageAnnotationValueProvider());
+    }
+    return myAnnotationList.getValue();
+  }
+
+  @NotNull
+  public PsiPackage[] getSubPackages() {
+    return getSubPackages(allScope());
+  }
+
+  @NotNull
+  public PsiPackage[] getSubPackages(@NotNull GlobalSearchScope scope) {
+    return getFacade().getSubPackages(this, scope);
+  }
+
+  private JavaPsiFacadeImpl getFacade() {
+    return (JavaPsiFacadeImpl)JavaPsiFacade.getInstance(myManager.getProject());
+  }
+
+  private Set<String> getClassNamesCache() {
+    if (myPublicClassNamesCache == null) {
+      Set<String> classNames = getFacade().getClassNames(this, allScope());
+      synchronized (myPublicClassNamesCacheLock) {
+        myPublicClassNamesCache = classNames;
+      }
+    }
+
+    return myPublicClassNamesCache;
+  }
+
+  @NotNull
+  private PsiClass[] findClassesByName(String name, GlobalSearchScope scope) {
+    final String qName = getQualifiedName();
+    final String classQName = qName.length() > 0 ? qName + "." + name : name;
+    return getFacade().findClasses(classQName, scope);
+  }
+
+  @Override
+  public boolean containsClassNamed(String name) {
+    return getClassNamesCache().contains(name);
+  }
+
+  @Nullable
+  private PsiPackage findSubPackageByName(String name) {
+    final String qName = getQualifiedName();
+    final String subpackageQName = qName.length() > 0 ? qName + "." + name : name;
+    PsiPackage aPackage = getFacade().findPackage(subpackageQName);
+    if (aPackage == null) return null;
+    //if (aPackage.getDirectories(scope).length == 0) return null;
+    return aPackage;
+  }
+
+  public boolean processDeclarations(@NotNull PsiScopeProcessor processor,
+                                     @NotNull ResolveState state,
+                                     PsiElement lastParent,
+                                     @NotNull PsiElement place) {
+    GlobalSearchScope scope = place.getResolveScope();
+
+    processor.handleEvent(PsiScopeProcessor.Event.SET_DECLARATION_HOLDER, this);
+    ElementClassHint classHint = processor.getHint(ElementClassHint.KEY);
+
+    final JavaPsiFacadeImpl facade = getFacade();
+    final Condition<String> prefixMatcher = processor.getHint(JavaCompletionHints.NAME_FILTER);
+
+    if (classHint == null || classHint.shouldProcess(ElementClassHint.DeclarationKind.CLASS)) {
+      NameHint nameHint = processor.getHint(NameHint.KEY);
+      if (nameHint != null) {
+        final String shortName = nameHint.getName(state);
+        if (containsClassNamed(shortName) && processClassesByName(processor, state, place, scope, shortName)) return false;
+      }
+      else if (prefixMatcher != null) {
+        for (String className : getClassNamesCache()) {
+          if (prefixMatcher.value(className)) {
+            if (processClassesByName(processor, state, place, scope, className)) return false;
+          }
+        }
+      }
+      else {
+        PsiClass[] classes = getClasses(scope);
+        if (!processClasses(processor, state, classes)) return false;
+      }
+    }
+    if (classHint == null || classHint.shouldProcess(ElementClassHint.DeclarationKind.PACKAGE)) {
+      NameHint nameHint = processor.getHint(NameHint.KEY);
+      if (nameHint != null) {
+        PsiPackage aPackage = findSubPackageByName(nameHint.getName(state));
+        if (aPackage != null) {
+          if (!processor.execute(aPackage, state)) return false;
+        }
+      }
+      else {
+        PsiPackage[] packs = getSubPackages(scope);
+        for (PsiPackage pack : packs) {
+          final String packageName = pack.getName();
+          if (packageName == null) continue;
+          if (!facade.getNameHelper().isIdentifier(packageName, PsiUtil.getLanguageLevel(this))) {
+            continue;
+          }
+          if (!processor.execute(pack, state)) {
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  private boolean processClassesByName(PsiScopeProcessor processor, ResolveState state, PsiElement place, GlobalSearchScope scope, String className) {
+    final PsiClass[] classes = findClassesByName(className, scope);
+    return !processClasses(processor, state, classes);
+  }
+
+  private static boolean processClasses(PsiScopeProcessor processor, ResolveState state, PsiClass[] classes) {
+    for (PsiClass aClass : classes) {
+      if (!processor.execute(aClass, state)) return false;
+    }
+    return true;
+  }
+
+  public boolean canNavigate() {
+    return isValid();
+  }
+
+  @Override
+  public ItemPresentation getPresentation() {
+    return ItemPresentationProviders.getItemPresentation(this);
+  }
+
+  public void navigate(final boolean requestFocus) {
+    PsiPackageImplementationHelper.getInstance().navigate(this, requestFocus);
+  }
+
+  private class PackageAnnotationValueProvider implements CachedValueProvider<PsiModifierList> {
+    private final Object[] OOCB_DEPENDENCY = { PsiModificationTracker.OUT_OF_CODE_BLOCK_MODIFICATION_COUNT };
+
+    public Result<PsiModifierList> compute() {
+      List<PsiModifierList> list = new ArrayList<PsiModifierList>();
+      for(PsiDirectory directory: getDirectories()) {
+        PsiFile file = directory.findFile(PACKAGE_INFO_FILE);
+        if (file != null) {
+          PsiPackageStatement stmt = PsiTreeUtil.getChildOfType(file, PsiPackageStatement.class);
+          if (stmt != null) {
+            final PsiModifierList modifierList = stmt.getAnnotationList();
+            if (modifierList != null) {
+              list.add(modifierList);
+            }
+          }
+        }
+      }
+
+      final JavaPsiFacadeImpl facade = getFacade();
+      for (PsiClass aClass : facade.findClasses(getQualifiedName() + ".package-info", allScope())) {
+        ContainerUtil.addIfNotNull(aClass.getModifierList(), list);
+      }
+
+      return new Result<PsiModifierList>(list.isEmpty() ? null : new PsiCompositeModifierList(getManager(), list), OOCB_DEPENDENCY);
+    }
+  }
+
+  @Nullable
+  public PsiModifierList getModifierList() {
+    return getAnnotationList();
+  }
+
+  public boolean hasModifierProperty(@NonNls @NotNull final String name) {
+    return false;
+  }
+
+  public PsiQualifiedNamedElement getContainer() {
+    return getParentPackage();
+  }
+}
