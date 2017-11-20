@@ -1,7 +1,7 @@
 <?php
 require 'vendor/autoload.php';
 
-const RESULT_DIR = __DIR__ . '/input/ast';
+const RESULT_DIR = __DIR__ . '/input/ast-java';
 const ADDED_METHODS = RESULT_DIR . '/added.txt';
 const DELETED_METHODS = RESULT_DIR . '/deleted.txt';
 const CHANGED_METHODS_BEFORE = RESULT_DIR . '/changed-before.txt';
@@ -11,23 +11,23 @@ const ADDED_DIR = RESULT_DIR . '/added/';
 const DELETED_DIR = RESULT_DIR . '/deleted/';
 const DIFF_SEPARATOR = '||||||||';
 
-mkdir(CHANGED_DIR);
-mkdir(ADDED_DIR);
-mkdir(DELETED_DIR);
+mkdir(CHANGED_DIR, 0777, true);
+mkdir(ADDED_DIR, 0777, true);
+mkdir(DELETED_DIR, 0777, true);
 
 file_put_contents(ADDED_METHODS, '');
 file_put_contents(DELETED_METHODS, '');
 file_put_contents(CHANGED_METHODS_BEFORE, '');
 file_put_contents(CHANGED_METHODS_AFTER, '');
 
-$projectsDir = __DIR__ . '/results/';
+$projectsDir = __DIR__ . '/results-java/';
 $projects = array_diff(scandir($projectsDir), ['.', '..', 'README.txt']);
 
 $progress = new \ProgressBar\Manager(0, count($projects));
 
 $methodsCount = 0;
 
-$tokens = array_map('trim', file(__DIR__ . '/tokens.txt'));
+$tokens = array_map('trim', file(__DIR__ . '/java-parser/tokens-java.txt'));
 
 $tokenDuplicates = array_filter(array_count_values($tokens), function ($count) {
     return $count > 1;

@@ -15,6 +15,8 @@ public class JavaAster {
 
     public static final String DIFF_SEPARATOR = "||||||||";
 
+    private int count = 0;
+
     public static void main(String[] args) throws Exception {
 
         new JavaAster().tokenizeAll();
@@ -22,13 +24,14 @@ public class JavaAster {
 
     public void tokenizeAll() throws IOException {
         String projectsDir = "D:\\projects\\refactor-extractor\\results-java\\";
-
+        System.out.println("");
         try (Stream<Path> paths = Files.walk(Paths.get(projectsDir))) {
             paths
                     .filter(Files::isDirectory)
                     .filter(path -> path.getFileName().toString().equals("after"))
                     .forEach(this::tokenizeProject);
         }
+        dumpTokens();
 
 //        tokenize("src/main/java/MethodTokenizer.java");
     }
@@ -45,8 +48,9 @@ public class JavaAster {
         Map<String, Pair<MethodDeclaration, String>> after = MethodTokenizer.tokenize(filePath.toString());
         String beforePath = filePath.getParent().getParent().resolve("before").resolve(filePath.getFileName()).toString();
         Map<String, Pair<MethodDeclaration, String>> before = MethodTokenizer.tokenize(beforePath);
-        Path diffsPath = filePath.getParent().getParent().resolve("diff");
+        Path diffsPath = filePath.getParent().getParent().resolve("diffs");
         diffsPath.toFile().mkdirs();
+        System.out.println("\r" + count++);
         before.values().forEach(methodBefore -> {
             if (after.containsKey(methodBefore.a.getNameAsString())) {
                 Pair<MethodDeclaration, String> methodAfter = after.get(methodBefore.a.getNameAsString());
@@ -65,5 +69,16 @@ public class JavaAster {
                 }
             }
         });
+        if (count % 1000 == 0) {
+            dumpTokens();
+        }
+    }
+
+    private void dumpTokens() {
+        try (PrintWriter out = new PrintWriter("tokens-java.txt")) {
+            out.println(Joiner.on('\n').join(MethodTokenizer.ALL_TOKENS));
+        } catch (FileNotFoundException e) {
+            throw new RuntimeException(e);
+        }
     }
 }
