@@ -1,0 +1,211 @@
+public boolean apply(Mutation mutation) {
+    for (ColumnFamily cf : mutation.getColumnFamilies()) {
+        if (cf.getColumn(Util.cellname("commit1")) != null)
+            commitLogMessageFound = true;
+        if (cf.getColumn(Util.cellname("commit2")) != null)
+            noCommitLogMessageFound = true;
+    }
+    return true;
+}||||||||public boolean apply(Mutation mutation) {
+    for (PartitionUpdate upd : mutation.getPartitionUpdates()) {
+        Row r = upd.getRow(new SimpleClustering(ByteBufferUtil.bytes("c")));
+        if (r != null) {
+            if (r.getCell(withCommit) != null)
+                commitLogMessageFound = true;
+            if (r.getCell(withoutCommit) != null)
+                noCommitLogMessageFound = true;
+        }
+    }
+    return true;
+}||||||||(MethodDeclaration
+	(BlockStmt
+		(ForeachStmt
+			(BlockStmt
+				(IfStmt
+					(BinaryExpr
+						(MethodCallExpr
+							(MethodCallExpr
+								StringLiteralExpr
+								SimpleName
+								NameExpr
+									SimpleName
+							)
+							SimpleName
+							NameExpr
+								SimpleName
+						)
+						NullLiteralExpr
+					)
+					(ExpressionStmt
+						(AssignExpr
+							NameExpr
+								SimpleName
+							(BooleanLiteralExpr
+							)
+						)
+					)
+				)
+				(IfStmt
+					(BinaryExpr
+						(MethodCallExpr
+							(MethodCallExpr
+								StringLiteralExpr
+								SimpleName
+								NameExpr
+									SimpleName
+							)
+							SimpleName
+							NameExpr
+								SimpleName
+						)
+						NullLiteralExpr
+					)
+					(ExpressionStmt
+						(AssignExpr
+							NameExpr
+								SimpleName
+							(BooleanLiteralExpr
+							)
+						)
+					)
+				)
+			)
+			(MethodCallExpr
+				SimpleName
+				NameExpr
+					SimpleName
+			)
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					SimpleName
+					(ClassOrInterfaceType
+						SimpleName
+					)
+				)
+			)
+		)
+		(ReturnStmt
+			(BooleanLiteralExpr
+			)
+		)
+	)
+	(PrimitiveType
+	)
+	SimpleName
+	(Parameter
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+)
+||||||||(MethodDeclaration
+	(BlockStmt
+		(ForeachStmt
+			(BlockStmt
+				(ExpressionStmt
+					(VariableDeclarationExpr
+						(VariableDeclarator
+							(MethodCallExpr
+								(ObjectCreationExpr
+									(MethodCallExpr
+										StringLiteralExpr
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+									(ClassOrInterfaceType
+										SimpleName
+									)
+								)
+								SimpleName
+								NameExpr
+									SimpleName
+							)
+							SimpleName
+							(ClassOrInterfaceType
+								SimpleName
+							)
+						)
+					)
+				)
+				(IfStmt
+					(BinaryExpr
+						NameExpr
+							SimpleName
+						NullLiteralExpr
+					)
+					(BlockStmt
+						(IfStmt
+							(BinaryExpr
+								(MethodCallExpr
+									NameExpr
+										SimpleName
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+								NullLiteralExpr
+							)
+							(ExpressionStmt
+								(AssignExpr
+									NameExpr
+										SimpleName
+									(BooleanLiteralExpr
+									)
+								)
+							)
+						)
+						(IfStmt
+							(BinaryExpr
+								(MethodCallExpr
+									NameExpr
+										SimpleName
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+								NullLiteralExpr
+							)
+							(ExpressionStmt
+								(AssignExpr
+									NameExpr
+										SimpleName
+									(BooleanLiteralExpr
+									)
+								)
+							)
+						)
+					)
+				)
+			)
+			(MethodCallExpr
+				SimpleName
+				NameExpr
+					SimpleName
+			)
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					SimpleName
+					(ClassOrInterfaceType
+						SimpleName
+					)
+				)
+			)
+		)
+		(ReturnStmt
+			(BooleanLiteralExpr
+			)
+		)
+	)
+	(PrimitiveType
+	)
+	SimpleName
+	(Parameter
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+)
+

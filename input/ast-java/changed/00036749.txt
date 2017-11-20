@@ -1,0 +1,2597 @@
+/**
+ * Performs ATN simulation to compute a predicted alternative based
+ * upon the remaining input, but also updates the DFA cache to avoid
+ * having to traverse the ATN again for the same input sequence.
+ *
+ * There are some key conditions we're looking for after computing a new
+ * set of ATN configs (proposed DFA state):
+ * if the set is empty, there is no viable alternative for current symbol
+ * does the state uniquely predict an alternative?
+ * does the state have a conflict that would prevent us from
+ * putting it on the work list?
+ * if in non-greedy decision is there a config at a rule stop state?
+ *
+ * We also have some key operations to do:
+ * add an edge from previous DFA state to potentially new DFA state, D,
+ * upon current symbol but only if adding to work list, which means in all
+ * cases except no viable alternative (and possibly non-greedy decisions?)
+ * collecting predicates and adding semantic context to DFA accept states
+ * adding rule context to context-sensitive DFA accept states
+ * consuming an input symbol
+ * reporting a conflict
+ * reporting an ambiguity
+ * reporting a context sensitivity
+ * reporting insufficient predicates
+ *
+ * We should isolate those operations, which are side-effecting, to the
+ * main work loop. We can isolate lots of code into other functions, but
+ * they should be side effect free. They can return package that
+ * indicates whether we should report something, whether we need to add a
+ * DFA edge, whether we need to augment accept state with semantic
+ * context or rule invocation context. Actually, it seems like we always
+ * add predicates if they exist, so that can simply be done in the main
+ * loop for any accept state creation or modification request.
+ *
+ * cover these cases:
+ * dead end
+ * single alt
+ * single alt + preds
+ * conflict
+ * conflict + preds
+ *
+ * TODO: greedy + those
+ */
+public int execATN(@NotNull DFA dfa, @NotNull DFAState s0, @NotNull TokenStream input, int startIndex, ParserRuleContext<?> outerContext) {
+    // caller is expected to have write lock on dfa
+    if (debug || debug_list_atn_decisions) {
+        System.out.println("execATN decision " + dfa.decision + " exec LA(1)==" + getLookaheadName(input) + " line " + input.LT(1).getLine() + ":" + input.LT(1).getCharPositionInLine());
+    }
+    ATN_failover++;
+    ATNConfigSet previous = s0.configs;
+    DFAState previousD = s0;
+    if (debug)
+        System.out.println("s0 = " + s0);
+    int t = input.LA(1);
+    DecisionState decState = atn.getDecisionState(dfa.decision);
+    while (true) {
+        // while more work
+        // System.out.println("REACH "+getLookaheadName(input));
+        ATNConfigSet reach = computeReachSet(previous, t, false);
+        if (reach == null) {
+            // if any configs in previous dipped into outer context, that
+            // means that input up to t actually finished entry rule
+            // at least for SLL decision. Full LL doesn't dip into outer
+            // so don't need special case.
+            // We will get an error no matter what so delay until after
+            // decision; better error message. Also, no reachable target
+            // ATN states in SLL implies LL will also get nowhere.
+            // If conflict in states that dip out, choose min since we
+            // will get error no matter what.
+            int alt = getAltThatFinishedDecisionEntryRule(previousD.configs);
+            if (alt != ATN.INVALID_ALT_NUMBER) {
+                // return w/o altering DFA
+                return alt;
+            }
+            throw noViableAlt(input, outerContext, previous, startIndex);
+        }
+        // create new target state; we'll add to DFA after it's complete
+        DFAState D = new DFAState(reach);
+        // It's often the case that D will already exist in the DFA
+        // and so it's a waste to compute all of the fields over the next
+        // big chunk of code. However, I tried inserting the following
+        // short circuit, but it didn't have much effect. I
+        // figured that this would be a big impact for multi threading,
+        // but it also didn't see much of an impact.
+        // synchronized (dfa) {
+        // DFAState existing = dfa.states.get(D);
+        // if ( existing!=null ) {
+        // addDFAEdge(dfa, previousD, t, existing);
+        // if ( existing.isAcceptState ) return existing.prediction;
+        // previous = D.configs;
+        // previousD = D;
+        // input.consume();
+        // t = input.LA(1);
+        // continue;
+        // }
+        // }
+        Collection<BitSet> altSubSets = getConflictingAltSubsets(reach);
+        // System.out.println("SLL altsets: "+altSubSets);
+        int predictedAlt = getUniqueAlt(altSubSets);
+        if (debug) {
+            System.out.println("SLL altSubSets=" + altSubSets + ", configs=" + reach + ", predict=" + predictedAlt + ", allSubsetsConflict=" + allSubsetsConflict(altSubSets) + ", conflictingAlts=" + getConflictingAlts(reach));
+        }
+        if (predictedAlt != ATN.INVALID_ALT_NUMBER) {
+            // NO CONFLICT, UNIQUE PREDICTED ALT
+            D.isAcceptState = true;
+            D.configs.uniqueAlt = predictedAlt;
+            D.prediction = predictedAlt;
+        } else {
+            // MORE THAN ONE VIABLE ALTERNATIVE
+            if (hasSLLConflictTerminatingPrediction(reach)) {
+                D.configs.conflictingAlts = getConflictingAlts(reach);
+                if (mode == PredictionMode.SLL) {
+                    // stop w/o failover for sure
+                    if (// in grammar start rule
+                    outerContext == ParserRuleContext.EMPTY || // didn't fall out of rule
+                    !D.configs.dipsIntoOuterContext) {
+                        // SPECIAL CASE WHERE SLL KNOWS CONFLICT IS AMBIGUITY
+                        if (!D.configs.hasSemanticContext) {
+                            reportAmbiguity(dfa, D, startIndex, input.index(), D.configs.conflictingAlts, D.configs);
+                        }
+                    }
+                    // always stop at D
+                    D.isAcceptState = true;
+                    D.prediction = D.configs.conflictingAlts.nextSetBit(0);
+                    if (debug)
+                        System.out.println("SLL RESOLVED TO " + D.prediction + " for " + D);
+                    predictedAlt = D.prediction;
+                // Falls through to check predicates below
+                } else {
+                    // RETRY WITH FULL LL CONTEXT
+                    if (debug)
+                        System.out.println("RETRY with outerContext=" + outerContext);
+                    ATNConfigSet s0_closure = computeStartState(dfa.atnStartState, outerContext, true);
+                    predictedAlt = execATNWithFullContext(dfa, D, s0_closure, input, startIndex, outerContext, D.configs.conflictingAlts.nextSetBit(0));
+                    // not accept state: isCtxSensitive
+                    // always force DFA to ATN simulate
+                    D.requiresFullContext = true;
+                    D.prediction = ATN.INVALID_ALT_NUMBER;
+                    addDFAEdge(dfa, previousD, t, D);
+                    // all done with preds, etc...
+                    return predictedAlt;
+                }
+            }
+        }
+        if (D.isAcceptState && D.configs.hasSemanticContext) {
+            // We need to test all predicates, even in DFA states that
+            // uniquely predict alternative.
+            int nalts = decState.getNumberOfTransitions();
+            // Update DFA so reach becomes accept state with (predicate,alt)
+            // pairs if preds found for conflicting alts
+            BitSet altsToCollectPredsFrom = getConflictingAltsOrUniqueAlt(D.configs);
+            SemanticContext[] altToPred = getPredsForAmbigAlts(altsToCollectPredsFrom, D.configs, nalts);
+            if (altToPred != null) {
+                D.predicates = getPredicatePredictions(altsToCollectPredsFrom, altToPred);
+                // make sure we use preds
+                D.prediction = ATN.INVALID_ALT_NUMBER;
+            } else {
+                // There are preds in configs but they might go away
+                // when OR'd together like {p}? || NONE == NONE. If neither
+                // alt has preds, resolve to min alt
+                D.prediction = altsToCollectPredsFrom.nextSetBit(0);
+            }
+            if (D.predicates != null) {
+                int stopIndex = input.index();
+                input.seek(startIndex);
+                BitSet alts = evalSemanticContext(D.predicates, outerContext, true);
+                // indicate we have preds
+                D.prediction = ATN.INVALID_ALT_NUMBER;
+                addDFAEdge(dfa, previousD, t, D);
+                switch(alts.cardinality()) {
+                    case 0:
+                        throw noViableAlt(input, outerContext, D.configs, startIndex);
+                    case 1:
+                        return alts.nextSetBit(0);
+                    default:
+                        // report ambiguity after predicate evaluation to make sure the correct
+                        // set of ambig alts is reported.
+                        reportAmbiguity(dfa, D, startIndex, stopIndex, alts, D.configs);
+                        return alts.nextSetBit(0);
+                }
+            }
+        }
+        // all adds to dfa are done after we've created full D state
+        addDFAEdge(dfa, previousD, t, D);
+        if (D.isAcceptState)
+            return predictedAlt;
+        previous = reach;
+        previousD = D;
+        input.consume();
+        t = input.LA(1);
+    }
+}||||||||/**
+ * Performs ATN simulation to compute a predicted alternative based
+ * upon the remaining input, but also updates the DFA cache to avoid
+ * having to traverse the ATN again for the same input sequence.
+ *
+ * There are some key conditions we're looking for after computing a new
+ * set of ATN configs (proposed DFA state):
+ * if the set is empty, there is no viable alternative for current symbol
+ * does the state uniquely predict an alternative?
+ * does the state have a conflict that would prevent us from
+ * putting it on the work list?
+ *
+ * We also have some key operations to do:
+ * add an edge from previous DFA state to potentially new DFA state, D,
+ * upon current symbol but only if adding to work list, which means in all
+ * cases except no viable alternative (and possibly non-greedy decisions?)
+ * collecting predicates and adding semantic context to DFA accept states
+ * adding rule context to context-sensitive DFA accept states
+ * consuming an input symbol
+ * reporting a conflict
+ * reporting an ambiguity
+ * reporting a context sensitivity
+ * reporting insufficient predicates
+ *
+ * cover these cases:
+ * dead end
+ * single alt
+ * single alt + preds
+ * conflict
+ * conflict + preds
+ */
+public int execATN(@NotNull DFA dfa, @NotNull DFAState s0, @NotNull TokenStream input, int startIndex, ParserRuleContext<?> outerContext) {
+    // caller is expected to have write lock on dfa
+    if (debug || debug_list_atn_decisions) {
+        System.out.println("execATN decision " + dfa.decision + " exec LA(1)==" + getLookaheadName(input) + " line " + input.LT(1).getLine() + ":" + input.LT(1).getCharPositionInLine());
+    }
+    ATN_failover++;
+    ATNConfigSet previous = s0.configs;
+    DFAState previousD = s0;
+    if (debug)
+        System.out.println("s0 = " + s0);
+    int t = input.LA(1);
+    DecisionState decState = atn.getDecisionState(dfa.decision);
+    while (true) {
+        // while more work
+        // System.out.println("REACH "+getLookaheadName(input));
+        ATNConfigSet reach = computeReachSet(previous, t, false);
+        if (reach == null) {
+            // if any configs in previous dipped into outer context, that
+            // means that input up to t actually finished entry rule
+            // at least for SLL decision. Full LL doesn't dip into outer
+            // so don't need special case.
+            // We will get an error no matter what so delay until after
+            // decision; better error message. Also, no reachable target
+            // ATN states in SLL implies LL will also get nowhere.
+            // If conflict in states that dip out, choose min since we
+            // will get error no matter what.
+            int alt = getAltThatFinishedDecisionEntryRule(previousD.configs);
+            if (alt != ATN.INVALID_ALT_NUMBER) {
+                // return w/o altering DFA
+                return alt;
+            }
+            throw noViableAlt(input, outerContext, previous, startIndex);
+        }
+        // create new target state; we'll add to DFA after it's complete
+        DFAState D = new DFAState(reach);
+        // It's often the case that D will already exist in the DFA
+        // and so it's a waste to compute all of the fields over the next
+        // big chunk of code. However, I tried inserting the following
+        // short circuit, but it didn't have much effect. I
+        // figured that this would be a big impact for multi threading,
+        // but it also didn't see much of an impact.
+        // synchronized (dfa) {
+        // DFAState existing = dfa.states.get(D);
+        // if ( existing!=null ) {
+        // addDFAEdge(dfa, previousD, t, existing);
+        // if ( existing.isAcceptState ) return existing.prediction;
+        // previous = D.configs;
+        // previousD = D;
+        // input.consume();
+        // t = input.LA(1);
+        // continue;
+        // }
+        // }
+        Collection<BitSet> altSubSets = PredictionMode.getConflictingAltSubsets(reach);
+        // System.out.println("SLL altsets: "+altSubSets);
+        int predictedAlt = PredictionMode.getUniqueAlt(altSubSets);
+        if (debug) {
+            System.out.println("SLL altSubSets=" + altSubSets + ", configs=" + reach + ", predict=" + predictedAlt + ", allSubsetsConflict=" + PredictionMode.allSubsetsConflict(altSubSets) + ", conflictingAlts=" + getConflictingAlts(reach));
+        }
+        if (predictedAlt != ATN.INVALID_ALT_NUMBER) {
+            // NO CONFLICT, UNIQUELY PREDICTED ALT
+            D.isAcceptState = true;
+            D.configs.uniqueAlt = predictedAlt;
+            D.prediction = predictedAlt;
+        } else if (PredictionMode.hasSLLConflictTerminatingPrediction(mode, reach)) {
+            // MORE THAN ONE VIABLE ALTERNATIVE
+            D.configs.conflictingAlts = getConflictingAlts(reach);
+            if (mode == PredictionMode.SLL) {
+                // stop w/o failover for sure
+                if (// in grammar start rule
+                outerContext == ParserRuleContext.EMPTY || // didn't fall out of rule
+                !D.configs.dipsIntoOuterContext) {
+                    // SPECIAL CASE WHERE SLL KNOWS CONFLICT IS AMBIGUITY
+                    if (!D.configs.hasSemanticContext) {
+                        reportAmbiguity(dfa, D, startIndex, input.index(), D.configs.conflictingAlts, D.configs);
+                    }
+                }
+                // always stop at D
+                D.isAcceptState = true;
+                D.prediction = D.configs.conflictingAlts.nextSetBit(0);
+                if (debug)
+                    System.out.println("SLL RESOLVED TO " + D.prediction + " for " + D);
+                predictedAlt = D.prediction;
+            // Falls through to check predicates below
+            } else {
+                // RETRY WITH FULL LL CONTEXT
+                if (debug)
+                    System.out.println("RETRY with outerContext=" + outerContext);
+                ATNConfigSet s0_closure = computeStartState(dfa.atnStartState, outerContext, true);
+                predictedAlt = execATNWithFullContext(dfa, D, s0_closure, input, startIndex, outerContext, D.configs.conflictingAlts.nextSetBit(0));
+                // TODO: if true conflict found and same answer as we got with SLL,
+                // then make it non ctx sensitive DFA state
+                // not accept state: isCtxSensitive
+                // always force DFA to ATN simulate
+                D.requiresFullContext = true;
+                D.prediction = ATN.INVALID_ALT_NUMBER;
+                addDFAEdge(dfa, previousD, t, D);
+                // all done with preds, etc...
+                return predictedAlt;
+            }
+        }
+        if (D.isAcceptState && D.configs.hasSemanticContext) {
+            // We need to test all predicates, even in DFA states that
+            // uniquely predict alternative.
+            int nalts = decState.getNumberOfTransitions();
+            // Update DFA so reach becomes accept state with (predicate,alt)
+            // pairs if preds found for conflicting alts
+            BitSet altsToCollectPredsFrom = getConflictingAltsOrUniqueAlt(D.configs);
+            SemanticContext[] altToPred = getPredsForAmbigAlts(altsToCollectPredsFrom, D.configs, nalts);
+            if (altToPred != null) {
+                D.predicates = getPredicatePredictions(altsToCollectPredsFrom, altToPred);
+                // make sure we use preds
+                D.prediction = ATN.INVALID_ALT_NUMBER;
+            } else {
+                // There are preds in configs but they might go away
+                // when OR'd together like {p}? || NONE == NONE. If neither
+                // alt has preds, resolve to min alt
+                D.prediction = altsToCollectPredsFrom.nextSetBit(0);
+            }
+            if (D.predicates != null) {
+                int stopIndex = input.index();
+                input.seek(startIndex);
+                BitSet alts = evalSemanticContext(D.predicates, outerContext, true);
+                // indicate we have preds
+                D.prediction = ATN.INVALID_ALT_NUMBER;
+                addDFAEdge(dfa, previousD, t, D);
+                switch(alts.cardinality()) {
+                    case 0:
+                        throw noViableAlt(input, outerContext, D.configs, startIndex);
+                    case 1:
+                        return alts.nextSetBit(0);
+                    default:
+                        // report ambiguity after predicate evaluation to make sure the correct
+                        // set of ambig alts is reported.
+                        reportAmbiguity(dfa, D, startIndex, stopIndex, alts, D.configs);
+                        return alts.nextSetBit(0);
+                }
+            }
+        }
+        // all adds to dfa are done after we've created full D state
+        addDFAEdge(dfa, previousD, t, D);
+        if (D.isAcceptState)
+            return predictedAlt;
+        previous = reach;
+        previousD = D;
+        input.consume();
+        t = input.LA(1);
+    }
+}||||||||(MethodDeclaration
+	(BlockStmt
+		(IfStmt
+			(BinaryExpr
+				NameExpr
+					SimpleName
+				NameExpr
+					SimpleName
+			)
+			(BlockStmt
+				(ExpressionStmt
+					(MethodCallExpr
+						(BinaryExpr
+							(BinaryExpr
+								(BinaryExpr
+									(BinaryExpr
+										(BinaryExpr
+											(BinaryExpr
+												(BinaryExpr
+													StringLiteralExpr
+													(FieldAccessExpr
+														SimpleName
+														NameExpr
+															SimpleName
+													)
+												)
+												StringLiteralExpr
+											)
+											(MethodCallExpr
+												NameExpr
+													SimpleName
+												SimpleName
+											)
+										)
+										StringLiteralExpr
+									)
+									(MethodCallExpr
+										SimpleName
+										(MethodCallExpr
+											(IntegerLiteralExpr
+											)
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+									)
+								)
+								StringLiteralExpr
+							)
+							(MethodCallExpr
+								SimpleName
+								(MethodCallExpr
+									(IntegerLiteralExpr
+									)
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+							)
+						)
+						SimpleName
+						(FieldAccessExpr
+							SimpleName
+							NameExpr
+								SimpleName
+						)
+					)
+				)
+			)
+			LineComment
+		)
+		(ExpressionStmt
+			(UnaryExpr
+				NameExpr
+					SimpleName
+			)
+		)
+		(ExpressionStmt
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					(FieldAccessExpr
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+					SimpleName
+					(ClassOrInterfaceType
+						SimpleName
+					)
+				)
+			)
+		)
+		(ExpressionStmt
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					NameExpr
+						SimpleName
+					SimpleName
+					(ClassOrInterfaceType
+						SimpleName
+					)
+				)
+			)
+		)
+		(IfStmt
+			NameExpr
+				SimpleName
+			(ExpressionStmt
+				(MethodCallExpr
+					(BinaryExpr
+						StringLiteralExpr
+						NameExpr
+							SimpleName
+					)
+					SimpleName
+					(FieldAccessExpr
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+				)
+			)
+		)
+		(ExpressionStmt
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					(MethodCallExpr
+						(IntegerLiteralExpr
+						)
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+					SimpleName
+					(PrimitiveType
+					)
+				)
+			)
+		)
+		(ExpressionStmt
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					(MethodCallExpr
+						(FieldAccessExpr
+							SimpleName
+							NameExpr
+								SimpleName
+						)
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+					SimpleName
+					(ClassOrInterfaceType
+						SimpleName
+					)
+				)
+			)
+		)
+		(WhileStmt
+			(BlockStmt
+				(ExpressionStmt
+					(VariableDeclarationExpr
+						(VariableDeclarator
+							(MethodCallExpr
+								NameExpr
+									SimpleName
+								NameExpr
+									SimpleName
+								(BooleanLiteralExpr
+								)
+								SimpleName
+							)
+							SimpleName
+							(ClassOrInterfaceType
+								SimpleName
+							)
+						)
+					)
+					LineComment
+				)
+				(IfStmt
+					(BinaryExpr
+						NameExpr
+							SimpleName
+						NullLiteralExpr
+					)
+					(BlockStmt
+						(ExpressionStmt
+							(VariableDeclarationExpr
+								(VariableDeclarator
+									(MethodCallExpr
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										SimpleName
+									)
+									SimpleName
+									(PrimitiveType
+									)
+								)
+							)
+							LineComment
+						)
+						(IfStmt
+							(BinaryExpr
+								NameExpr
+									SimpleName
+								(FieldAccessExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+							)
+							(BlockStmt
+								(ReturnStmt
+									NameExpr
+										SimpleName
+									LineComment
+								)
+							)
+						)
+						(ThrowStmt
+							(MethodCallExpr
+								NameExpr
+									SimpleName
+								NameExpr
+									SimpleName
+								NameExpr
+									SimpleName
+								NameExpr
+									SimpleName
+								SimpleName
+							)
+						)
+					)
+				)
+				(ExpressionStmt
+					(VariableDeclarationExpr
+						(VariableDeclarator
+							(ObjectCreationExpr
+								NameExpr
+									SimpleName
+								(ClassOrInterfaceType
+									SimpleName
+								)
+							)
+							SimpleName
+							(ClassOrInterfaceType
+								SimpleName
+							)
+						)
+					)
+					LineComment
+				)
+				(ExpressionStmt
+					(VariableDeclarationExpr
+						(VariableDeclarator
+							(MethodCallExpr
+								NameExpr
+									SimpleName
+								SimpleName
+							)
+							SimpleName
+							(ClassOrInterfaceType
+								SimpleName
+								(ClassOrInterfaceType
+									SimpleName
+								)
+							)
+						)
+					)
+				)
+				(ExpressionStmt
+					(VariableDeclarationExpr
+						(VariableDeclarator
+							(MethodCallExpr
+								NameExpr
+									SimpleName
+								SimpleName
+							)
+							SimpleName
+							(PrimitiveType
+							)
+						)
+					)
+				)
+				(IfStmt
+					NameExpr
+						SimpleName
+					(BlockStmt
+						(ExpressionStmt
+							(MethodCallExpr
+								(BinaryExpr
+									(BinaryExpr
+										(BinaryExpr
+											(BinaryExpr
+												(BinaryExpr
+													(BinaryExpr
+														(BinaryExpr
+															(BinaryExpr
+																(BinaryExpr
+																	StringLiteralExpr
+																	NameExpr
+																		SimpleName
+																)
+																StringLiteralExpr
+															)
+															NameExpr
+																SimpleName
+														)
+														StringLiteralExpr
+													)
+													NameExpr
+														SimpleName
+												)
+												StringLiteralExpr
+											)
+											(MethodCallExpr
+												NameExpr
+													SimpleName
+												SimpleName
+											)
+										)
+										StringLiteralExpr
+									)
+									(MethodCallExpr
+										NameExpr
+											SimpleName
+										SimpleName
+									)
+								)
+								SimpleName
+								(FieldAccessExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+							)
+						)
+					)
+				)
+				(IfStmt
+					(BinaryExpr
+						NameExpr
+							SimpleName
+						(FieldAccessExpr
+							SimpleName
+							NameExpr
+								SimpleName
+						)
+					)
+					(BlockStmt
+						(IfStmt
+							(MethodCallExpr
+								NameExpr
+									SimpleName
+								SimpleName
+							)
+							(BlockStmt
+								(ExpressionStmt
+									(AssignExpr
+										(FieldAccessExpr
+											SimpleName
+											(FieldAccessExpr
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+										)
+										(MethodCallExpr
+											NameExpr
+												SimpleName
+											SimpleName
+										)
+									)
+								)
+								(IfStmt
+									(BinaryExpr
+										NameExpr
+											SimpleName
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+									)
+									(BlockStmt
+										(IfStmt
+											NameExpr
+												SimpleName
+											(ExpressionStmt
+												(MethodCallExpr
+													(BinaryExpr
+														StringLiteralExpr
+														NameExpr
+															SimpleName
+													)
+													SimpleName
+													(FieldAccessExpr
+														SimpleName
+														NameExpr
+															SimpleName
+													)
+												)
+											)
+											LineComment
+										)
+										(ExpressionStmt
+											(VariableDeclarationExpr
+												(VariableDeclarator
+													(MethodCallExpr
+														(FieldAccessExpr
+															SimpleName
+															NameExpr
+																SimpleName
+														)
+														NameExpr
+															SimpleName
+														(BooleanLiteralExpr
+														)
+														SimpleName
+													)
+													SimpleName
+													(ClassOrInterfaceType
+														SimpleName
+													)
+												)
+											)
+										)
+										(ExpressionStmt
+											(AssignExpr
+												NameExpr
+													SimpleName
+												(MethodCallExpr
+													NameExpr
+														SimpleName
+													NameExpr
+														SimpleName
+													NameExpr
+														SimpleName
+													NameExpr
+														SimpleName
+													NameExpr
+														SimpleName
+													NameExpr
+														SimpleName
+													(MethodCallExpr
+														(IntegerLiteralExpr
+														)
+														SimpleName
+														(FieldAccessExpr
+															SimpleName
+															(FieldAccessExpr
+																SimpleName
+																NameExpr
+																	SimpleName
+															)
+														)
+													)
+													SimpleName
+												)
+											)
+										)
+										(ExpressionStmt
+											(AssignExpr
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+												(BooleanLiteralExpr
+												)
+											)
+											LineComment
+										)
+										(ExpressionStmt
+											(AssignExpr
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+											)
+										)
+										(ExpressionStmt
+											(MethodCallExpr
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												SimpleName
+											)
+										)
+										(ReturnStmt
+											NameExpr
+												SimpleName
+											LineComment
+										)
+									)
+									(BlockStmt
+										(IfStmt
+											(BinaryExpr
+												(BinaryExpr
+													NameExpr
+														SimpleName
+													(FieldAccessExpr
+														SimpleName
+														NameExpr
+															SimpleName
+													)
+													LineComment
+												)
+												(UnaryExpr
+													(FieldAccessExpr
+														SimpleName
+														(FieldAccessExpr
+															SimpleName
+															NameExpr
+																SimpleName
+														)
+													)
+													LineComment
+												)
+											)
+											(BlockStmt
+												(IfStmt
+													(UnaryExpr
+														(FieldAccessExpr
+															SimpleName
+															(FieldAccessExpr
+																SimpleName
+																NameExpr
+																	SimpleName
+															)
+														)
+													)
+													(BlockStmt
+														(ExpressionStmt
+															(MethodCallExpr
+																NameExpr
+																	SimpleName
+																NameExpr
+																	SimpleName
+																NameExpr
+																	SimpleName
+																(MethodCallExpr
+																	SimpleName
+																	NameExpr
+																		SimpleName
+																)
+																(FieldAccessExpr
+																	SimpleName
+																	(FieldAccessExpr
+																		SimpleName
+																		NameExpr
+																			SimpleName
+																	)
+																)
+																(FieldAccessExpr
+																	SimpleName
+																	NameExpr
+																		SimpleName
+																)
+																SimpleName
+															)
+														)
+													)
+													LineComment
+												)
+											)
+											LineComment
+										)
+										(ExpressionStmt
+											(AssignExpr
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+												(BooleanLiteralExpr
+												)
+											)
+											LineComment
+										)
+										(ExpressionStmt
+											(AssignExpr
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+												(MethodCallExpr
+													(IntegerLiteralExpr
+													)
+													SimpleName
+													(FieldAccessExpr
+														SimpleName
+														(FieldAccessExpr
+															SimpleName
+															NameExpr
+																SimpleName
+														)
+													)
+												)
+											)
+										)
+										(IfStmt
+											NameExpr
+												SimpleName
+											(ExpressionStmt
+												(MethodCallExpr
+													(BinaryExpr
+														(BinaryExpr
+															(BinaryExpr
+																StringLiteralExpr
+																(FieldAccessExpr
+																	SimpleName
+																	NameExpr
+																		SimpleName
+																)
+															)
+															StringLiteralExpr
+														)
+														NameExpr
+															SimpleName
+													)
+													SimpleName
+													(FieldAccessExpr
+														SimpleName
+														NameExpr
+															SimpleName
+													)
+												)
+											)
+										)
+										(ExpressionStmt
+											(AssignExpr
+												NameExpr
+													SimpleName
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+											)
+										)
+									)
+								)
+							)
+							LineComment
+						)
+					)
+					(BlockStmt
+						(ExpressionStmt
+							(AssignExpr
+								(FieldAccessExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+								(BooleanLiteralExpr
+								)
+							)
+							LineComment
+						)
+						(ExpressionStmt
+							(AssignExpr
+								(FieldAccessExpr
+									SimpleName
+									(FieldAccessExpr
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+								)
+								NameExpr
+									SimpleName
+							)
+						)
+						(ExpressionStmt
+							(AssignExpr
+								(FieldAccessExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+								NameExpr
+									SimpleName
+							)
+						)
+					)
+				)
+				(IfStmt
+					(BinaryExpr
+						(FieldAccessExpr
+							SimpleName
+							NameExpr
+								SimpleName
+						)
+						(FieldAccessExpr
+							SimpleName
+							(FieldAccessExpr
+								SimpleName
+								NameExpr
+									SimpleName
+							)
+						)
+					)
+					(BlockStmt
+						(ExpressionStmt
+							(VariableDeclarationExpr
+								(VariableDeclarator
+									(MethodCallExpr
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+									SimpleName
+									(PrimitiveType
+									)
+								)
+							)
+							LineComment
+						)
+						(ExpressionStmt
+							(VariableDeclarationExpr
+								(VariableDeclarator
+									(MethodCallExpr
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										SimpleName
+									)
+									SimpleName
+									(ClassOrInterfaceType
+										SimpleName
+									)
+								)
+							)
+							LineComment
+						)
+						(ExpressionStmt
+							(VariableDeclarationExpr
+								(VariableDeclarator
+									(MethodCallExpr
+										NameExpr
+											SimpleName
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										NameExpr
+											SimpleName
+										SimpleName
+									)
+									SimpleName
+									(ArrayType
+										(ClassOrInterfaceType
+											SimpleName
+										)
+									)
+								)
+							)
+						)
+						(IfStmt
+							(BinaryExpr
+								NameExpr
+									SimpleName
+								NullLiteralExpr
+							)
+							(BlockStmt
+								(ExpressionStmt
+									(AssignExpr
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										(MethodCallExpr
+											(IntegerLiteralExpr
+											)
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+									)
+									LineComment
+								)
+							)
+							(BlockStmt
+								(ExpressionStmt
+									(AssignExpr
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										(MethodCallExpr
+											NameExpr
+												SimpleName
+											NameExpr
+												SimpleName
+											SimpleName
+										)
+									)
+								)
+								(ExpressionStmt
+									(AssignExpr
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+									)
+									LineComment
+								)
+							)
+						)
+						(IfStmt
+							(BinaryExpr
+								(FieldAccessExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+								NullLiteralExpr
+							)
+							(BlockStmt
+								(ExpressionStmt
+									(VariableDeclarationExpr
+										(VariableDeclarator
+											(MethodCallExpr
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+											SimpleName
+											(PrimitiveType
+											)
+										)
+									)
+								)
+								(ExpressionStmt
+									(MethodCallExpr
+										NameExpr
+											SimpleName
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+								)
+								(ExpressionStmt
+									(VariableDeclarationExpr
+										(VariableDeclarator
+											(MethodCallExpr
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+												NameExpr
+													SimpleName
+												(BooleanLiteralExpr
+												)
+												SimpleName
+											)
+											SimpleName
+											(ClassOrInterfaceType
+												SimpleName
+											)
+										)
+									)
+								)
+								(ExpressionStmt
+									(AssignExpr
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+									)
+									LineComment
+								)
+								(ExpressionStmt
+									(MethodCallExpr
+										NameExpr
+											SimpleName
+										NameExpr
+											SimpleName
+										NameExpr
+											SimpleName
+										NameExpr
+											SimpleName
+										SimpleName
+									)
+								)
+								(SwitchStmt
+									(SwitchEntryStmt
+										(IntegerLiteralExpr
+										)
+										(ThrowStmt
+											(MethodCallExpr
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+												NameExpr
+													SimpleName
+												SimpleName
+											)
+										)
+									)
+									(SwitchEntryStmt
+										(IntegerLiteralExpr
+										)
+										(ReturnStmt
+											(MethodCallExpr
+												(IntegerLiteralExpr
+												)
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+										)
+									)
+									(SwitchEntryStmt
+										(ExpressionStmt
+											(MethodCallExpr
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+												SimpleName
+											)
+											LineComment
+										)
+										(ReturnStmt
+											(MethodCallExpr
+												(IntegerLiteralExpr
+												)
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+										)
+									)
+									(MethodCallExpr
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+								)
+							)
+						)
+					)
+				)
+				(ExpressionStmt
+					(MethodCallExpr
+						NameExpr
+							SimpleName
+						NameExpr
+							SimpleName
+						NameExpr
+							SimpleName
+						NameExpr
+							SimpleName
+						SimpleName
+					)
+					LineComment
+				)
+				(IfStmt
+					(FieldAccessExpr
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+					(ReturnStmt
+						NameExpr
+							SimpleName
+					)
+				)
+				(ExpressionStmt
+					(AssignExpr
+						NameExpr
+							SimpleName
+						NameExpr
+							SimpleName
+					)
+				)
+				(ExpressionStmt
+					(AssignExpr
+						NameExpr
+							SimpleName
+						NameExpr
+							SimpleName
+					)
+				)
+				(ExpressionStmt
+					(MethodCallExpr
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+				)
+				(ExpressionStmt
+					(AssignExpr
+						NameExpr
+							SimpleName
+						(MethodCallExpr
+							(IntegerLiteralExpr
+							)
+							SimpleName
+							NameExpr
+								SimpleName
+						)
+					)
+				)
+			)
+			(BooleanLiteralExpr
+			)
+		)
+	)
+	(PrimitiveType
+	)
+	SimpleName
+	(Parameter
+		(MarkerAnnotationExpr
+			Name
+		)
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+	(Parameter
+		(MarkerAnnotationExpr
+			Name
+		)
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+	(Parameter
+		(MarkerAnnotationExpr
+			Name
+		)
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+	(Parameter
+		SimpleName
+		(PrimitiveType
+		)
+	)
+	(Parameter
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+			(WildcardType
+			)
+		)
+	)
+	(JavadocComment
+	)
+)
+||||||||(MethodDeclaration
+	(BlockStmt
+		(IfStmt
+			(BinaryExpr
+				NameExpr
+					SimpleName
+				NameExpr
+					SimpleName
+			)
+			(BlockStmt
+				(ExpressionStmt
+					(MethodCallExpr
+						(BinaryExpr
+							(BinaryExpr
+								(BinaryExpr
+									(BinaryExpr
+										(BinaryExpr
+											(BinaryExpr
+												(BinaryExpr
+													StringLiteralExpr
+													(FieldAccessExpr
+														SimpleName
+														NameExpr
+															SimpleName
+													)
+												)
+												StringLiteralExpr
+											)
+											(MethodCallExpr
+												NameExpr
+													SimpleName
+												SimpleName
+											)
+										)
+										StringLiteralExpr
+									)
+									(MethodCallExpr
+										SimpleName
+										(MethodCallExpr
+											(IntegerLiteralExpr
+											)
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+									)
+								)
+								StringLiteralExpr
+							)
+							(MethodCallExpr
+								SimpleName
+								(MethodCallExpr
+									(IntegerLiteralExpr
+									)
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+							)
+						)
+						SimpleName
+						(FieldAccessExpr
+							SimpleName
+							NameExpr
+								SimpleName
+						)
+					)
+				)
+			)
+			LineComment
+		)
+		(ExpressionStmt
+			(UnaryExpr
+				NameExpr
+					SimpleName
+			)
+		)
+		(ExpressionStmt
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					(FieldAccessExpr
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+					SimpleName
+					(ClassOrInterfaceType
+						SimpleName
+					)
+				)
+			)
+		)
+		(ExpressionStmt
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					NameExpr
+						SimpleName
+					SimpleName
+					(ClassOrInterfaceType
+						SimpleName
+					)
+				)
+			)
+		)
+		(IfStmt
+			NameExpr
+				SimpleName
+			(ExpressionStmt
+				(MethodCallExpr
+					(BinaryExpr
+						StringLiteralExpr
+						NameExpr
+							SimpleName
+					)
+					SimpleName
+					(FieldAccessExpr
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+				)
+			)
+		)
+		(ExpressionStmt
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					(MethodCallExpr
+						(IntegerLiteralExpr
+						)
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+					SimpleName
+					(PrimitiveType
+					)
+				)
+			)
+		)
+		(ExpressionStmt
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					(MethodCallExpr
+						(FieldAccessExpr
+							SimpleName
+							NameExpr
+								SimpleName
+						)
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+					SimpleName
+					(ClassOrInterfaceType
+						SimpleName
+					)
+				)
+			)
+		)
+		(WhileStmt
+			(BlockStmt
+				(ExpressionStmt
+					(VariableDeclarationExpr
+						(VariableDeclarator
+							(MethodCallExpr
+								NameExpr
+									SimpleName
+								NameExpr
+									SimpleName
+								(BooleanLiteralExpr
+								)
+								SimpleName
+							)
+							SimpleName
+							(ClassOrInterfaceType
+								SimpleName
+							)
+						)
+					)
+					LineComment
+				)
+				(IfStmt
+					(BinaryExpr
+						NameExpr
+							SimpleName
+						NullLiteralExpr
+					)
+					(BlockStmt
+						(ExpressionStmt
+							(VariableDeclarationExpr
+								(VariableDeclarator
+									(MethodCallExpr
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										SimpleName
+									)
+									SimpleName
+									(PrimitiveType
+									)
+								)
+							)
+							LineComment
+						)
+						(IfStmt
+							(BinaryExpr
+								NameExpr
+									SimpleName
+								(FieldAccessExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+							)
+							(BlockStmt
+								(ReturnStmt
+									NameExpr
+										SimpleName
+									LineComment
+								)
+							)
+						)
+						(ThrowStmt
+							(MethodCallExpr
+								NameExpr
+									SimpleName
+								NameExpr
+									SimpleName
+								NameExpr
+									SimpleName
+								NameExpr
+									SimpleName
+								SimpleName
+							)
+						)
+					)
+				)
+				(ExpressionStmt
+					(VariableDeclarationExpr
+						(VariableDeclarator
+							(ObjectCreationExpr
+								NameExpr
+									SimpleName
+								(ClassOrInterfaceType
+									SimpleName
+								)
+							)
+							SimpleName
+							(ClassOrInterfaceType
+								SimpleName
+							)
+						)
+					)
+					LineComment
+				)
+				(ExpressionStmt
+					(VariableDeclarationExpr
+						(VariableDeclarator
+							(MethodCallExpr
+								NameExpr
+									SimpleName
+								SimpleName
+								NameExpr
+									SimpleName
+							)
+							SimpleName
+							(ClassOrInterfaceType
+								SimpleName
+								(ClassOrInterfaceType
+									SimpleName
+								)
+							)
+						)
+					)
+				)
+				(ExpressionStmt
+					(VariableDeclarationExpr
+						(VariableDeclarator
+							(MethodCallExpr
+								NameExpr
+									SimpleName
+								SimpleName
+								NameExpr
+									SimpleName
+							)
+							SimpleName
+							(PrimitiveType
+							)
+						)
+					)
+				)
+				(IfStmt
+					NameExpr
+						SimpleName
+					(BlockStmt
+						(ExpressionStmt
+							(MethodCallExpr
+								(BinaryExpr
+									(BinaryExpr
+										(BinaryExpr
+											(BinaryExpr
+												(BinaryExpr
+													(BinaryExpr
+														(BinaryExpr
+															(BinaryExpr
+																(BinaryExpr
+																	StringLiteralExpr
+																	NameExpr
+																		SimpleName
+																)
+																StringLiteralExpr
+															)
+															NameExpr
+																SimpleName
+														)
+														StringLiteralExpr
+													)
+													NameExpr
+														SimpleName
+												)
+												StringLiteralExpr
+											)
+											(MethodCallExpr
+												NameExpr
+													SimpleName
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+										)
+										StringLiteralExpr
+									)
+									(MethodCallExpr
+										NameExpr
+											SimpleName
+										SimpleName
+									)
+								)
+								SimpleName
+								(FieldAccessExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+							)
+						)
+					)
+				)
+				(IfStmt
+					(BinaryExpr
+						NameExpr
+							SimpleName
+						(FieldAccessExpr
+							SimpleName
+							NameExpr
+								SimpleName
+						)
+					)
+					(IfStmt
+						(MethodCallExpr
+							NameExpr
+								SimpleName
+							NameExpr
+								SimpleName
+							SimpleName
+							NameExpr
+								SimpleName
+						)
+						(BlockStmt
+							(ExpressionStmt
+								(AssignExpr
+									(FieldAccessExpr
+										SimpleName
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+									)
+									(MethodCallExpr
+										NameExpr
+											SimpleName
+										SimpleName
+									)
+								)
+								LineComment
+							)
+							(IfStmt
+								(BinaryExpr
+									NameExpr
+										SimpleName
+									(FieldAccessExpr
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+								)
+								(BlockStmt
+									(IfStmt
+										NameExpr
+											SimpleName
+										(ExpressionStmt
+											(MethodCallExpr
+												(BinaryExpr
+													StringLiteralExpr
+													NameExpr
+														SimpleName
+												)
+												SimpleName
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+											)
+										)
+										LineComment
+									)
+									(ExpressionStmt
+										(VariableDeclarationExpr
+											(VariableDeclarator
+												(MethodCallExpr
+													(FieldAccessExpr
+														SimpleName
+														NameExpr
+															SimpleName
+													)
+													NameExpr
+														SimpleName
+													(BooleanLiteralExpr
+													)
+													SimpleName
+												)
+												SimpleName
+												(ClassOrInterfaceType
+													SimpleName
+												)
+											)
+										)
+									)
+									(ExpressionStmt
+										(AssignExpr
+											NameExpr
+												SimpleName
+											(MethodCallExpr
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												(MethodCallExpr
+													(IntegerLiteralExpr
+													)
+													SimpleName
+													(FieldAccessExpr
+														SimpleName
+														(FieldAccessExpr
+															SimpleName
+															NameExpr
+																SimpleName
+														)
+													)
+												)
+												SimpleName
+											)
+										)
+									)
+									(ExpressionStmt
+										(AssignExpr
+											(FieldAccessExpr
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+											(BooleanLiteralExpr
+											)
+										)
+										LineComment
+									)
+									(ExpressionStmt
+										(AssignExpr
+											(FieldAccessExpr
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+											(FieldAccessExpr
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+										)
+									)
+									(ExpressionStmt
+										(MethodCallExpr
+											NameExpr
+												SimpleName
+											NameExpr
+												SimpleName
+											NameExpr
+												SimpleName
+											NameExpr
+												SimpleName
+											SimpleName
+										)
+									)
+									(ReturnStmt
+										NameExpr
+											SimpleName
+										LineComment
+									)
+								)
+								(BlockStmt
+									(IfStmt
+										(BinaryExpr
+											(BinaryExpr
+												NameExpr
+													SimpleName
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+												LineComment
+											)
+											(UnaryExpr
+												(FieldAccessExpr
+													SimpleName
+													(FieldAccessExpr
+														SimpleName
+														NameExpr
+															SimpleName
+													)
+												)
+												LineComment
+											)
+										)
+										(BlockStmt
+											(IfStmt
+												(UnaryExpr
+													(FieldAccessExpr
+														SimpleName
+														(FieldAccessExpr
+															SimpleName
+															NameExpr
+																SimpleName
+														)
+													)
+												)
+												(BlockStmt
+													(ExpressionStmt
+														(MethodCallExpr
+															NameExpr
+																SimpleName
+															NameExpr
+																SimpleName
+															NameExpr
+																SimpleName
+															(MethodCallExpr
+																SimpleName
+																NameExpr
+																	SimpleName
+															)
+															(FieldAccessExpr
+																SimpleName
+																(FieldAccessExpr
+																	SimpleName
+																	NameExpr
+																		SimpleName
+																)
+															)
+															(FieldAccessExpr
+																SimpleName
+																NameExpr
+																	SimpleName
+															)
+															SimpleName
+														)
+													)
+												)
+												LineComment
+											)
+										)
+										LineComment
+									)
+									(ExpressionStmt
+										(AssignExpr
+											(FieldAccessExpr
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+											(BooleanLiteralExpr
+											)
+										)
+										LineComment
+									)
+									(ExpressionStmt
+										(AssignExpr
+											(FieldAccessExpr
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+											(MethodCallExpr
+												(IntegerLiteralExpr
+												)
+												SimpleName
+												(FieldAccessExpr
+													SimpleName
+													(FieldAccessExpr
+														SimpleName
+														NameExpr
+															SimpleName
+													)
+												)
+											)
+										)
+									)
+									(IfStmt
+										NameExpr
+											SimpleName
+										(ExpressionStmt
+											(MethodCallExpr
+												(BinaryExpr
+													(BinaryExpr
+														(BinaryExpr
+															StringLiteralExpr
+															(FieldAccessExpr
+																SimpleName
+																NameExpr
+																	SimpleName
+															)
+														)
+														StringLiteralExpr
+													)
+													NameExpr
+														SimpleName
+												)
+												SimpleName
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+											)
+										)
+									)
+									(ExpressionStmt
+										(AssignExpr
+											NameExpr
+												SimpleName
+											(FieldAccessExpr
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+										)
+									)
+								)
+							)
+						)
+					)
+					(BlockStmt
+						(ExpressionStmt
+							(AssignExpr
+								(FieldAccessExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+								(BooleanLiteralExpr
+								)
+							)
+							LineComment
+						)
+						(ExpressionStmt
+							(AssignExpr
+								(FieldAccessExpr
+									SimpleName
+									(FieldAccessExpr
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+								)
+								NameExpr
+									SimpleName
+							)
+						)
+						(ExpressionStmt
+							(AssignExpr
+								(FieldAccessExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+								NameExpr
+									SimpleName
+							)
+						)
+					)
+				)
+				(IfStmt
+					(BinaryExpr
+						(FieldAccessExpr
+							SimpleName
+							NameExpr
+								SimpleName
+						)
+						(FieldAccessExpr
+							SimpleName
+							(FieldAccessExpr
+								SimpleName
+								NameExpr
+									SimpleName
+							)
+						)
+					)
+					(BlockStmt
+						(ExpressionStmt
+							(VariableDeclarationExpr
+								(VariableDeclarator
+									(MethodCallExpr
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+									SimpleName
+									(PrimitiveType
+									)
+								)
+							)
+							LineComment
+						)
+						(ExpressionStmt
+							(VariableDeclarationExpr
+								(VariableDeclarator
+									(MethodCallExpr
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										SimpleName
+									)
+									SimpleName
+									(ClassOrInterfaceType
+										SimpleName
+									)
+								)
+							)
+							LineComment
+						)
+						(ExpressionStmt
+							(VariableDeclarationExpr
+								(VariableDeclarator
+									(MethodCallExpr
+										NameExpr
+											SimpleName
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										NameExpr
+											SimpleName
+										SimpleName
+									)
+									SimpleName
+									(ArrayType
+										(ClassOrInterfaceType
+											SimpleName
+										)
+									)
+								)
+							)
+						)
+						(IfStmt
+							(BinaryExpr
+								NameExpr
+									SimpleName
+								NullLiteralExpr
+							)
+							(BlockStmt
+								(ExpressionStmt
+									(AssignExpr
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										(MethodCallExpr
+											(IntegerLiteralExpr
+											)
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+									)
+									LineComment
+								)
+							)
+							(BlockStmt
+								(ExpressionStmt
+									(AssignExpr
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										(MethodCallExpr
+											NameExpr
+												SimpleName
+											NameExpr
+												SimpleName
+											SimpleName
+										)
+									)
+								)
+								(ExpressionStmt
+									(AssignExpr
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+									)
+									LineComment
+								)
+							)
+						)
+						(IfStmt
+							(BinaryExpr
+								(FieldAccessExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+								NullLiteralExpr
+							)
+							(BlockStmt
+								(ExpressionStmt
+									(VariableDeclarationExpr
+										(VariableDeclarator
+											(MethodCallExpr
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+											SimpleName
+											(PrimitiveType
+											)
+										)
+									)
+								)
+								(ExpressionStmt
+									(MethodCallExpr
+										NameExpr
+											SimpleName
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+								)
+								(ExpressionStmt
+									(VariableDeclarationExpr
+										(VariableDeclarator
+											(MethodCallExpr
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+												NameExpr
+													SimpleName
+												(BooleanLiteralExpr
+												)
+												SimpleName
+											)
+											SimpleName
+											(ClassOrInterfaceType
+												SimpleName
+											)
+										)
+									)
+								)
+								(ExpressionStmt
+									(AssignExpr
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+									)
+									LineComment
+								)
+								(ExpressionStmt
+									(MethodCallExpr
+										NameExpr
+											SimpleName
+										NameExpr
+											SimpleName
+										NameExpr
+											SimpleName
+										NameExpr
+											SimpleName
+										SimpleName
+									)
+								)
+								(SwitchStmt
+									(SwitchEntryStmt
+										(IntegerLiteralExpr
+										)
+										(ThrowStmt
+											(MethodCallExpr
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+												NameExpr
+													SimpleName
+												SimpleName
+											)
+										)
+									)
+									(SwitchEntryStmt
+										(IntegerLiteralExpr
+										)
+										(ReturnStmt
+											(MethodCallExpr
+												(IntegerLiteralExpr
+												)
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+										)
+									)
+									(SwitchEntryStmt
+										(ExpressionStmt
+											(MethodCallExpr
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												NameExpr
+													SimpleName
+												(FieldAccessExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+												SimpleName
+											)
+											LineComment
+										)
+										(ReturnStmt
+											(MethodCallExpr
+												(IntegerLiteralExpr
+												)
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+										)
+									)
+									(MethodCallExpr
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+								)
+							)
+						)
+					)
+				)
+				(ExpressionStmt
+					(MethodCallExpr
+						NameExpr
+							SimpleName
+						NameExpr
+							SimpleName
+						NameExpr
+							SimpleName
+						NameExpr
+							SimpleName
+						SimpleName
+					)
+					LineComment
+				)
+				(IfStmt
+					(FieldAccessExpr
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+					(ReturnStmt
+						NameExpr
+							SimpleName
+					)
+				)
+				(ExpressionStmt
+					(AssignExpr
+						NameExpr
+							SimpleName
+						NameExpr
+							SimpleName
+					)
+				)
+				(ExpressionStmt
+					(AssignExpr
+						NameExpr
+							SimpleName
+						NameExpr
+							SimpleName
+					)
+				)
+				(ExpressionStmt
+					(MethodCallExpr
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+				)
+				(ExpressionStmt
+					(AssignExpr
+						NameExpr
+							SimpleName
+						(MethodCallExpr
+							(IntegerLiteralExpr
+							)
+							SimpleName
+							NameExpr
+								SimpleName
+						)
+					)
+				)
+			)
+			(BooleanLiteralExpr
+			)
+		)
+	)
+	(PrimitiveType
+	)
+	SimpleName
+	(Parameter
+		(MarkerAnnotationExpr
+			Name
+		)
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+	(Parameter
+		(MarkerAnnotationExpr
+			Name
+		)
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+	(Parameter
+		(MarkerAnnotationExpr
+			Name
+		)
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+	(Parameter
+		SimpleName
+		(PrimitiveType
+		)
+	)
+	(Parameter
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+			(WildcardType
+			)
+		)
+	)
+	(JavadocComment
+	)
+)
+
