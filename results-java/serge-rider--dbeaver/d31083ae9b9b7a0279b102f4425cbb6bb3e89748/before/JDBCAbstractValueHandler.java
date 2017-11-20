@@ -1,0 +1,229 @@
+/*
+ * Copyright (C) 2010-2012 Serge Rieder
+ * serge@jkiss.org
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+package org.jkiss.dbeaver.model.impl.jdbc.data;
+
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.eclipse.jface.action.IMenuManager;
+import org.eclipse.swt.SWT;
+import org.eclipse.swt.dnd.Clipboard;
+import org.eclipse.swt.dnd.TextTransfer;
+import org.eclipse.swt.events.*;
+import org.eclipse.swt.widgets.Composite;
+import org.eclipse.swt.widgets.Control;
+import org.jkiss.dbeaver.core.CoreMessages;
+import org.jkiss.dbeaver.model.DBConstants;
+import org.jkiss.dbeaver.model.data.*;
+import org.jkiss.dbeaver.model.exec.*;
+import org.jkiss.dbeaver.model.exec.jdbc.JDBCExecutionContext;
+import org.jkiss.dbeaver.model.exec.jdbc.JDBCPreparedStatement;
+import org.jkiss.dbeaver.model.exec.jdbc.JDBCResultSet;
+import org.jkiss.dbeaver.model.struct.DBSTypedObject;
+import org.jkiss.dbeaver.ui.UIUtils;
+import org.jkiss.dbeaver.ui.properties.PropertySourceAbstract;
+import org.jkiss.utils.CommonUtils;
+
+import java.sql.SQLException;
+
+/**
+ * Standard JDBC value handler
+ */
+public abstract class JDBCAbstractValueHandler implements DBDValueHandler {
+
+    static final Log log = LogFactory.getLog(JDBCAbstractValueHandler.class);
+    private static final String CELL_VALUE_INLINE_EDITOR = "org.jkiss.dbeaver.CellValueInlineEditor";
+
+    @Override
+    public final Object fetchValueObject(DBCExecutionContext context, DBCResultSet resultSet, DBSTypedObject type, int index)
+        throws DBCException
+    {
+        try {
+            return fetchColumnValue(context, (JDBCResultSet) resultSet, type, index + 1);
+        }
+        catch (Throwable e) {
+            throw new DBCException(CoreMessages.model_jdbc_exception_could_not_get_result_set_value, e);
+        }
+    }
+
+    @Override
+    public final void bindValueObject(DBCExecutionContext context, DBCStatement statement, DBSTypedObject columnMetaData,
+                                      int index, Object value) throws DBCException {
+        try {
+            this.bindParameter((JDBCExecutionContext) context, (JDBCPreparedStatement) statement, columnMetaData, index + 1, value);
+        }
+        catch (SQLException e) {
+            throw new DBCException(CoreMessages.model_jdbc_exception_could_not_bind_statement_parameter, e);
+        }
+    }
+
+    @Override
+    public Object getValueFromClipboard(DBCExecutionContext context, DBSTypedObject column, Clipboard clipboard) throws DBCException
+    {
+        String strValue = (String) clipboard.getContents(TextTransfer.getInstance());
+        if (CommonUtils.isEmpty(strValue)) {
+            return null;
+        }
+        return getValueFromObject(context, column, strValue, false);
+    }
+
+    @Override
+    public void releaseValueObject(Object value)
+    {
+        if (value instanceof DBDValue) {
+            ((DBDValue)value).release();
+        }
+    }
+
+    @Override
+    public String getValueDisplayString(DBSTypedObject column, Object value) {
+        return value == null ? DBConstants.NULL_VALUE_LABEL : value.toString();
+    }
+
+    @Override
+    public DBDValueAnnotation[] getValueAnnotations(DBCAttributeMetaData column)
+        throws DBCException
+    {
+        return null;
+    }
+
+    @Override
+    public void fillContextMenu(IMenuManager menuManager, DBDValueController controller)
+        throws DBCException
+    {
+
+    }
+
+    @Override
+    public void fillProperties(PropertySourceAbstract propertySource, DBDValueController controller)
+    {
+        propertySource.addProperty(
+            "column_size", //$NON-NLS-1$
+            CoreMessages.model_jdbc_column_size,
+            controller.getAttributeMetaData().getMaxLength());
+    }
+
+    protected abstract Object fetchColumnValue(DBCExecutionContext context, JDBCResultSet resultSet, DBSTypedObject type, int index)
+        throws DBCException, SQLException;
+
+    protected abstract void bindParameter(
+        JDBCExecutionContext context,
+        JDBCPreparedStatement statement,
+        DBSTypedObject paramType,
+        int paramIndex,
+        Object value)
+        throws DBCException, SQLException;
+
+    protected abstract class ValueEditor<T> implements DBDValueEditor {
+        protected final DBDValueController valueController;
+        protected final T control;
+        protected ValueEditor(final DBDValueController valueController)
+        {
+            this.valueController = valueController;
+            this.control = createControl(valueController.getEditPlaceholder());
+            if (this.control instanceof Control) {
+                initInlineControl((Control)this.control);
+            }
+        }
+
+        protected abstract Object extractValue();
+
+        protected abstract T createControl(Composite editPlaceholder);
+
+        protected void initInlineControl(final Control inlineControl)
+        {
+            UIUtils.addFocusTracker(valueController.getValueSite(), CELL_VALUE_INLINE_EDITOR, inlineControl);
+            inlineControl.addDisposeListener(new DisposeListener() {
+                @Override
+                public void widgetDisposed(DisposeEvent e)
+                {
+                    UIUtils.removeFocusTracker(valueController.getValueSite(), inlineControl);
+                }
+            });
+
+            if (valueController.getEditType() == DBDValueController.EditType.PANEL) {
+                inlineControl.setBackground(valueController.getEditPlaceholder().getBackground());
+                return;
+            }
+            // There is a bug in windows. First time date control gain focus it renders cell editor incorrectly.
+            // Let's focus on it in async mode
+            inlineControl.getDisplay().asyncExec(new Runnable() {
+                @Override
+                public void run()
+                {
+                    inlineControl.setFocus();
+                }
+            });
+
+            inlineControl.setFont(valueController.getEditPlaceholder().getFont());
+            inlineControl.addTraverseListener(new TraverseListener() {
+                @Override
+                public void keyTraversed(TraverseEvent e)
+                {
+                    if (e.detail == SWT.TRAVERSE_RETURN) {
+                        Object newValue = extractValue();
+                        valueController.closeInlineEditor();
+                        valueController.updateValue(newValue);
+                        e.doit = false;
+                        e.detail = SWT.TRAVERSE_NONE;
+                    } else if (e.detail == SWT.TRAVERSE_ESCAPE) {
+                        valueController.closeInlineEditor();
+                        e.doit = false;
+                        e.detail = SWT.TRAVERSE_NONE;
+                    } else if (e.detail == SWT.TRAVERSE_TAB_NEXT || e.detail == SWT.TRAVERSE_TAB_PREVIOUS) {
+                        Object newValue = extractValue();
+                        valueController.closeInlineEditor();
+                        valueController.updateValue(newValue);
+                        valueController.nextInlineEditor(e.detail == SWT.TRAVERSE_TAB_NEXT);
+                        e.doit = false;
+                        e.detail = SWT.TRAVERSE_NONE;
+                    }
+                }
+            });
+            inlineControl.addFocusListener(new FocusAdapter() {
+                @Override
+                public void focusLost(FocusEvent e)
+                {
+                    // Check new focus control in async mode
+                    // (because right now focus is still on edit control)
+                    inlineControl.getDisplay().asyncExec(new Runnable() {
+                        @Override
+                        public void run()
+                        {
+                            if (inlineControl.isDisposed()) {
+                                return;
+                            }
+                            Control newFocus = inlineControl.getDisplay().getFocusControl();
+                            if (newFocus != null) {
+                                for (Control fc = newFocus.getParent(); fc != null; fc = fc.getParent()) {
+                                    if (fc == valueController.getEditPlaceholder()) {
+                                        // New focus is still a child of inline placeholder - do not close it
+                                        return;
+                                    }
+                                }
+                            }
+                            valueController.updateValue(extractValue());
+                            valueController.closeInlineEditor();
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+}

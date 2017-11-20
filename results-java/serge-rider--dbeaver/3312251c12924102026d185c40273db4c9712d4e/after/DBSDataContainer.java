@@ -1,0 +1,74 @@
+/*
+ * Copyright (C) 2010-2012 Serge Rieder
+ * serge@jkiss.org
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+
+package org.jkiss.dbeaver.model.struct;
+
+import org.jkiss.dbeaver.DBException;
+import org.jkiss.dbeaver.model.data.DBDDataFilter;
+import org.jkiss.dbeaver.model.data.DBDDataReceiver;
+import org.jkiss.dbeaver.model.exec.DBCExecutionContext;
+
+/**
+ * Data container.
+ * Provides facilities to query object for data.
+ * Any data container MUST support data read. Other function may be not supported (client can check it with {@link #getSupportedFeatures()}).
+ */
+public interface DBSDataContainer extends DBSObject {
+
+    public static final int DATA_SELECT         = 0;
+    public static final int DATA_COUNT          = 1;
+    public static final int DATA_FILTER         = 2;
+
+    /**
+     * Features supported by implementation
+     * @return features flags
+     */
+    int getSupportedFeatures();
+
+    /**
+     * Reads data from container and pushes it into receiver
+     * @param context execution context
+     * @param dataReceiver data receiver. Works as a data pipe
+     * @param dataFilter data filter. May be null
+     * @param firstRow first row number (<= 0 means do not use it)
+     * @param maxRows total rows to fetch (<= 0 means fetch everything)
+     * @return number of fetched rows
+     * @throws DBException on any error
+     */
+    long readData(
+        DBCExecutionContext context,
+        DBDDataReceiver dataReceiver,
+        DBDDataFilter dataFilter,
+        long firstRow,
+        long maxRows)
+        throws DBException;
+
+    /**
+     * Counts data rows in container.
+     * @param context execution context
+     * @param dataFilter data filter (may be null)
+     * @return number of rows in container. May return negative values if count feature is not available
+     * @throws DBException on any error
+     */
+    long countData(
+        DBCExecutionContext context,
+        DBDDataFilter dataFilter)
+        throws DBException;
+
+}

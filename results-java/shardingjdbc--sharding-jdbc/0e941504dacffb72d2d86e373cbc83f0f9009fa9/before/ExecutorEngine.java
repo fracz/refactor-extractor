@@ -1,0 +1,124 @@
+/*
+ * Copyright 1999-2015 dangdang.com.
+ * <p>
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * </p>
+ */
+
+package com.dangdang.ddframe.rdb.sharding.executor;
+
+import com.dangdang.ddframe.rdb.sharding.exception.ShardingJdbcException;
+import com.dangdang.ddframe.rdb.sharding.executor.threadlocal.ExecutorExceptionHandler;
+import com.google.common.collect.Lists;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.ListeningExecutorService;
+import com.google.common.util.concurrent.MoreExecutors;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * 多线程执行框架.
+ *
+ * @author gaohongtao
+ */
+@Slf4j
+public final class ExecutorEngine implements AutoCloseable {
+
+    private final ListeningExecutorService executorService;
+
+    public ExecutorEngine(final int executorSize) {
+        executorService = MoreExecutors.listeningDecorator(new ThreadPoolExecutor(
+                executorSize, executorSize, 0, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<Runnable>(), new ThreadFactoryBuilder().setDaemon(true).setNameFormat("ShardingJDBC-%d").build()));
+        MoreExecutors.addDelayedShutdownHook(executorService, 60, TimeUnit.SECONDS);
+    }
+
+    /**
+     * 多线程执行任务.
+     *
+     * <p>
+     * 一组任务中, 将第一个任务放在当前线程执行, 其余的任务放到线程池中运行.
+     * </p>
+     *
+     * @param baseStatementUnits 输入参数
+     * @param executeUnit 执行单元
+     * @param <T> 返回值类型
+     * @return 执行结果
+     */
+    public <T> List<T> execute(final Collection<? extends BaseStatementUnit> baseStatementUnits, final ExecuteUnit<T> executeUnit) {
+        if (baseStatementUnits.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Iterator<? extends BaseStatementUnit> iterator = baseStatementUnits.iterator();
+        BaseStatementUnit firstInput = iterator.next();
+        ListenableFuture<List<T>> restFutures = asyncExecute(Lists.newArrayList(iterator), executeUnit);
+        T firstOutput;
+        List<T> restOutputs;
+        try {
+            firstOutput = syncExecute(firstInput, executeUnit);
+            restOutputs = restFutures.get();
+            //CHECKSTYLE:OFF
+        } catch (final Exception ex) {
+            //CHECKSTYLE:ON
+            ExecutorExceptionHandler.handleException(ex);
+            return null;
+        }
+        List<T> result = Lists.newLinkedList(restOutputs);
+        result.add(0, firstOutput);
+        return result;
+    }
+
+    private <T> ListenableFuture<List<T>> asyncExecute(final Collection<BaseStatementUnit> baseStatementUnits, final ExecuteUnit<T> executeUnit) {
+        List<ListenableFuture<T>> result = new ArrayList<>(baseStatementUnits.size());
+        for (final BaseStatementUnit each : baseStatementUnits) {
+            result.add(executorService.submit(new Callable<T>() {
+
+                @Override
+                public T call() throws Exception {
+                    synchronized (each.getStatement().getConnection()) {
+                        return executeUnit.execute(each);
+                    }
+                }
+            }));
+        }
+        return Futures.allAsList(result);
+    }
+
+    private <T> T syncExecute(final BaseStatementUnit baseStatementUnit, final ExecuteUnit<T> executeUnit) throws Exception {
+        synchronized (baseStatementUnit.getStatement().getConnection()) {
+            return executeUnit.execute(baseStatementUnit);
+        }
+    }
+
+    @Override
+    public void close() {
+        executorService.shutdownNow();
+        try {
+            executorService.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (final InterruptedException ignored) {
+        }
+        if (!executorService.isTerminated()) {
+            throw new ShardingJdbcException("ExecutorEngine can not been terminated");
+        }
+    }
+}

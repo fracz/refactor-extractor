@@ -1,0 +1,61 @@
+/*
+ *
+ *  *  Copyright 2010-2016 OrientDB LTD (http://orientdb.com)
+ *  *
+ *  *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  *  you may not use this file except in compliance with the License.
+ *  *  You may obtain a copy of the License at
+ *  *
+ *  *       http://www.apache.org/licenses/LICENSE-2.0
+ *  *
+ *  *  Unless required by applicable law or agreed to in writing, software
+ *  *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  *  See the License for the specific language governing permissions and
+ *  *  limitations under the License.
+ *  *
+ *  * For more information: http://orientdb.com
+ *
+ */
+package com.orientechnologies.orient.client.remote.message;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+
+import com.orientechnologies.common.serialization.types.OBinarySerializer;
+import com.orientechnologies.common.serialization.types.OIntegerSerializer;
+import com.orientechnologies.orient.client.binary.OChannelBinaryAsynchClient;
+import com.orientechnologies.orient.client.remote.OBinaryResponse;
+import com.orientechnologies.orient.client.remote.OSBTreeBonsaiRemote;
+import com.orientechnologies.orient.client.remote.OStorageRemoteSession;
+
+public class OSBTFetchEntriesMajorResponse<K, V> implements OBinaryResponse<List<Entry<K, V>>> {
+  private final OBinarySerializer<K> keySerializer;
+  private final OBinarySerializer<V> valueSerializer;
+
+  public OSBTFetchEntriesMajorResponse(OBinarySerializer<K> keySerializer, OBinarySerializer<V> valueSerializer) {
+    this.keySerializer = keySerializer;
+    this.valueSerializer = valueSerializer;
+  }
+
+  @Override
+  public List<Entry<K, V>> read(OChannelBinaryAsynchClient network, OStorageRemoteSession session) throws IOException {
+    List<Map.Entry<K, V>> list = null;
+    byte[] stream = network.readBytes();
+    int offset = 0;
+    final int count = OIntegerSerializer.INSTANCE.deserializeLiteral(stream, 0);
+    offset += OIntegerSerializer.INT_SIZE;
+    list = new ArrayList<Map.Entry<K, V>>(count);
+    for (int i = 0; i < count; i++) {
+      final K resultKey = keySerializer.deserialize(stream, offset);
+      offset += keySerializer.getObjectSize(stream, offset);
+      final V resultValue = valueSerializer.deserialize(stream, offset);
+      offset += valueSerializer.getObjectSize(stream, offset);
+      list.add(new OSBTreeBonsaiRemote.TreeEntry<K, V>(resultKey, resultValue));
+    }
+    return list;
+  }
+}

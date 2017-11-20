@@ -1,0 +1,172 @@
+/*
+ * Copyright 2010-2016 OrientDB LTD (http://orientdb.com)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.orientechnologies.orient.core.sql.functions;
+
+import com.orientechnologies.common.exception.OException;
+import com.orientechnologies.common.log.OLogManager;
+import com.orientechnologies.orient.core.exception.OCommandExecutionException;
+import com.orientechnologies.orient.core.sql.functions.coll.*;
+import com.orientechnologies.orient.core.sql.functions.geo.OSQLFunctionDistance;
+import com.orientechnologies.orient.core.sql.functions.graph.*;
+import com.orientechnologies.orient.core.sql.functions.math.*;
+import com.orientechnologies.orient.core.sql.functions.misc.*;
+import com.orientechnologies.orient.core.sql.functions.sequence.OSQLFunctionSequence;
+import com.orientechnologies.orient.core.sql.functions.stat.*;
+import com.orientechnologies.orient.core.sql.functions.text.OSQLFunctionConcat;
+import com.orientechnologies.orient.core.sql.functions.text.OSQLFunctionFormat;
+
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.util.*;
+
+/**
+ * Default set of SQL function.
+ *
+ * @author Johann Sorel (Geomatys)
+ */
+public final class ODefaultSQLFunctionFactory implements OSQLFunctionFactory {
+
+  private static final Map<String, Object> FUNCTIONS = new HashMap<>();
+  static {
+    // MISC FUNCTIONS
+    register(OSQLFunctionAverage.NAME, OSQLFunctionAverage.class);
+    register(OSQLFunctionCoalesce.NAME, new OSQLFunctionCoalesce());
+    register(OSQLFunctionCount.NAME, OSQLFunctionCount.class);
+    register(OSQLFunctionDate.NAME, OSQLFunctionDate.class);
+    register(OSQLFunctionDecode.NAME, new OSQLFunctionDecode());
+    register(OSQLFunctionDifference.NAME, OSQLFunctionDifference.class);
+    register(OSQLFunctionSymmetricDifference.NAME, OSQLFunctionSymmetricDifference.class);
+    register(OSQLFunctionDistance.NAME, new OSQLFunctionDistance());
+    register(OSQLFunctionDistinct.NAME, OSQLFunctionDistinct.class);
+    register(OSQLFunctionDocument.NAME, OSQLFunctionDocument.class);
+    register(OSQLFunctionEncode.NAME, new OSQLFunctionEncode());
+    register(OSQLFunctionEval.NAME, OSQLFunctionEval.class);
+    register(OSQLFunctionFirst.NAME, new OSQLFunctionFirst());
+    register(OSQLFunctionFormat.NAME, new OSQLFunctionFormat());
+    register(OSQLFunctionTraversedEdge.NAME, OSQLFunctionTraversedEdge.class);
+    register(OSQLFunctionTraversedElement.NAME, OSQLFunctionTraversedElement.class);
+    register(OSQLFunctionTraversedVertex.NAME, OSQLFunctionTraversedVertex.class);
+    register(OSQLFunctionIf.NAME, new OSQLFunctionIf());
+    register(OSQLFunctionIfNull.NAME, new OSQLFunctionIfNull());
+    register(OSQLFunctionIntersect.NAME, OSQLFunctionIntersect.class);
+    register(OSQLFunctionLast.NAME, new OSQLFunctionLast());
+    register(OSQLFunctionList.NAME, OSQLFunctionList.class);
+    register(OSQLFunctionMap.NAME, OSQLFunctionMap.class);
+    register(OSQLFunctionMax.NAME, OSQLFunctionMax.class);
+    register(OSQLFunctionMin.NAME, OSQLFunctionMin.class);
+    register(OSQLFunctionSet.NAME, OSQLFunctionSet.class);
+    register(OSQLFunctionSysdate.NAME, OSQLFunctionSysdate.class);
+    register(OSQLFunctionSum.NAME, OSQLFunctionSum.class);
+    register(OSQLFunctionUnionAll.NAME, OSQLFunctionUnionAll.class);
+    register(OSQLFunctionMode.NAME, OSQLFunctionMode.class);
+    register(OSQLFunctionPercentile.NAME, OSQLFunctionPercentile.class);
+    register(OSQLFunctionMedian.NAME, OSQLFunctionMedian.class);
+    register(OSQLFunctionVariance.NAME, OSQLFunctionVariance.class);
+    register(OSQLFunctionStandardDeviation.NAME, OSQLFunctionStandardDeviation.class);
+    register(OSQLFunctionUUID.NAME, OSQLFunctionUUID.class);
+    register(OSQLFunctionConcat.NAME, OSQLFunctionConcat.class);
+    register(OSQLFunctionDecimal.NAME, OSQLFunctionDecimal.class);
+    register(OSQLFunctionSequence.NAME, new OSQLFunctionSequence());
+    register(OSQLFunctionAbsoluteValue.NAME, OSQLFunctionAbsoluteValue.class);
+    register(OSQLFunctionIndexKeySize.NAME, OSQLFunctionIndexKeySize.class);
+    //graph
+    register(OSQLFunctionOut.NAME, OSQLFunctionOut.class);
+    register(OSQLFunctionIn.NAME, OSQLFunctionIn.class);
+    register(OSQLFunctionBoth.NAME, OSQLFunctionBoth.class);
+    register(OSQLFunctionOutE.NAME, OSQLFunctionOutE.class);
+    register(OSQLFunctionOutV.NAME, OSQLFunctionOutV.class);
+    register(OSQLFunctionInE.NAME, OSQLFunctionInE.class);
+    register(OSQLFunctionInV.NAME, OSQLFunctionInV.class);
+    register(OSQLFunctionBothE.NAME, OSQLFunctionBothE.class);
+    register(OSQLFunctionBothV.NAME, OSQLFunctionBothV.class);
+    register(OSQLFunctionShortestPath.NAME, OSQLFunctionShortestPath.class);
+    register(OSQLFunctionDijkstra.NAME, OSQLFunctionDijkstra.class);
+    register(OSQLFunctionAstar.NAME, OSQLFunctionAstar.class);
+    // auto-register all Math.<method>() automatically with math_ prefix
+    registerStaticReflectiveFunctions("math_", Math.class);
+  }
+
+  public static void register(final String iName, final Object iImplementation) {
+    FUNCTIONS.put(iName.toLowerCase(), iImplementation);
+  }
+
+  private static void registerStaticReflectiveFunctions(final String prefix, final Class<?> clazz) {
+    Map<String, List<Method>> methodsMap = new HashMap<>();
+
+    for (Method method : clazz.getMethods()) {
+      if (Modifier.isStatic(method.getModifiers())) {
+        if (!methodsMap.containsKey(method.getName())) {
+          methodsMap.put(method.getName(), new ArrayList<>());
+        }
+        methodsMap.get(method.getName()).add(method);
+      }
+    }
+
+    for (Map.Entry<String, List<Method>> entry : methodsMap.entrySet()) {
+      final String name = prefix + entry.getKey();
+      if (FUNCTIONS.containsKey(name)) {
+        OLogManager.instance().warn(null, "Unable to register reflective function with name " + entry.getKey());
+      } else {
+        List<Method> methodsList = methodsMap.get(entry.getKey());
+        Method[] methods = new Method[methodsList.size()];
+        int i = 0;
+        int minParams = 0;
+        int maxParams = 0;
+        for (Method m : methodsList) {
+          methods[i++] = m;
+          minParams = minParams < m.getParameterTypes().length ? minParams : m.getParameterTypes().length;
+          maxParams = maxParams > m.getParameterTypes().length ? maxParams : m.getParameterTypes().length;
+        }
+        OSQLStaticReflectiveFunction reflectiveFunction = new OSQLStaticReflectiveFunction(name, minParams, maxParams, methods);
+        register(name, reflectiveFunction);
+      }
+    }
+
+  }
+
+  @Override
+  public Set<String> getFunctionNames() {
+    return FUNCTIONS.keySet();
+  }
+
+  @Override
+  public boolean hasFunction(final String name) {
+    return FUNCTIONS.containsKey(name);
+  }
+
+  @Override
+  public OSQLFunction createFunction(final String name) {
+    final Object obj = FUNCTIONS.get(name);
+
+    if (obj == null)
+      throw new OCommandExecutionException("Unknown function name :" + name);
+
+    if (obj instanceof OSQLFunction)
+      return (OSQLFunction) obj;
+    else {
+      // it's a class
+      final Class<?> clazz = (Class<?>) obj;
+      try {
+        return (OSQLFunction) clazz.newInstance();
+      } catch (Exception e) {
+        throw OException.wrapException(new OCommandExecutionException("Error in creation of function " + name
+            + "(). Probably there is not an empty constructor or the constructor generates errors"), e);
+      }
+    }
+
+  }
+
+}
