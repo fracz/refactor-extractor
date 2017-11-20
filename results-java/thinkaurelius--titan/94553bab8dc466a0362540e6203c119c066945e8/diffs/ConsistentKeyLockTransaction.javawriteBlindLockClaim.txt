@@ -1,0 +1,857 @@
+/**
+ * Attempts to lock the supplied {@code (key, column, expectedValue)}.
+ *
+ * <p>
+ *
+ * Conflicts with locks held by other transactions within the process are
+ * detected using {@link LocalLockMediator} before this method returns. Such
+ * conflicts generate LockingExceptions.
+ *
+ * <p>
+ *
+ * Conflicts with locks held by transactions in other processes will not be
+ * detected before this method returns. We optimistically write a lock claim
+ * to {@code backer}'s {@code lockStore}, but whether the claim takes
+ * precedence and the lock succeeded won't be checked until
+ * {@link #verifyAllLockClaims()}.
+ *
+ * <p>
+ *
+ * Unless there's an StorageException-worthy problem communicating with
+ * {@code backer}'s {@code lockStore}, such as failure to connect or
+ * exceptionally high write latency, this method concludes by appending a
+ * {@link LockClaim} to its {@code #lockClaims} hash set and then returns.
+ * The {@code LockClaim} lets {@code #verifyAllLockClaims()} find and check
+ * this lock attempt when called.
+ *
+ * <p>
+ *
+ * Therefore, if this method returns instead of throwing an exception, we
+ * know the following:
+ *
+ * <ul>
+ * <li>The attempted lock conflicts with no other transactions in the
+ * process</li>
+ * <li>Whether the attempted lock conflicts with transactions in remote
+ * processes is uncertain until {@code #verifyAllLockClaims()} returns</li>
+ * </ul>
+ *
+ * @param backer
+ * the store containing lock data and configuration parameters
+ * @param key
+ * the key to lock
+ * @param column
+ * the column to lock
+ * @param expectedValue
+ * the value which must be present at {@code (key, column)} in
+ * {@code backer}'s {@code dataStore} when
+ * {@code #verifyAllLockClaims()} is called later
+ * @throws com.thinkaurelius.titan.diskstorage.locking.LockingException
+ * @throws StorageException
+ */
+public void writeBlindLockClaim(ConsistentKeyLockStore backer, StaticBuffer key, StaticBuffer column, StaticBuffer expectedValue) throws StorageException {
+    LockClaim lc = new LockClaim(backer, key, column, expectedValue);
+    // Check to see whether we already hold this lock
+    if (lockClaims.contains(lc)) {
+        log.trace("Skipping lock {}: already held", lc);
+        return;
+    }
+    /* Check the local lock mediator.
+		 *
+		 * The timestamp calculated here is only approximate.  If it turns out that we
+		 * spend longer than the expiration period attempting to finish the rest of
+		 * this method, then there's a window of time in which the LocalLockMediator
+		 * may tell other threads that our key-column target is unlocked.  Lock conflict
+		 * is still detected in such cases during verifyAllLockClaims() below (it's
+		 * just slower than when LocalLockMediator gives the correct answer).
+		 *
+		 * We'll also update the timestamp in the LocalLockMediator after we're done
+		 * talking to the backend store.
+		 *
+		 * We use TimeUtility.INSTANCE.getApproxNSSinceEpoch()/1000 instead of the
+		 * superficially equivalent System.currentTimeMillis() to get consistent timestamp
+		 * rollovers.
+		 */
+    long tempts = TimeUtility.INSTANCE.getApproxNSSinceEpoch(false) + backer.getLockExpireMS() * MILLION;
+    if (!backer.getLocalLockMediator().lock(lc.getKc(), this, tempts, TimeUnit.NANOSECONDS)) {
+        throw new PermanentLockingException("Lock could not be acquired because it is held by a local transaction [" + lc + "]");
+    }
+    /* Write lock to the backing store
+		 *
+		 * The key we write is a concatenation of the arguments key and column,
+		 * prefixed by an int (4 bytes) representing the length of the argument key.
+		 *
+		 * The column we write is a concatenation of our rid and the timestamp.
+		 */
+    StaticBuffer lockKey = lc.getLockKey();
+    StaticBuffer valBuf = ByteBufferUtil.getIntBuffer(0);
+    boolean ok = false;
+    long tsNS = 0;
+    try {
+        for (int i = 0; i < backer.getLockRetryCount(); i++) {
+            tsNS = TimeUtility.INSTANCE.getApproxNSSinceEpoch(false);
+            Entry addition = StaticBufferEntry.of(lc.getLockCol(tsNS, backer.getRid()), valBuf);
+            long before = System.currentTimeMillis();
+            backer.getLockStore().mutate(lockKey, Arrays.asList(addition), KeyColumnValueStore.NO_DELETIONS, consistentTx);
+            long after = System.currentTimeMillis();
+            if (backer.getLockWaitMS() < after - before) {
+                // Too slow
+                // Delete lock claim and loop again
+                backer.getLockStore().mutate(lockKey, KeyColumnValueStore.NO_ADDITIONS, Arrays.asList(lc.getLockCol(tsNS, backer.getRid())), consistentTx);
+            } else {
+                ok = true;
+                lastLockApplicationTimesMS.put(backer, before);
+                lc.setTimestamp(tsNS);
+                log.trace("Wrote lock: {}", lc);
+                lockClaims.add(lc);
+                return;
+            }
+        }
+        throw new TemporaryLockingException("Lock failed: exceeded max timeouts [" + lc + "]");
+    } finally {
+        if (ok) {
+            // Update the timeout
+            assert 0 != tsNS;
+            boolean expireTimeUpdated = backer.getLocalLockMediator().lock(lc.getKc(), this, tsNS + MILLION * backer.getLockExpireMS(), TimeUnit.NANOSECONDS);
+            if (!expireTimeUpdated)
+                log.warn("Failed to update expiration time of local lock {}; is titan.storage.lock-expiry-time too low?");
+        /*
+				 * No action is immediately necessary even if we failed to re-lock locally.
+				 *
+				 * Any failure to re-lock locally will be detected later in verifyAllLockClaims().
+				 */
+        } else {
+            backer.getLocalLockMediator().unlock(lc.getKc(), this);
+        }
+    }
+}||||||||/**
+ * Attempts to lock the supplied {@code (key, column, expectedValue)}.
+ *
+ * <p>
+ *
+ * Conflicts with locks held by other transactions within the process are
+ * detected using {@link LocalLockMediator} before this method returns. Such
+ * conflicts generate LockingExceptions.
+ *
+ * <p>
+ *
+ * Conflicts with locks held by transactions in other processes will not be
+ * detected before this method returns. We optimistically write a lock claim
+ * to {@code backer}'s {@code lockStore}, but whether the claim takes
+ * precedence and the lock succeeded won't be checked until
+ * {@link #verifyAllLockClaims()}.
+ *
+ * <p>
+ *
+ * Unless there's an StorageException-worthy problem communicating with
+ * {@code backer}'s {@code lockStore}, such as failure to connect or
+ * exceptionally high write latency, this method concludes by appending a
+ * {@link LockClaim} to its {@code #lockClaims} hash set and then returns.
+ * The {@code LockClaim} lets {@code #verifyAllLockClaims()} find and check
+ * this lock attempt when called.
+ *
+ * <p>
+ *
+ * Therefore, if this method returns instead of throwing an exception, we
+ * know the following:
+ *
+ * <ul>
+ * <li>The attempted lock conflicts with no other transactions in the
+ * process</li>
+ * <li>Whether the attempted lock conflicts with transactions in remote
+ * processes is uncertain until {@code #verifyAllLockClaims()} returns</li>
+ * </ul>
+ *
+ * @param backer
+ * the store containing lock data and configuration parameters
+ * @param key
+ * the key to lock
+ * @param column
+ * the column to lock
+ * @param expectedValue
+ * the value which must be present at {@code (key, column)} in
+ * {@code backer}'s {@code dataStore} when
+ * {@code #verifyAllLockClaims()} is called later
+ * @throws com.thinkaurelius.titan.diskstorage.locking.LockingException
+ * @throws StorageException
+ */
+public void writeBlindLockClaim(ConsistentKeyLockStore backer, StaticBuffer key, StaticBuffer column, StaticBuffer expectedValue) throws StorageException {
+// LockClaim lc = new LockClaim(backer, key, column, expectedValue);
+// 
+// // Check to see whether we already hold this lock
+// if (lockClaims.contains(lc)) {
+// log.trace("Skipping lock {}: already held", lc);
+// return;
+// }
+// 
+// /* Check the local lock mediator.
+// *
+// * The timestamp calculated here is only approximate.  If it turns out that we
+// * spend longer than the expiration period attempting to finish the rest of
+// * this method, then there's a window of time in which the LocalLockMediator
+// * may tell other threads that our key-column target is unlocked.  Lock conflict
+// * is still detected in such cases during verifyAllLockClaims() below (it's
+// * just slower than when LocalLockMediator gives the correct answer).
+// *
+// * We'll also update the timestamp in the LocalLockMediator after we're done
+// * talking to the backend store.
+// *
+// * We use TimeUtility.INSTANCE.getApproxNSSinceEpoch()/1000 instead of the
+// * superficially equivalent System.currentTimeMillis() to get consistent timestamp
+// * rollovers.
+// */
+// long tempts = TimeUtility.INSTANCE.getApproxNSSinceEpoch(false) +
+// backer.getLockExpireMS() * MILLION;
+// if (!backer.getLocalLockMediator().lock(lc.getKc(), this, tempts, TimeUnit.NANOSECONDS)) {
+// throw new PermanentLockingException("Lock could not be acquired because it is held by a local transaction [" + lc + "]");
+// }
+// 
+// /* Write lock to the backing store
+// *
+// * The key we write is a concatenation of the arguments key and column,
+// * prefixed by an int (4 bytes) representing the length of the argument key.
+// *
+// * The column we write is a concatenation of our rid and the timestamp.
+// */
+// StaticBuffer lockKey = lc.getLockKey();
+// 
+// StaticBuffer valBuf = ByteBufferUtil.getIntBuffer(0);
+// 
+// boolean ok = false;
+// long tsNS = 0;
+// try {
+// for (int i = 0; i < backer.getLockRetryCount(); i++) {
+// tsNS = TimeUtility.INSTANCE.getApproxNSSinceEpoch(false);
+// Entry addition = StaticBufferEntry.of(lc.getLockCol(tsNS, backer.getRid()), valBuf);
+// 
+// long before = System.currentTimeMillis();
+// backer.getLockStore().mutate(lockKey, Arrays.asList(addition), KeyColumnValueStore.NO_DELETIONS, consistentTx);
+// long after = System.currentTimeMillis();
+// 
+// if (backer.getLockWaitMS() < after - before) {
+// // Too slow
+// // Delete lock claim and loop again
+// backer.getLockStore().mutate(lockKey, KeyColumnValueStore.NO_ADDITIONS, Arrays.asList(lc.getLockCol(tsNS, backer.getRid())), consistentTx);
+// } else {
+// ok = true;
+// lastLockApplicationTimesMS.put(backer, before);
+// lc.setTimestamp(tsNS);
+// log.trace("Wrote lock: {}", lc);
+// lockClaims.add(lc);
+// return;
+// }
+// }
+// 
+// throw new TemporaryLockingException("Lock failed: exceeded max timeouts [" + lc + "]");
+// } finally {
+// if (ok) {
+// // Update the timeout
+// assert 0 != tsNS;
+// boolean expireTimeUpdated = backer.getLocalLockMediator().lock(
+// lc.getKc(), this, tsNS + MILLION * backer.getLockExpireMS(), TimeUnit.NANOSECONDS);
+// 
+// if (!expireTimeUpdated)
+// log.warn("Failed to update expiration time of local lock {}; is titan.storage.lock-expiry-time too low?");
+// 
+// /*
+// * No action is immediately necessary even if we failed to re-lock locally.
+// *
+// * Any failure to re-lock locally will be detected later in verifyAllLockClaims().
+// */
+// 
+// } else {
+// backer.getLocalLockMediator().unlock(lc.getKc(), this);
+// }
+// }
+}||||||||(MethodDeclaration
+	(BlockStmt
+		(ExpressionStmt
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					(ObjectCreationExpr
+						NameExpr
+							SimpleName
+						NameExpr
+							SimpleName
+						NameExpr
+							SimpleName
+						NameExpr
+							SimpleName
+						(ClassOrInterfaceType
+							SimpleName
+						)
+					)
+					SimpleName
+					(ClassOrInterfaceType
+						SimpleName
+					)
+				)
+			)
+		)
+		(IfStmt
+			(MethodCallExpr
+				NameExpr
+					SimpleName
+				SimpleName
+				NameExpr
+					SimpleName
+			)
+			(BlockStmt
+				(ExpressionStmt
+					(MethodCallExpr
+						StringLiteralExpr
+						NameExpr
+							SimpleName
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+				)
+				(ReturnStmt
+				)
+			)
+			LineComment
+		)
+		(ExpressionStmt
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					(BinaryExpr
+						(MethodCallExpr
+							(BooleanLiteralExpr
+							)
+							SimpleName
+							(FieldAccessExpr
+								SimpleName
+								NameExpr
+									SimpleName
+							)
+						)
+						(BinaryExpr
+							(MethodCallExpr
+								SimpleName
+								NameExpr
+									SimpleName
+							)
+							NameExpr
+								SimpleName
+						)
+					)
+					SimpleName
+					(PrimitiveType
+					)
+				)
+			)
+			(BlockComment
+			)
+		)
+		(IfStmt
+			(UnaryExpr
+				(MethodCallExpr
+					(MethodCallExpr
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+					(ThisExpr
+					)
+					NameExpr
+						SimpleName
+					(FieldAccessExpr
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+					SimpleName
+					(MethodCallExpr
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+				)
+			)
+			(BlockStmt
+				(ThrowStmt
+					(ObjectCreationExpr
+						(BinaryExpr
+							(BinaryExpr
+								StringLiteralExpr
+								NameExpr
+									SimpleName
+							)
+							StringLiteralExpr
+						)
+						(ClassOrInterfaceType
+							SimpleName
+						)
+					)
+				)
+			)
+		)
+		(ExpressionStmt
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					(MethodCallExpr
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+					SimpleName
+					(ClassOrInterfaceType
+						SimpleName
+					)
+				)
+			)
+			(BlockComment
+			)
+		)
+		(ExpressionStmt
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					(MethodCallExpr
+						(IntegerLiteralExpr
+						)
+						SimpleName
+						NameExpr
+							SimpleName
+					)
+					SimpleName
+					(ClassOrInterfaceType
+						SimpleName
+					)
+				)
+			)
+		)
+		(ExpressionStmt
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					(BooleanLiteralExpr
+					)
+					SimpleName
+					(PrimitiveType
+					)
+				)
+			)
+		)
+		(ExpressionStmt
+			(VariableDeclarationExpr
+				(VariableDeclarator
+					(IntegerLiteralExpr
+					)
+					SimpleName
+					(PrimitiveType
+					)
+				)
+			)
+		)
+		(TryStmt
+			(BlockStmt
+				(IfStmt
+					NameExpr
+						SimpleName
+					(BlockStmt
+						(ExpressionStmt
+							(MethodCallExpr
+								(MethodCallExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+								(ThisExpr
+								)
+								SimpleName
+								(MethodCallExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+							)
+						)
+					)
+					(BlockStmt
+						(AssertStmt
+							(BinaryExpr
+								(IntegerLiteralExpr
+								)
+								NameExpr
+									SimpleName
+							)
+							LineComment
+						)
+						(ExpressionStmt
+							(VariableDeclarationExpr
+								(VariableDeclarator
+									(MethodCallExpr
+										(MethodCallExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										(ThisExpr
+										)
+										(BinaryExpr
+											NameExpr
+												SimpleName
+											(BinaryExpr
+												NameExpr
+													SimpleName
+												(MethodCallExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+											)
+										)
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										SimpleName
+										(MethodCallExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+									)
+									SimpleName
+									(PrimitiveType
+									)
+								)
+							)
+						)
+						(IfStmt
+							(UnaryExpr
+								NameExpr
+									SimpleName
+							)
+							(ExpressionStmt
+								(MethodCallExpr
+									StringLiteralExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+							)
+						)
+					)
+				)
+			)
+			(BlockStmt
+				(ForStmt
+					(BlockStmt
+						(ExpressionStmt
+							(AssignExpr
+								NameExpr
+									SimpleName
+								(MethodCallExpr
+									(BooleanLiteralExpr
+									)
+									SimpleName
+									(FieldAccessExpr
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+								)
+							)
+						)
+						(ExpressionStmt
+							(VariableDeclarationExpr
+								(VariableDeclarator
+									(MethodCallExpr
+										(MethodCallExpr
+											NameExpr
+												SimpleName
+											(MethodCallExpr
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										NameExpr
+											SimpleName
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+									SimpleName
+									(ClassOrInterfaceType
+										SimpleName
+									)
+								)
+							)
+						)
+						(ExpressionStmt
+							(VariableDeclarationExpr
+								(VariableDeclarator
+									(MethodCallExpr
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+									SimpleName
+									(PrimitiveType
+									)
+								)
+							)
+						)
+						(ExpressionStmt
+							(MethodCallExpr
+								NameExpr
+									SimpleName
+								(MethodCallExpr
+									NameExpr
+										SimpleName
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+								(FieldAccessExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+								NameExpr
+									SimpleName
+								SimpleName
+								(MethodCallExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+							)
+						)
+						(ExpressionStmt
+							(VariableDeclarationExpr
+								(VariableDeclarator
+									(MethodCallExpr
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+									SimpleName
+									(PrimitiveType
+									)
+								)
+							)
+						)
+						(IfStmt
+							(BinaryExpr
+								(MethodCallExpr
+									SimpleName
+									NameExpr
+										SimpleName
+								)
+								(BinaryExpr
+									NameExpr
+										SimpleName
+									NameExpr
+										SimpleName
+								)
+							)
+							(BlockStmt
+								(ExpressionStmt
+									(AssignExpr
+										NameExpr
+											SimpleName
+										(BooleanLiteralExpr
+										)
+									)
+								)
+								(ExpressionStmt
+									(MethodCallExpr
+										NameExpr
+											SimpleName
+										NameExpr
+											SimpleName
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+								)
+								(ExpressionStmt
+									(MethodCallExpr
+										NameExpr
+											SimpleName
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+								)
+								(ExpressionStmt
+									(MethodCallExpr
+										StringLiteralExpr
+										NameExpr
+											SimpleName
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+								)
+								(ExpressionStmt
+									(MethodCallExpr
+										NameExpr
+											SimpleName
+										SimpleName
+										NameExpr
+											SimpleName
+									)
+								)
+								(ReturnStmt
+								)
+							)
+							(BlockStmt
+								(ExpressionStmt
+									(MethodCallExpr
+										NameExpr
+											SimpleName
+										(FieldAccessExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										(MethodCallExpr
+											(MethodCallExpr
+												NameExpr
+													SimpleName
+												(MethodCallExpr
+													SimpleName
+													NameExpr
+														SimpleName
+												)
+												SimpleName
+												NameExpr
+													SimpleName
+											)
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+										NameExpr
+											SimpleName
+										SimpleName
+										(MethodCallExpr
+											SimpleName
+											NameExpr
+												SimpleName
+										)
+									)
+									LineComment
+								)
+							)
+						)
+					)
+					(BinaryExpr
+						NameExpr
+							SimpleName
+						(MethodCallExpr
+							SimpleName
+							NameExpr
+								SimpleName
+						)
+					)
+					(VariableDeclarationExpr
+						(VariableDeclarator
+							(IntegerLiteralExpr
+							)
+							SimpleName
+							(PrimitiveType
+							)
+						)
+					)
+					(UnaryExpr
+						NameExpr
+							SimpleName
+					)
+				)
+				(ThrowStmt
+					(ObjectCreationExpr
+						(BinaryExpr
+							(BinaryExpr
+								StringLiteralExpr
+								NameExpr
+									SimpleName
+							)
+							StringLiteralExpr
+						)
+						(ClassOrInterfaceType
+							SimpleName
+						)
+					)
+				)
+			)
+		)
+	)
+	(VoidType
+	)
+	SimpleName
+	(Parameter
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+	(Parameter
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+	(Parameter
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+	(Parameter
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+	(ClassOrInterfaceType
+		SimpleName
+	)
+	(JavadocComment
+	)
+)
+||||||||(MethodDeclaration
+	(BlockStmt
+	)
+	(VoidType
+	)
+	SimpleName
+	(Parameter
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+	(Parameter
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+	(Parameter
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+	(Parameter
+		SimpleName
+		(ClassOrInterfaceType
+			SimpleName
+		)
+	)
+	(ClassOrInterfaceType
+		SimpleName
+	)
+	(JavadocComment
+	)
+)
+

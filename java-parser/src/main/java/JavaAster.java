@@ -1,3 +1,4 @@
+import com.github.javaparser.ParseProblemException;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.utils.Pair;
 import com.google.common.base.Joiner;
@@ -45,30 +46,37 @@ public class JavaAster {
     }
 
     public void tokenizeFile(Path filePath) {
-        Map<String, Pair<MethodDeclaration, String>> after = MethodTokenizer.tokenize(filePath.toString());
-        String beforePath = filePath.getParent().getParent().resolve("before").resolve(filePath.getFileName()).toString();
-        Map<String, Pair<MethodDeclaration, String>> before = MethodTokenizer.tokenize(beforePath);
-        Path diffsPath = filePath.getParent().getParent().resolve("diffs");
-        diffsPath.toFile().mkdirs();
-        System.out.println("\r" + count++);
-        before.values().forEach(methodBefore -> {
-            if (after.containsKey(methodBefore.a.getNameAsString())) {
-                Pair<MethodDeclaration, String> methodAfter = after.get(methodBefore.a.getNameAsString());
-                if (!methodBefore.b.equals(methodAfter.b)) {
-                    String diffFilename = filePath.getFileName().toString() + methodBefore.a.getNameAsString() + ".txt";
-                    try (PrintWriter out = new PrintWriter(diffsPath.resolve(diffFilename).toFile())) {
-                        out.println(Joiner.on(DIFF_SEPARATOR).join(
-                                methodBefore.a.toString(),
-                                methodAfter.a.toString(),
-                                methodBefore.b,
-                                methodAfter.b
-                        ));
-                    } catch (FileNotFoundException e) {
-                        throw new RuntimeException(e);
+        try {
+            Map<String, Pair<MethodDeclaration, String>> after = MethodTokenizer.tokenize(filePath.toString());
+            String beforePath = filePath.getParent().getParent().resolve("before").resolve(filePath.getFileName()).toString();
+            Map<String, Pair<MethodDeclaration, String>> before = MethodTokenizer.tokenize(beforePath);
+            Path diffsPath = filePath.getParent().getParent().resolve("diffs");
+            diffsPath.toFile().mkdirs();
+            count++;
+            if (count % 100 == 0) {
+                System.out.println("\r" + count);
+            }
+            before.values().forEach(methodBefore -> {
+                if (after.containsKey(methodBefore.a.getNameAsString())) {
+                    Pair<MethodDeclaration, String> methodAfter = after.get(methodBefore.a.getNameAsString());
+                    if (!methodBefore.b.equals(methodAfter.b)) {
+                        String diffFilename = filePath.getFileName().toString() + methodBefore.a.getNameAsString() + ".txt";
+                        try (PrintWriter out = new PrintWriter(diffsPath.resolve(diffFilename).toFile())) {
+                            out.println(Joiner.on(DIFF_SEPARATOR).join(
+                                    methodBefore.a.toString(),
+                                    methodAfter.a.toString(),
+                                    methodBefore.b,
+                                    methodAfter.b
+                            ));
+                        } catch (FileNotFoundException e) {
+                            throw new RuntimeException(e);
+                        }
                     }
                 }
-            }
-        });
+            });
+        } catch (ParseProblemException e) {
+            System.out.println(e.getMessage());
+        }
         if (count % 1000 == 0) {
             dumpTokens();
         }
