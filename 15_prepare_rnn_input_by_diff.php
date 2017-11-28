@@ -6,7 +6,7 @@ ini_set('memory_limit', '2G');
 
 $maxLength = 100;
 $tokensTreatedAsBad = ['AST_IF', 'ZEND_AST_IF', 'AST_IF_ELEM'];
-$astDir = __DIR__ . '/input/ast/';
+$astDir = __DIR__ . '/input/ast-java/';
 
 $tokensByNumber = array_map('trim', file(__DIR__ . '/tokens.txt'));
 $tokens = array_flip($tokensByNumber);
@@ -105,32 +105,33 @@ $readDataset = function ($fileBefore, $fileAfter) use ($tokensByNumber, $maxLeng
 
 $fakeDataset = $readDataset('changed-before.txt', 'changed-after.txt');
 
-if (false) { // one file with whole dataset, model2
-    $fakeDataset = array_merge($fakeDataset['after'], $fakeDataset['before']);
 
-    shuffle($fakeDataset);
+file_put_contents(__DIR__ . '/input/rnn/input-before.csv', implode(PHP_EOL, array_map(function ($row) {
+    return $row['X'];
+}, $fakeDataset['before'])));
+file_put_contents(__DIR__ . '/input/rnn/lengths-before.csv', implode(',', array_map(function ($row) {
+    return $row['len'];
+}, $fakeDataset['before'])));
+file_put_contents(__DIR__ . '/input/rnn/input-after.csv', implode(PHP_EOL, array_map(function ($row) {
+    return $row['X'];
+}, $fakeDataset['after'])));
+file_put_contents(__DIR__ . '/input/rnn/lengths-after.csv', implode(',', array_map(function ($row) {
+    return $row['len'];
+}, $fakeDataset['after'])));
 
-    file_put_contents(__DIR__ . '/input/rnn/input.csv', implode(PHP_EOL, array_map(function ($row) {
-        return $row['X'];
-    }, $fakeDataset)));
-    file_put_contents(__DIR__ . '/input/rnn/labels.csv', implode(PHP_EOL, array_map(function ($row) {
-        return $row['Y'];
-    }, $fakeDataset)));
-    file_put_contents(__DIR__ . '/input/rnn/lengths.csv', implode(',', array_map(function ($row) {
-        return $row['len'];
-    }, $fakeDataset)));
-} else {
-    file_put_contents(__DIR__ . '/input/rnn/input-before.csv', implode(PHP_EOL, array_map(function ($row) {
-        return $row['X'];
-    }, $fakeDataset['before'])));
-    file_put_contents(__DIR__ . '/input/rnn/lengths-before.csv', implode(',', array_map(function ($row) {
-        return $row['len'];
-    }, $fakeDataset['before'])));
-    file_put_contents(__DIR__ . '/input/rnn/input-after.csv', implode(PHP_EOL, array_map(function ($row) {
-        return $row['X'];
-    }, $fakeDataset['after'])));
-    file_put_contents(__DIR__ . '/input/rnn/lengths-after.csv', implode(',', array_map(function ($row) {
-        return $row['len'];
-    }, $fakeDataset['after'])));
-}
+$fakeDataset = array_merge($fakeDataset['after'], $fakeDataset['before']);
+
+shuffle($fakeDataset);
+
+file_put_contents(__DIR__ . '/input/rnn/input.csv', implode(PHP_EOL, array_map(function ($row) {
+    return $row['X'];
+}, $fakeDataset)));
+file_put_contents(__DIR__ . '/input/rnn/labels.csv', implode(PHP_EOL, array_map(function ($row) {
+    return $row['Y'];
+}, $fakeDataset)));
+file_put_contents(__DIR__ . '/input/rnn/lengths.csv', implode(',', array_map(function ($row) {
+    return $row['len'];
+}, $fakeDataset)));
+
+
 
