@@ -1,7 +1,7 @@
 <?php
 require 'vendor/autoload.php';
 
-const RESULT_DIR = __DIR__ . '/input/ast-java';
+const RESULT_DIR = __DIR__ . '/input/ast-java-strict-no-parenthesis';
 const ADDED_METHODS = RESULT_DIR . '/added.txt';
 const DELETED_METHODS = RESULT_DIR . '/deleted.txt';
 const CHANGED_METHODS_BEFORE = RESULT_DIR . '/changed-before.txt';
@@ -11,9 +11,9 @@ const ADDED_DIR = RESULT_DIR . '/added/';
 const DELETED_DIR = RESULT_DIR . '/deleted/';
 const DIFF_SEPARATOR = '||||||||';
 
-mkdir(CHANGED_DIR, 0777, true);
-mkdir(ADDED_DIR, 0777, true);
-mkdir(DELETED_DIR, 0777, true);
+@mkdir(CHANGED_DIR, 0777, true);
+@mkdir(ADDED_DIR, 0777, true);
+@mkdir(DELETED_DIR, 0777, true);
 
 file_put_contents(ADDED_METHODS, '');
 file_put_contents(DELETED_METHODS, '');
@@ -28,6 +28,8 @@ $progress = new \ProgressBar\Manager(0, count($projects));
 $methodsCount = 0;
 
 $tokens = array_map('trim', file(__DIR__ . '/java-parser/tokens-java.txt'));
+
+$refactorRegex = '#(\brefactor|readability)#i';
 
 $tokenDuplicates = array_filter(array_count_values($tokens), function ($count) {
     return $count > 1;
@@ -56,6 +58,12 @@ foreach ($projects as $project) {
     foreach ($changes as $commitId) {
         $changeDir = $projectDir . '/' . $commitId;
         $diffsDir = $changeDir . '/diffs';
+        $commitMessage = file($changeDir . '/README.txt');
+        array_splice($commitMessage, 0, 3);
+        $commitMessageFirstLine = current(array_filter(array_map('trim', $commitMessage)));
+        if (!preg_match($refactorRegex, $commitMessageFirstLine)) {
+            continue;
+        }
         if (is_dir($diffsDir)) {
             $asts = array_diff(scandir($diffsDir), ['.', '..', 'README.txt']);
             foreach ($asts as $astFile) {
@@ -86,10 +94,11 @@ function tokenize(string $ast): string
     global $tokens;
     $tokenizedAst = preg_replace('#\\s#m', '', $ast);
     $tokenizedAst = str_replace(array_keys($tokens), $tokens, $tokenizedAst);
+    $tokenizedAst = preg_replace('#[\(\)]#m', '', $tokenizedAst);
     $allTokensReplaced = preg_match('#^[\d,]*$#', $tokenizedAst, $matches);
     if (!$allTokensReplaced) {
         preg_match_all('#[^\d,]+#', $tokenizedAst, $matches);
-        throw new InvalidArgumentException("NO TOKENS FOR: " . implode(', ', $matches[0]));
+        throw new InvalidArgumentException("NO TOKENS FOR: " . implode(', ', $matches[0]) . PHP_EOL . $tokenizedAst . PHP_EOL . $ast);
     }
     return rtrim($tokenizedAst, ',');
 }

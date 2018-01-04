@@ -6,14 +6,12 @@ ini_set('memory_limit', '2G');
 
 $maxLength = 100;
 $astDir = __DIR__ . '/input/ast-java-strict/';
+$diffDir = __DIR__ . '/input/ast-java-strict/unified-diffs/';
+const DIFF_SEPARATOR = '||||||||';
 
-$tokensByNumber = array_map('trim', file(__DIR__ . '/tokens.txt'));
-$tokens = array_flip($tokensByNumber);
+@mkdir($diffDir, 0777, true);
 
-
-$readDataset = function ($fileBefore, $fileAfter) use ($tokensByNumber, $maxLength, $astDir) {
-
-
+$readDataset = function ($fileBefore, $fileAfter) use ($diffDir, $maxLength, $astDir) {
     $rowsBefore = explode(PHP_EOL, file_get_contents($astDir . $fileBefore));
     $rowsAfter = explode(PHP_EOL, file_get_contents($astDir . $fileAfter));
 
@@ -46,6 +44,20 @@ $readDataset = function ($fileBefore, $fileAfter) use ($tokensByNumber, $maxLeng
                 unset($rowsBefore[$i]);
                 unset($rowsAfter[$i]);
             } else {
+                $id = sprintf("%08d", $i + 1);
+                $codes = file_get_contents($astDir . '/changed/' . $id . '.txt');
+                $codes = explode(DIFF_SEPARATOR, $codes);
+                $tempBefore = $astDir . '/temp-before.java';
+                $tempAfter = $astDir . '/temp-after.java';
+                file_put_contents($tempBefore, $codes[0]);
+                file_put_contents($tempAfter, $codes[1]);
+                $hashBefore = exec("git hash-object $tempBefore -w", $gitDiff);
+                $hashAfter = exec("git hash-object $tempAfter -w", $gitDiff);
+                $command = "git diff $hashBefore $hashAfter -U1000";
+                $gitDiff = [];
+                exec($command, $gitDiff);
+                file_put_contents($diffDir . '/' . $id . '.txt', implode(PHP_EOL, $gitDiff));
+
 //                $change = implode(' ', array_map(function($c) { return $c[0]; }, $changed));
 //                time();
             }
@@ -73,35 +85,8 @@ $readDataset = function ($fileBefore, $fileAfter) use ($tokensByNumber, $maxLeng
     return $result;
 };
 
-$fakeDataset = $readDataset('changed-before.txt', 'changed-after.txt');
+$readDataset('changed-before.txt', 'changed-after.txt');
 
-
-file_put_contents(__DIR__ . '/input/rnn/input-before.csv', implode(PHP_EOL, array_map(function ($row) {
-    return $row['X'];
-}, $fakeDataset['before'])));
-file_put_contents(__DIR__ . '/input/rnn/lengths-before.csv', implode(',', array_map(function ($row) {
-    return $row['len'];
-}, $fakeDataset['before'])));
-file_put_contents(__DIR__ . '/input/rnn/input-after.csv', implode(PHP_EOL, array_map(function ($row) {
-    return $row['X'];
-}, $fakeDataset['after'])));
-file_put_contents(__DIR__ . '/input/rnn/lengths-after.csv', implode(',', array_map(function ($row) {
-    return $row['len'];
-}, $fakeDataset['after'])));
-
-$fakeDataset = array_merge($fakeDataset['after'], $fakeDataset['before']);
-
-shuffle($fakeDataset);
-
-file_put_contents(__DIR__ . '/input/rnn/input.csv', implode(PHP_EOL, array_map(function ($row) {
-    return $row['X'];
-}, $fakeDataset)));
-file_put_contents(__DIR__ . '/input/rnn/labels.csv', implode(PHP_EOL, array_map(function ($row) {
-    return $row['Y'];
-}, $fakeDataset)));
-file_put_contents(__DIR__ . '/input/rnn/lengths.csv', implode(',', array_map(function ($row) {
-    return $row['len'];
-}, $fakeDataset)));
 
 
 
