@@ -4,7 +4,7 @@ require 'class.Diff.php';
 
 ini_set('memory_limit', '2G');
 
-$maxLength = 100;
+$maxLength = 200;
 $astDir = __DIR__ . '/input/ast-java-strict/';
 $diffDir = __DIR__ . '/input/ast-java-strict/unified-diffs/';
 const DIFF_SEPARATOR = '||||||||';
@@ -17,7 +17,7 @@ $readDataset = function ($fileBefore, $fileAfter) use ($diffDir, $maxLength, $as
 
 
     $count = count($rowsBefore);
-    for ($i = 0; $i < $count; $i++) {
+    for ($i = 12287; $i < $count; $i++) {
 
         $tokensBefore = substr_count($rowsBefore[$i], ',') + 1;
         $tokensAfter = substr_count($rowsAfter[$i], ',') + 1;
@@ -38,8 +38,14 @@ $readDataset = function ($fileBefore, $fileAfter) use ($diffDir, $maxLength, $as
             $changed = array_filter($diff, function ($d) {
                 return $d[1] != Diff::UNMODIFIED;
             });
+            $added = count(array_filter($changed, function ($d) {
+                return $d[1] == Diff::INSERTED;
+            }));
+            $deleted = count($changed) - $added;
             if (count($changed) < 10
                 || count($changed) > 50
+                || !$added
+                || !$deleted
             ) {
                 unset($rowsBefore[$i]);
                 unset($rowsAfter[$i]);

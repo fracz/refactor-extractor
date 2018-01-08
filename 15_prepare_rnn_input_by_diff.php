@@ -4,7 +4,7 @@ require 'class.Diff.php';
 
 ini_set('memory_limit', '2G');
 
-$maxLength = 100;
+$maxLength = 200;
 $astDir = __DIR__ . '/input/ast-java-strict/';
 
 $tokensByNumber = array_map('trim', file(__DIR__ . '/tokens.txt'));
@@ -40,8 +40,14 @@ $readDataset = function ($fileBefore, $fileAfter) use ($tokensByNumber, $maxLeng
             $changed = array_filter($diff, function ($d) {
                 return $d[1] != Diff::UNMODIFIED;
             });
-            if (count($changed) < 10
-                || count($changed) > 50
+            $added = count(array_filter($changed, function ($d) {
+                return $d[1] == Diff::INSERTED;
+            }));
+            $deleted = count($changed) - $added;
+            if (count($changed) < 5
+                || count($changed) > 100
+                || !$added
+                || !$deleted
             ) {
                 unset($rowsBefore[$i]);
                 unset($rowsAfter[$i]);
