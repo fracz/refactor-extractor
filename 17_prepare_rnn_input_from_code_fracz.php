@@ -17,6 +17,9 @@ $rowsBefore = explode(PHP_EOL, file_get_contents($astDir . 'changed-before.txt')
 $rowsAfter = explode(PHP_EOL, file_get_contents($astDir . 'changed-after.txt'));
 foreach ($scoreboard as $scoreboardEntry) {
     list($score, $count, $filename) =  array_values($scoreboardEntry);
+    if (abs($score) < 3) {
+        continue;
+    }
     $fileIndex = intval($filename) - 1;
     $afterBetter = $score > 0;
     $codeBefore = $rowsBefore[$fileIndex];
