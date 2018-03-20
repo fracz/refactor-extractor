@@ -17,7 +17,7 @@ $readDataset = function ($fileBefore, $fileAfter) use ($diffDir, $maxLength, $as
 
 
     $count = count($rowsBefore);
-    for ($i = 12287; $i < $count; $i++) {
+    for ($i = 0; $i < $count; $i++) {
 
         $tokensBefore = substr_count($rowsBefore[$i], ',') + 1;
         $tokensAfter = substr_count($rowsAfter[$i], ',') + 1;
