@@ -9,6 +9,7 @@ $astDir = __DIR__ . '/input/ast-java-strict/';
 
 $tokensByNumber = array_map('trim', file(__DIR__ . '/tokens.txt'));
 $tokens = array_flip($tokensByNumber);
+const DIFF_SEPARATOR = '||||||||';
 
 require __DIR__ . '/scoreboard.php';
 
@@ -45,6 +46,12 @@ foreach ($scoreboard as $scoreboardEntry) {
         $afterEntry['Y'] = '0,1';
         $result['before'][] = $afterEntry;
     }
+    $source = explode(DIFF_SEPARATOR, file_get_contents($astDir . '/changed/' . $filename));
+    $index = sprintf("%08d", count($result['before']) - 1);
+    $classBefore = "// original filename: $filename\n// before\npublic class Class$index" . ($afterBetter ? 'Worse' : 'Better') . " {\n" . $source[0] . "\n}";
+    $classAfter = "// original filename: $filename\n// after\npublic class Class$index" . ($afterBetter ? 'Better' : 'Worse') . " {\n" . $source[1] . "\n}";
+    file_put_contents(__DIR__ . "/input/rnn/sources/Class$index" . ($afterBetter ? 'Worse' : 'Better') . '.java', $classBefore);
+    file_put_contents(__DIR__ . "/input/rnn/sources/Class$index" . ($afterBetter ? 'Better' : 'Worse') . '.java', $classAfter);
 }
 
 $fakeDataset = $result;
@@ -64,7 +71,7 @@ file_put_contents(__DIR__ . '/input/rnn/lengths-after.csv', implode(',', array_m
 
 $fakeDataset = array_merge($fakeDataset['after'], $fakeDataset['before']);
 
-shuffle($fakeDataset);
+//shuffle($fakeDataset);
 
 file_put_contents(__DIR__ . '/input/rnn/input.csv', implode(PHP_EOL, array_map(function ($row) {
     return $row['X'];

@@ -23,6 +23,7 @@ do
         echo "###"
         echo "################################"
         echo ""
+        rm -fr repos/$PROJECT
         git clone https://github.com/$PROJECT repos/$PROJECT || (sleep 10 && exit)
         php 2_extract_refactor_commits.php $PROJECT
     #    php metrics.php $PROJECT
