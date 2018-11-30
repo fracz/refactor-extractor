@@ -4,8 +4,10 @@ require 'vendor/autoload.php';
 $project = $argc == 2 ? $argv[1] : 'domnikl/DesignPatternsPHP';
 
 $REPO_DIR = __DIR__ . '/repos/' . $project;
-const REFACTOR_KEYWORDS = ['refactor', 'improve', 'reorganize', 'readability'];
+const REFACTOR_KEYWORDS = ['refactor',/* 'improve', 'reorganize',*/
+    'readability'];
 const EXTENSION_FILTER = ['java']; //['java', 'js', 'ts', 'php', 'cs'];
+$refactorRegex = '#(\brefactor|readability)#i';
 
 chdir($REPO_DIR);
 
@@ -20,7 +22,7 @@ echo 'Getting refactor changes from found commits...' . PHP_EOL;
 
 $progress = new \ProgressBar\Manager(0, count($commits));
 
-$outputDir = __DIR__ . '/results-java/' . str_replace('/', '--', $project);
+$outputDir = __DIR__ . '/results-evaluation/' . str_replace('/', '--', $project);
 @mkdir($outputDir);
 
 $files = 0;
@@ -29,6 +31,13 @@ $filesStats = [];
 
 foreach ($commits as $hash) {
     $progress->advance();
+    $fullCommitMessage = executeInRepo('git show -q ' . $hash);
+    array_splice($fullCommitMessage, 0, 3);
+    $commitMessageFirstLine = current(array_filter(array_map('trim', $fullCommitMessage)));
+    if (!preg_match($refactorRegex, $commitMessageFirstLine)) {
+        continue;
+    }
+    $fullCommitMessage = implode(PHP_EOL, $fullCommitMessage);
     $output = $outputDir . '/' . $hash;
     $outputBefore = $output . '/before';
     $outputAfter = $output . '/after';
@@ -37,28 +46,28 @@ foreach ($commits as $hash) {
         $extension = strtolower(@end(explode('.', $changedFile)));
         return in_array($extension, EXTENSION_FILTER);
     });
-    $filesInThisCommit = count($processableFiles);
-    $files += $filesInThisCommit;
-    if ($filesInThisCommit > 0) {
-        foreach ($processableFiles as $changedFile) {
-            $filename = basename($changedFile);
-            @mkdir($output);
-            @mkdir($outputBefore);
-            @mkdir($outputAfter);
-            $cmd = "git show {$hash}^:$changedFile";
-            $beforeRefactoring = implode(PHP_EOL, executeInRepo("git show {$hash}~1:$changedFile"));
-            $afterRefactoring = implode(PHP_EOL, executeInRepo("git show $hash:$changedFile"));
+    $filesInThisCommit = 0;
+    foreach ($processableFiles as $changedFile) {
+        $filename = basename($changedFile);
+        @mkdir($output);
+        @mkdir($outputBefore);
+        @mkdir($outputAfter);
+        $cmd = "git show {$hash}^:$changedFile";
+        $beforeRefactoring = implode(PHP_EOL, executeInRepo("git show {$hash}~1:$changedFile"));
+        $afterRefactoring = implode(PHP_EOL, executeInRepo("git show $hash:$changedFile"));
+        if ($beforeRefactoring && $afterRefactoring) {
             file_put_contents($outputBefore . "/$filename", $beforeRefactoring);
             file_put_contents($outputAfter . "/$filename", $afterRefactoring);
+            ++$filesInThisCommit;
         }
     }
+    $files += $filesInThisCommit;
     if ($filesInThisCommit > 0) {
         ++$commitsWithFiles;
         if (!isset($filesStats[$filesInThisCommit])) {
             $filesStats[$filesInThisCommit] = 0;
         }
         ++$filesStats[$filesInThisCommit];
-        $fullCommitMessage = implode(PHP_EOL, executeInRepo('git show -q ' . $hash));
         file_put_contents($output . '/README.txt', $fullCommitMessage);
     }
 }
@@ -75,8 +84,7 @@ file_put_contents($outputDir . '/README.txt', $resultText);
 
 echo $resultText;
 
-function executeInRepo($cmd)
-{
+function executeInRepo($cmd) {
     exec($cmd . ' 2>NUL', $output);
     return $output;
 }

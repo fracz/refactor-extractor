@@ -3,10 +3,14 @@
 const PER_PAGE = 100;
 const QUERY = 'https://api.github.com/search/repositories?q=language:java%20stars:%3E=3000&sort=stars&order=desc&per_page=' . PER_PAGE . '&page=';
 
+$existing = array_filter(array_map('trim', explode(PHP_EOL, file_get_contents(__DIR__ . '/repos-list/350-to-learn.txt'))));
+
 function fetchPage($page = 1) {
     $ch = curl_init(QUERY . $page);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-    curl_setopt($ch,CURLOPT_USERAGENT,'Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.8.1.13) Gecko/20080311 Firefox/2.0.0.13');
+    curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.8.1.13) Gecko/20080311 Firefox/2.0.0.13');
     $response = curl_exec($ch);
     curl_close($ch);
     return json_decode($response);
@@ -18,10 +22,13 @@ $projects = [];
 for ($page = 1; $page <= $pages; $page++) {
     $response = fetchPage($page);
     $pages = ceil($response->total_count / PER_PAGE);
-    $projects = array_merge($projects, array_map(function($project) {
+    $projects = array_merge($projects, array_map(function ($project) {
         return $project->full_name;
     }, $response->items));
 }
 
-echo 'Projects: ' . count($projects) . PHP_EOL;
-echo implode(' ', $projects);
+$limited = array_slice($projects, 0, count($existing));
+$newProjects = array_diff($limited, $existing);
+
+echo 'Projects: ' . count($newProjects) . PHP_EOL;
+echo implode(' ', $newProjects);
